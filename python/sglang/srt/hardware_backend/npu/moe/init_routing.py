@@ -93,10 +93,75 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         quant_mode: int = -1,
         expert_tokens_num_type: int = 1,
         active_expert_range: Optional[Tuple[int, int]] = None,
+        mxfp8_quant_before_routing: bool = False,
     ):
         self.quant_mode = quant_mode
         self.expert_tokens_num_type = expert_tokens_num_type
         self.active_expert_range = active_expert_range
+        self.mxfp8_quant_before_routing = mxfp8_quant_before_routing
+
+    def _route_prequantized_mxfp8(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        active_expert_range,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize [T,H] before Top-K expansion and route payload/scale.
+
+        MoeInitRouting's native MX mode expands BF16 rows first and then runs
+        DynamicMxQuant on [T*top_k,H].  Instead, quantize [T,H], ask the routing
+        op to sort a one-column source-token id, and use that permutation for
+        both the FP8 payload and its E8M0 scale.  The one-column metadata route
+        preserves the operator's exact expert ordering and expanded_row_idx
+        contract without repeating the H-wide BF16 traffic.
+        """
+        num_tokens = hidden_states.shape[0]
+        quantized_states, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            hidden_states.contiguous(), dst_type=torch.float8_e4m3fn
+        )
+
+        source_token_rows = torch.arange(
+            num_tokens,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ).view(num_tokens, 1)
+        (
+            expanded_token_rows,
+            expanded_row_idx,
+            expert_tokens,
+            _,
+        ) = torch.ops.npu.npu_moe_init_routing_v2(
+            source_token_rows,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=num_experts,
+            expert_tokens_num_type=self.expert_tokens_num_type,
+            expert_tokens_num_flag=True,
+            active_expert_range=active_expert_range,
+            quant_mode=-1,
+            row_idx_type=0,
+        )
+
+        # active_expert_range can leave an invalid static-shape suffix. Make
+        # every gather index safe without a data-dependent slice; GMM consumes
+        # only the valid prefix described by expert_tokens.
+        source_token_idx = torch.nan_to_num(
+            expanded_token_rows.squeeze(-1),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_(0.0, float(num_tokens - 1))
+        source_token_idx = source_token_idx.to(torch.int64)
+        expanded_states = quantized_states.index_select(0, source_token_idx)
+        expanded_scale = input_scale.index_select(0, source_token_idx)
+        return (
+            expanded_states,
+            expanded_row_idx,
+            expert_tokens.to(torch.int64),
+            expanded_scale,
+        )
 
     def _init_routing(
         self,
@@ -123,6 +188,15 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                     "active_expert_range must be a non-empty sub-range of "
                     f"[0, {num_experts}], got {active_expert_range}"
                 )
+
+        if (
+            self.quant_mode == MXFP8_QUANT_MODE
+            and self.mxfp8_quant_before_routing
+            and num_tokens > 0
+        ):
+            return self._route_prequantized_mxfp8(
+                hidden_states, topk_ids, num_experts, top_k, active_expert_range
+            )
 
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(

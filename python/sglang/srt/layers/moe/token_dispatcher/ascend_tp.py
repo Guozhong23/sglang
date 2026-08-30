@@ -4,6 +4,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     AllGatherFinalizeRoutingWrapper,
     NPUFinalizeRouting,
@@ -126,7 +127,12 @@ class AscendTPDispatcher(BaseDispatcher):
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP8:
-            self.init = NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
+            self.init = NPUMoEInitRouting_v2(
+                quant_mode=MXFP8_QUANT_MODE,
+                mxfp8_quant_before_routing=(
+                    envs.SGLANG_NPU_MXFP8_QUANT_BEFORE_ROUTE.get()
+                ),
+            )
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
         else:
@@ -266,6 +272,9 @@ class AscendLocalEPDispatcher(BaseDispatcher):
                 quant_mode=MXFP8_QUANT_MODE,
                 expert_tokens_num_type=1,
                 active_expert_range=active_expert_range,
+                mxfp8_quant_before_routing=(
+                    envs.SGLANG_NPU_MXFP8_QUANT_BEFORE_ROUTE.get()
+                ),
             )
         else:
             raise ValueError(
