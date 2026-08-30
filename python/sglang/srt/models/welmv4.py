@@ -1620,6 +1620,26 @@ class Qwen2MoeAttention(nn.Module):
             if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
             else None
         )
+        quant_method = self.o_proj.quant_method
+        supports_quant_mc2 = getattr(
+            quant_method, "supports_matmul_reduce_scatter", None
+        )
+        if callable(supports_quant_mc2) and supports_quant_mc2(self.o_proj):
+            return quant_method.apply_matmul_reduce_scatter(
+                self.o_proj,
+                attn_output,
+                self._get_welm_npu_o_proj_hcom_name(),
+                self.o_proj.tp_size,
+                bias=bias,
+                comm_mode="ccu",
+            )
+
+        if self.o_proj.weight.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "WeLM OProj MatmulReduceScatterV2 received an unsupported "
+                f"quantization method {type(quant_method).__name__} with "
+                f"weight dtype {self.o_proj.weight.dtype}."
+            )
         return torch_npu.npu_mm_reduce_scatter_base(
             attn_output.contiguous(),
             self.o_proj.weight.transpose(0, 1),

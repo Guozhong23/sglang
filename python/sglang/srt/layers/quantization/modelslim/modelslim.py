@@ -409,6 +409,42 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
 
+    @staticmethod
+    def supports_matmul_reduce_scatter(layer: torch.nn.Module) -> bool:
+        return callable(
+            getattr(
+                getattr(layer, "scheme", None),
+                "apply_matmul_reduce_scatter",
+                None,
+            )
+        )
+
+    def apply_matmul_reduce_scatter(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        hcom: str,
+        world_size: int,
+        *,
+        bias: Optional[torch.Tensor] = None,
+        comm_mode: str = "ccu",
+    ) -> torch.Tensor:
+        scheme = layer.scheme
+        apply_mc2 = getattr(scheme, "apply_matmul_reduce_scatter", None)
+        if not callable(apply_mc2):
+            raise RuntimeError(
+                f"{type(scheme).__name__} does not support "
+                "MatmulReduceScatterV2."
+            )
+        return apply_mc2(
+            layer,
+            x,
+            hcom,
+            world_size,
+            bias=bias,
+            comm_mode=comm_mode,
+        )
+
 
 class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     """

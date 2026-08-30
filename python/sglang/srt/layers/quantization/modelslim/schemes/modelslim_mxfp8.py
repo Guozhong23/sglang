@@ -87,3 +87,22 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.kernel.apply(layer, x, bias)
+
+    def apply_matmul_reduce_scatter(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        hcom: str,
+        world_size: int,
+        *,
+        bias: Optional[torch.Tensor] = None,
+        comm_mode: str = "ccu",
+    ) -> torch.Tensor:
+        return self.kernel.apply_matmul_reduce_scatter(
+            layer,
+            x,
+            hcom,
+            world_size,
+            bias=bias,
+            comm_mode=comm_mode,
+        )

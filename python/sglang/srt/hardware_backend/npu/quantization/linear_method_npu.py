@@ -307,6 +307,80 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
 
+    @staticmethod
+    def supports_matmul_reduce_scatter(layer: torch.nn.Module) -> bool:
+        return (
+            getattr(layer, "weight", None) is not None
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and getattr(layer, "weight_scale_inv", None) is not None
+        )
+
+    def apply_matmul_reduce_scatter(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        hcom: str,
+        world_size: int,
+        *,
+        bias: Optional[torch.Tensor] = None,
+        comm_mode: str = "ccu",
+    ) -> torch.Tensor:
+        """Run MXFP8 MatMul and ReduceScatter through the V2 MC2 op."""
+        if not self.supports_matmul_reduce_scatter(layer):
+            raise RuntimeError(
+                "MXFP8 MatmulReduceScatterV2 requires an E4M3 weight and "
+                "its E8M0 block scale."
+            )
+        if x.dim() != 2:
+            raise ValueError(
+                "MXFP8 MatmulReduceScatterV2 requires a 2D activation, got "
+                f"shape={tuple(x.shape)}."
+            )
+        if x.shape[0] % world_size != 0:
+            raise ValueError(
+                "MXFP8 MatmulReduceScatterV2 requires M divisible by the "
+                f"world size, got M={x.shape[0]} and world_size={world_size}."
+            )
+
+        output_dtype = x.dtype
+        if output_dtype not in (torch.float16, torch.bfloat16):
+            x = x.to(torch.bfloat16)
+            output_dtype = torch.bfloat16
+        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            x.contiguous(), dst_type=torch.float8_e4m3fn
+        )
+
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
+        # torch_npu maps x1_scale/x2_scale plus pair-split E8M0 layouts to
+        # aclnnMatmulReduceScatterV2 MX mode (group size [1, 1, 32]). The
+        # post-load weight and scale are already matching transpose views;
+        # materialising either view would break that contract and add an HBM
+        # copy.
+        import torch_npu
+
+        return torch_npu.npu_mm_reduce_scatter_base(
+            qx,
+            layer.weight,
+            hcom,
+            world_size,
+            reduce_op="sum",
+            bias=quant_bias,
+            x1_scale=input_scale,
+            x2_scale=layer.weight_scale_inv,
+            comm_turn=0,
+            output_dtype=output_dtype,
+            comm_mode=comm_mode,
+        )
+
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
