@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -642,8 +643,25 @@ class Qwen2MoeMLP(nn.Module):
         x,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gate_up_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        if gate_up_pre_quant is None:
+            gate_up, _ = self.gate_up_proj(x)
+        else:
+            apply_prequantized = getattr(
+                self.gate_up_proj.quant_method, "apply_prequantized", None
+            )
+            if not callable(apply_prequantized):
+                raise RuntimeError(
+                    "Shared expert gate_up does not support reusable MXFP8 input."
+                )
+            gate_up = apply_prequantized(
+                self.gate_up_proj,
+                gate_up_pre_quant,
+                input_shape=x.shape,
+                output_dtype=x.dtype,
+                bias=None,
+            )
         if self.swiglu_clamp_limit is not None and self.swiglu_clamp_limit > 0:
             d = gate_up.shape[-1] // 2
             gate = F.silu(gate_up[..., :d]).clamp_(max=self.swiglu_clamp_limit)
@@ -849,17 +867,48 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
     def _forward_shared_expert(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        gate_up_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[torch.Tensor]:
         if self.shared_expert is None:
             return None
 
-        shared_output = self.shared_expert(hidden_states)
+        shared_output = self.shared_expert(
+            hidden_states, gate_up_pre_quant=gate_up_pre_quant
+        )
         if self.shared_expert_gate is not None:
             shared_output = (
                 F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
             )
         return shared_output
+
+    def _maybe_quant_moe_input_once(
+        self,
+        hidden_states: torch.Tensor,
+        use_welm_local_ep_moe: bool,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            not envs.SGLANG_NPU_MXFP8_MOE_QUANT_ONCE.get()
+            or hidden_states.shape[0] == 0
+            or hidden_states.dtype != torch.bfloat16
+            or self.shared_expert is None
+        ):
+            return None
+        dispatcher = (
+            self.experts.local_ep_dispatcher
+            if use_welm_local_ep_moe
+            else self.experts.dispatcher
+        )
+        supports_dispatch = getattr(dispatcher, "supports_prequantized_mxfp8", None)
+        if not callable(supports_dispatch) or not supports_dispatch():
+            return None
+        gate_up = self.shared_expert.gate_up_proj
+        quant_method = gate_up.quant_method
+        supports = getattr(quant_method, "supports_prequantized_input", None)
+        if not callable(supports) or not supports(gate_up):
+            return None
+        return quant_method.quantize_activation(gate_up, hidden_states)
 
     def get_npu_router_compute_weight(
         self, dtype: torch.dtype
@@ -947,6 +996,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
             and not is_prefill_batch
         )
+        pre_quant_input = self._maybe_quant_moe_input_once(
+            hidden_states, use_welm_local_ep_moe
+        )
         num_token_non_padded = (
             getattr(forward_batch, "num_token_non_padded", None)
             if forward_batch is not None
@@ -978,7 +1030,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             if self.shared_expert is not None and not enable_npu_dual_stream:
-                shared_output = self._forward_shared_expert(hidden_states)
+                shared_output = self._forward_shared_expert(
+                    hidden_states,
+                    gate_up_pre_quant=pre_quant_input,
+                )
             if _is_npu:
                 # router_logits = mmq_style_router_linear_npu(
                 #     hidden_states,
@@ -998,7 +1053,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 # routing, dispatch, and the routed-expert path until final add;
                 # both paths only read the original hidden_states storage.
                 shared_output = process_shared_expert(
-                    hidden_states, self._forward_shared_expert
+                    hidden_states,
+                    partial(
+                        self._forward_shared_expert,
+                        gate_up_pre_quant=pre_quant_input,
+                    ),
                 )
             # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
             # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
@@ -1059,14 +1118,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     "layout, but use_reduce_scatter is enabled."
                 )
             experts_output = self.experts.forward_local_ep_partial(
-                hidden_states, topk_output
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
             )
             # Only routed experts are partial across EP ranks. The shared
             # expert below is fully replicated under DeepEP and must be added
             # after this sum, otherwise it would be multiplied by EP size.
             experts_output = moe_expert_parallel_all_reduce(experts_output)
         else:
-            experts_output = self.experts(hidden_states, topk_output)
+            experts_output = self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+            )
         if return_components and skip_component_output:
             if enable_npu_dual_stream:
                 # This early return hands shared_output to the caller, so it is

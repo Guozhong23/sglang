@@ -10,7 +10,7 @@ process_weights_after_loading detects the pre-quantized float8_e4m3fn weight and
 takes the offline (transpose-only) branch.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -87,6 +87,28 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.kernel.apply(layer, x, bias)
+
+    def quantize_activation(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.kernel.quantize_activation(x)
+
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        pre_quant_input: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        input_shape: torch.Size,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.kernel.apply_prequantized(
+            layer,
+            pre_quant_input,
+            input_shape=input_shape,
+            output_dtype=output_dtype,
+            bias=bias,
+        )
 
     def apply_matmul_reduce_scatter(
         self,

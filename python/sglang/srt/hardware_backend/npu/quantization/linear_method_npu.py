@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -257,39 +257,57 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         else:
             layer.bias_fp32 = None
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
+    @staticmethod
+    def quantize_activation(
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create the block-32 payload/scale bundle shared by MX consumers."""
+        if x.dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
-            original_dtype = torch.bfloat16
-
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
-        input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
-
-        # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        return torch.ops.npu.npu_dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # MXFP8 matmul (weight & scale already transposed at load time)
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
+    @staticmethod
+    def _prepare_quant_bias(
+        layer: torch.nn.Module, bias: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
         if bias is None:
-            quant_bias = None
-        elif (
+            return None
+        if (
             bias is getattr(layer, "bias", None)
             and getattr(layer, "bias_fp32", None) is not None
         ):
-            quant_bias = layer.bias_fp32
-        else:
-            quant_bias = bias.to(torch.float32)
+            return layer.bias_fp32
+        return bias.to(torch.float32)
 
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        pre_quant_input: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        input_shape: torch.Size,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run MXFP8 matmul without launching another activation quantizer."""
+        qx, input_scale = pre_quant_input
+        if qx.ndim != 2 or qx.shape[-1] != layer.weight.shape[0]:
+            raise ValueError(
+                "Pre-quantized MXFP8 activation is incompatible with the "
+                f"linear weight: activation={tuple(qx.shape)}, "
+                f"weight={tuple(layer.weight.shape)}."
+            )
+        if input_scale.shape[0] != qx.shape[0]:
+            raise ValueError(
+                "Pre-quantized MXFP8 scale must have one row per activation, "
+                f"got scale={tuple(input_scale.shape)} and "
+                f"activation={tuple(qx.shape)}."
+            )
+        if output_dtype not in (torch.float16, torch.bfloat16):
+            output_dtype = torch.bfloat16
+        quant_bias = self._prepare_quant_bias(layer, bias)
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
         output = torch.ops.npu.npu_quant_matmul(
             qx,
@@ -299,13 +317,30 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             pertoken_scale=input_scale,
             pertoken_scale_dtype=e8m0_dtype,
             bias=quant_bias,
-            output_dtype=original_dtype,
+            output_dtype=output_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
         )
 
         # Restore original shape (replace last dim with output features)
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        output_dtype = x.dtype
+        input_shape = x.shape
+        pre_quant_input = self.quantize_activation(x)
+        return self.apply_prequantized(
+            layer,
+            pre_quant_input,
+            input_shape=input_shape,
+            output_dtype=output_dtype,
+            bias=bias,
+        )
 
     @staticmethod
     def supports_matmul_reduce_scatter(layer: torch.nn.Module) -> bool:

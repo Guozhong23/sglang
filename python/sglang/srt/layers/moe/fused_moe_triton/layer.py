@@ -1423,9 +1423,18 @@ class FusedMoE(torch.nn.Module):
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        if pre_quant_input is not None and isinstance(
+            self.dispatcher, AscendTPDispatcher
+        ):
+            dispatch_output = self.dispatcher.dispatch_prequantized_mxfp8(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+        else:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
         if (
             pre_quant_input is not None
             and dispatch_output.format.is_standard()
@@ -1479,7 +1488,10 @@ class FusedMoE(torch.nn.Module):
         return self.dispatcher.combine(combine_input=combine_input)
 
     def forward_local_ep_partial(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Run locally owned experts for an already-replicated token layout.
 
@@ -1500,10 +1512,19 @@ class FusedMoE(torch.nn.Module):
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
 
-        dispatch_output = self.local_ep_dispatcher.dispatch(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        if pre_quant_input is not None and isinstance(
+            self.local_ep_dispatcher, AscendLocalEPDispatcher
+        ):
+            dispatch_output = self.local_ep_dispatcher.dispatch_prequantized_mxfp8(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+        else:
+            dispatch_output = self.local_ep_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
         combine_input = self.run_moe_core(dispatch_output=dispatch_output)
 
         if self._dwdp_bound:

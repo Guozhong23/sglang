@@ -445,6 +445,49 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
             comm_mode=comm_mode,
         )
 
+    @staticmethod
+    def supports_prequantized_input(layer: torch.nn.Module) -> bool:
+        scheme = getattr(layer, "scheme", None)
+        return callable(getattr(scheme, "quantize_activation", None)) and callable(
+            getattr(scheme, "apply_prequantized", None)
+        )
+
+    def quantize_activation(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scheme = layer.scheme
+        quantize = getattr(scheme, "quantize_activation", None)
+        if not callable(quantize):
+            raise RuntimeError(
+                f"{type(scheme).__name__} cannot produce reusable "
+                "pre-quantized input."
+            )
+        return quantize(x)
+
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        pre_quant_input: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        input_shape: torch.Size,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        scheme = layer.scheme
+        apply_prequantized = getattr(scheme, "apply_prequantized", None)
+        if not callable(apply_prequantized):
+            raise RuntimeError(
+                f"{type(scheme).__name__} cannot consume reusable "
+                "pre-quantized input."
+            )
+        return apply_prequantized(
+            layer,
+            pre_quant_input,
+            input_shape=input_shape,
+            output_dtype=output_dtype,
+            bias=bias,
+        )
+
 
 class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     """

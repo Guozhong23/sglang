@@ -758,6 +758,9 @@ class Envs:
     # Quantize each original MoE token once, then route the FP8 payload and
     # E8M0 scale. This avoids quantizing the Top-K-expanded activation.
     SGLANG_NPU_MXFP8_QUANT_BEFORE_ROUTE = EnvBool(True)
+    # Share that original-token MXFP8 activation between the routed and
+    # shared experts when both consumers support the same block-32 layout.
+    SGLANG_NPU_MXFP8_MOE_QUANT_ONCE = EnvBool(True)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

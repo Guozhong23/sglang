@@ -107,6 +107,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         num_experts: int,
         top_k: int,
         active_expert_range,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize [T,H] before Top-K expansion and route payload/scale.
 
@@ -118,9 +119,31 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         contract without repeating the H-wide BF16 traffic.
         """
         num_tokens = hidden_states.shape[0]
-        quantized_states, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            hidden_states.contiguous(), dst_type=torch.float8_e4m3fn
-        )
+        if pre_quant_input is None:
+            quantized_states, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states.contiguous(), dst_type=torch.float8_e4m3fn
+            )
+        else:
+            quantized_states, input_scale = pre_quant_input
+            if (
+                quantized_states.ndim != 2
+                or quantized_states.shape != hidden_states.shape
+            ):
+                raise ValueError(
+                    "Pre-quantized MXFP8 payload must match the MoE input shape, "
+                    f"got payload={tuple(quantized_states.shape)} and "
+                    f"input={tuple(hidden_states.shape)}."
+                )
+            if input_scale.shape[0] != num_tokens:
+                raise ValueError(
+                    "Pre-quantized MXFP8 scale must have one row per MoE token, "
+                    f"got scale={tuple(input_scale.shape)} and tokens={num_tokens}."
+                )
+            if quantized_states.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    "Pre-quantized MoE payload must use float8_e4m3fn, got "
+                    f"{quantized_states.dtype}."
+                )
 
         source_token_rows = torch.arange(
             num_tokens,
@@ -169,6 +192,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         topk_ids: torch.Tensor,
         num_experts: int,
         top_k: int,
+        mxfp8_pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
         if self.active_expert_range is None:
@@ -191,11 +215,16 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
 
         if (
             self.quant_mode == MXFP8_QUANT_MODE
-            and self.mxfp8_quant_before_routing
+            and (self.mxfp8_quant_before_routing or mxfp8_pre_quant_input is not None)
             and num_tokens > 0
         ):
             return self._route_prequantized_mxfp8(
-                hidden_states, topk_ids, num_experts, top_k, active_expert_range
+                hidden_states,
+                topk_ids,
+                num_experts,
+                top_k,
+                active_expert_range,
+                pre_quant_input=mxfp8_pre_quant_input,
             )
 
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (

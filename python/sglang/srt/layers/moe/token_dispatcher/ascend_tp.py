@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -143,6 +143,14 @@ class AscendTPDispatcher(BaseDispatcher):
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> AscendTPDispatchOutput:
+        return self._dispatch(hidden_states, topk_output, pre_quant_input=None)
+
+    def _dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         # BF16 finalize routing supports FP32 scales and accumulates in FP32.
         # Preserve router precision instead of truncating the weights to BF16.
@@ -165,6 +173,7 @@ class AscendTPDispatcher(BaseDispatcher):
             topk_ids,
             self.num_experts,
             top_k,
+            mxfp8_pre_quant_input=pre_quant_input,
         )
 
         self._dispatch_output = AscendTPDispatchOutput(
@@ -177,6 +186,22 @@ class AscendTPDispatcher(BaseDispatcher):
             group_list_type=self.group_list_type,
         )
         return self._dispatch_output
+
+    def supports_prequantized_mxfp8(self) -> bool:
+        return self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP8
+
+    def dispatch_prequantized_mxfp8(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Tuple[torch.Tensor, torch.Tensor],
+    ) -> AscendTPDispatchOutput:
+        if not self.supports_prequantized_mxfp8():
+            raise RuntimeError(
+                "Pre-quantized MXFP8 input requires an MXFP8 Ascend TP "
+                f"dispatcher, got {self.ascend_dispatcher_output_dtype}."
+            )
+        return self._dispatch(hidden_states, topk_output, pre_quant_input)
 
     def combine(self, combine_input: AscendTPCombineInput) -> torch.Tensor:
         if self._dispatch_output is None:
@@ -285,6 +310,14 @@ class AscendLocalEPDispatcher(BaseDispatcher):
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> AscendLocalEPDispatchOutput:
+        return self._dispatch(hidden_states, topk_output, pre_quant_input=None)
+
+    def _dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> AscendLocalEPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         if not (
             self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16
@@ -313,6 +346,7 @@ class AscendLocalEPDispatcher(BaseDispatcher):
             topk_ids,
             self.num_experts,
             local_topk_weights.shape[-1],
+            mxfp8_pre_quant_input=pre_quant_input,
         )
 
         return AscendLocalEPDispatchOutput(
@@ -323,6 +357,22 @@ class AscendLocalEPDispatcher(BaseDispatcher):
             expert_tokens=expert_tokens,
             group_list_type=self.group_list_type,
         )
+
+    def supports_prequantized_mxfp8(self) -> bool:
+        return self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP8
+
+    def dispatch_prequantized_mxfp8(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Tuple[torch.Tensor, torch.Tensor],
+    ) -> AscendLocalEPDispatchOutput:
+        if not self.supports_prequantized_mxfp8():
+            raise RuntimeError(
+                "Pre-quantized MXFP8 input requires an MXFP8 local EP "
+                f"dispatcher, got {self.ascend_dispatcher_output_dtype}."
+            )
+        return self._dispatch(hidden_states, topk_output, pre_quant_input)
 
     def combine(self, combine_input: AscendLocalEPCombineInput) -> torch.Tensor:
         # Keep the raw -1 entries emitted by row_idx_type=0. They mark routes
