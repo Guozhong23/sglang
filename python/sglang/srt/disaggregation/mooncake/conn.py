@@ -1458,12 +1458,39 @@ class MooncakeKVManager(CommonKVManager):
             dst_dim = dst_state_dim_per_tensor[dst_idx]
             outer_count = src_state_slice_outer_counts[src_idx]
 
+            slice_src_tp_size = src_attn_tp_size
+            slice_dst_tp_size = dst_attn_tp_size
+            slice_src_rank = local_tp_rank_in_group
+            slice_dst_rank = dst_tp_rank_in_group
             if src_dim * src_attn_tp_size != dst_dim * dst_attn_tp_size:
-                raise RuntimeError(
-                    "SWA KV-head geometry mismatch: "
-                    f"src={src_dim}x{src_attn_tp_size}, "
-                    f"dst={dst_dim}x{dst_attn_tp_size}"
-                )
+                # GQA can replicate one KV head across consecutive TP ranks.
+                # As in FULL KV transfer, use the true head count rather than
+                # treating those replicas as additional head shards.
+                total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+                if (
+                    total_kv_heads <= 0
+                    or src_dim != max(1, total_kv_heads // src_attn_tp_size)
+                    or dst_dim != max(1, total_kv_heads // dst_attn_tp_size)
+                    or max(src_attn_tp_size, total_kv_heads)
+                    % min(src_attn_tp_size, total_kv_heads)
+                    != 0
+                    or max(dst_attn_tp_size, total_kv_heads)
+                    % min(dst_attn_tp_size, total_kv_heads)
+                    != 0
+                ):
+                    raise RuntimeError(
+                        "SWA KV-head geometry mismatch: "
+                        f"src={src_dim}x{src_attn_tp_size}, "
+                        f"dst={dst_dim}x{dst_attn_tp_size}, "
+                        f"total_kv_heads={total_kv_heads}"
+                    )
+                # The byte-slice helper expects non-replicated shards. Collapse
+                # replica ranks only for address calculation; keep every sender
+                # participating in the existing transfer/completion protocol.
+                slice_src_tp_size = min(src_attn_tp_size, total_kv_heads)
+                slice_dst_tp_size = min(dst_attn_tp_size, total_kv_heads)
+                slice_src_rank //= src_attn_tp_size // slice_src_tp_size
+                slice_dst_rank //= dst_attn_tp_size // slice_dst_tp_size
             src_denominator = src_dim * outer_count
             dst_denominator = dst_dim * outer_count
             if (
@@ -1488,10 +1515,10 @@ class MooncakeKVManager(CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=src_attn_tp_size,
-                dst_attn_tp_size=dst_attn_tp_size,
-                dst_tp_rank_in_group=dst_tp_rank_in_group,
-                local_tp_rank_in_group=local_tp_rank_in_group,
+                src_attn_tp_size=slice_src_tp_size,
+                dst_attn_tp_size=slice_dst_tp_size,
+                dst_tp_rank_in_group=slice_dst_rank,
+                local_tp_rank_in_group=slice_src_rank,
             )
             src_offsets = np.asarray([x[0] for x in byte_blocks], dtype=np.int64)
             dst_offsets = np.asarray([x[1] for x in byte_blocks], dtype=np.int64)
