@@ -159,16 +159,17 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 f"Invalid port in ASCEND_MF_HCOM_URL: {hcom_url!r}"
             ) from exc
 
-        # Every Decode worker owns one MemFabric store. Its matching Prefill
-        # worker joins that store lazily and MemFabric assigns the two peers
-        # adjacent ranks, so reserve two ports for each SGLang world rank.
-        # DP-attention does not change world_rank.
-        worker_port = base_port + world_rank * 2
-        if not 1024 <= worker_port <= 65535:
+        # MemFabric adds its group rank to this base port. Reserve eight ports
+        # per worker for group ranks 0..7, allowing multiple Prefill peers to
+        # join a Decode store. DP-attention does not change world_rank.
+        port_stride = 8
+        worker_port = base_port + world_rank * port_stride
+        if not (1024 <= worker_port and worker_port + port_stride - 1 <= 65535):
             raise ValueError(
                 "Resolved ASCEND_MF_HCOM_URL port is out of range: "
                 f"base_port={base_port}, world_rank={world_rank}, "
-                f"role={self.role}, resolved_port={worker_port}"
+                f"role={self.role}, "
+                f"resolved_port_range={worker_port}-{worker_port + port_stride - 1}"
             )
 
         worker_hcom_url = f"{address}:{worker_port}"
