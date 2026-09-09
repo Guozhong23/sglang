@@ -15,7 +15,12 @@ def _fused_expert_bias_topk_npu(*args, **kwargs):
     return fused_expert_bias_topk_npu(*args, **kwargs)
 
 
-def _install_fake_npu_op(monkeypatch, *, force_normalized_weights=False):
+def _install_fake_npu_op(
+    monkeypatch,
+    *,
+    force_normalized_weights=False,
+    honor_sigmoid_renorm=False,
+):
     calls = []
 
     def fake_op(x, **kwargs):
@@ -23,7 +28,11 @@ def _install_fake_npu_op(monkeypatch, *, force_normalized_weights=False):
         routing_scores = scores + kwargs["bias"]
         _, ids = torch.topk(routing_scores, k=kwargs["k"], dim=-1)
         weights = scores.gather(1, ids)
-        if force_normalized_weights or kwargs["norm_type"] == 1 or kwargs["renorm"]:
+        if (
+            force_normalized_weights
+            or kwargs["renorm"]
+            or (kwargs["norm_type"] == 1 and not honor_sigmoid_renorm)
+        ):
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
         norm_scores = scores if kwargs["out_flag"] else torch.empty(0)
         calls.append(kwargs)
@@ -34,6 +43,9 @@ def _install_fake_npu_op(monkeypatch, *, force_normalized_weights=False):
 
 
 def test_sigmoid_without_renorm_gathers_unbiased_scores(monkeypatch):
+    import sglang.srt.hardware_backend.npu.moe.topk as npu_topk
+
+    monkeypatch.setattr(npu_topk, "_USE_SIGMOID_NO_RENORM_OUTPUT", False)
     calls = _install_fake_npu_op(monkeypatch, force_normalized_weights=True)
     logits = torch.tensor([[0.0, 1.0, -1.0, 0.5]], dtype=torch.float32)
     bias = torch.tensor([0.0, -0.5, 0.8, 0.0], dtype=torch.float32)
@@ -51,6 +63,31 @@ def test_sigmoid_without_renorm_gathers_unbiased_scores(monkeypatch):
     expected_weights = scores.gather(1, expected_ids)
     assert torch.equal(ids.to(torch.int64), expected_ids)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    assert calls[0]["out_flag"] is False
+
+
+def test_sigmoid_without_renorm_uses_custom_op_output(monkeypatch):
+    import sglang.srt.hardware_backend.npu.moe.topk as npu_topk
+
+    monkeypatch.setattr(npu_topk, "_USE_SIGMOID_NO_RENORM_OUTPUT", True)
+    calls = _install_fake_npu_op(monkeypatch, honor_sigmoid_renorm=True)
+    logits = torch.tensor([[0.0, 1.0, -1.0, 0.5]], dtype=torch.float32)
+    bias = torch.tensor([0.0, -0.5, 0.8, 0.0], dtype=torch.float32)
+
+    weights, ids = _fused_expert_bias_topk_npu(
+        logits,
+        bias,
+        top_k=2,
+        scoring_func="sigmoid",
+        renormalize=False,
+    )
+
+    scores = logits.sigmoid()
+    expected_ids = torch.topk(scores + bias, k=2, dim=-1).indices
+    expected_weights = scores.gather(1, expected_ids)
+    assert torch.equal(ids.to(torch.int64), expected_ids)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    assert calls[0]["renorm"] == 0
     assert calls[0]["out_flag"] is False
 
 

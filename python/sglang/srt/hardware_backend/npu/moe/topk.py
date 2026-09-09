@@ -10,6 +10,11 @@ from sglang.srt.layers.moe.topk import (
     capture_routed_experts_if_allowed,
     select_experts,
 )
+from sglang.srt.utils import get_bool_env_var
+
+_USE_SIGMOID_NO_RENORM_OUTPUT = get_bool_env_var(
+    "SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM", "false"
+)
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -78,11 +83,17 @@ def fused_expert_bias_topk_npu(
         eps=float(1e-20),
     )
 
-    if renormalize or scoring_func == "softmax":
+    if (
+        renormalize
+        or scoring_func == "softmax"
+        or _USE_SIGMOID_NO_RENORM_OUTPUT
+    ):
         # For softmax, renorm=1 makes the op normalize the selected scores. For
-        # sigmoid, MoeGatingTopK always normalizes selected scores. Both match
-        # WeLM when renormalize=True. Softmax + renormalize=False already
-        # returns the selected un-biased softmax scores.
+        # sigmoid, the custom MoeGatingTopK extension honors renorm=0 when the
+        # opt-in flag is enabled. In that configuration op_weights already are
+        # the selected un-biased sigmoid scores, so no score recomputation is
+        # needed. Keep the flag disabled with the stock CANN operator because
+        # its sigmoid path always renormalizes selected scores.
         topk_weights = op_weights
     else:
         # Sigmoid + renormalize=False cannot use op_weights: MoeGatingTopK
@@ -181,7 +192,7 @@ def fused_topk_npu(
             k_group=topk_config.topk_group if use_grouped_topk else 1,
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
-            renorm=0,
+            renorm=1 if renormalize else 0,
             # 1 for sigmoid, 0 for softmax
             norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(
