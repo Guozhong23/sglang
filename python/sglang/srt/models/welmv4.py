@@ -129,6 +129,12 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+# (qkv_width, num_cache_rows, max_position, positions_contiguous) ->
+# cannbotdsl ProviderCallable. M is dynamic in the compiled artifact, so the
+# same callable is shared by every eligible layer and prefill token count in a
+# worker process.
+_WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[int, int, int, bool], Any] = {}
+
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
     """Adapt WeLM fused RMSNorm to LayerCommunicator's return-value contract."""
@@ -2004,6 +2010,226 @@ class Qwen2MoeAttention(nn.Module):
         )
         return qkv, gate_hidden_states, gate_all_gather_on_alt_stream
 
+    def _try_npu_fused_qkv_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        need_mirror: bool,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Run the optional WeLMv4 BF16 fused QKV prologue.
+
+        The external CANNBotDSL kernel owns projection, K RMSNorm, Q/K RoPE,
+        and the paged-cache scatter. It returns materialized Q/K/V so the
+        existing Ascend attention interface remains unchanged; the caller
+        disables its normal cache write and post-projection transforms.
+
+        Only the exact profiled ordinary-prefill layout is accepted. Every
+        other mode and layout returns None and preserves the upstream path.
+        """
+        if not _is_npu or not envs.SGLANG_NPU_WELMV4_FUSED_QKV.get():
+            return None
+        if (
+            forward_batch is None
+            or hidden_states.shape[0] == 0
+            or forward_batch.batch_size != 1
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        if (
+            self.q_norm is not None
+            or self.k_norm is None
+            or self.head_dim != 256
+            or self.qk_rope_head_dim != 64
+            or self.num_heads != 6
+            or self.num_kv_heads != 1
+            or hidden_states.ndim != 2
+            or tuple(hidden_states.shape[1:]) != (2048,)
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or not self.rotary_emb.is_neox_style
+            or self.rotary_emb.head_size != 256
+            or self.rotary_emb.rotary_dim != 64
+        ):
+            return None
+
+        # KV-mirror source layers expose the post-load combined 2560-row
+        # projection directly on the attention module. Plain layers retain
+        # their normal unquantized QKVParallelLinear payload.
+        if need_mirror:
+            weight = getattr(self, "qkv_proj_weight", None)
+            proj_bias = getattr(self, "qkv_proj_bias", None)
+            expected_width = 2560
+        else:
+            projection = self.qkv_proj
+            if type(getattr(projection, "quant_method", None)).__name__ != (
+                "UnquantizedLinearMethod"
+            ):
+                return None
+            weight = getattr(projection, "weight", None)
+            proj_bias = getattr(projection, "bias", None)
+            expected_width = 2048
+
+        gamma = self.k_norm.weight
+        cos_sin = self.rotary_emb.cos_sin_cache
+        if (
+            weight is None
+            or proj_bias is not None
+            or tuple(weight.shape) != (expected_width, 2048)
+            or weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or gamma.dtype != torch.bfloat16
+            or tuple(gamma.shape) != (256,)
+            or not gamma.is_contiguous()
+            or cos_sin.ndim != 2
+            or cos_sin.shape[1] != 64
+            or cos_sin.dtype != torch.float32
+            or not cos_sin.is_contiguous()
+        ):
+            return None
+        num_tokens = hidden_states.shape[0]
+        if (
+            positions is None
+            or positions.ndim != 1
+            or positions.shape[0] != num_tokens
+            or positions.dtype not in (torch.int32, torch.int64)
+            or not positions.is_contiguous()
+        ):
+            return None
+
+        try:
+            from sglang.srt.model_executor.forward_context import (
+                get_attn_backend,
+                get_token_to_kv_pool,
+            )
+
+            backend = get_attn_backend()
+            pool = get_token_to_kv_pool()
+        except (AssertionError, AttributeError):
+            return None
+
+        slot_mapping = getattr(forward_batch, "out_cache_loc", None)
+        is_swa_layer = getattr(backend, "_is_swa_layer", None)
+        if callable(is_swa_layer) and is_swa_layer(self.attn):
+            metadata = getattr(backend, "forward_metadata", None)
+            slot_mapping = getattr(metadata, "swa_out_cache_loc", None)
+        if (
+            slot_mapping is None
+            or slot_mapping.ndim != 1
+            or slot_mapping.shape[0] != num_tokens
+            or slot_mapping.dtype not in (torch.int32, torch.int64)
+            or slot_mapping.device != hidden_states.device
+        ):
+            return None
+
+        try:
+            k_cache = pool.get_key_buffer(self.attn.layer_id)
+            v_cache = pool.get_value_buffer(self.attn.layer_id)
+        except (AttributeError, KeyError, NotImplementedError):
+            return None
+        if (
+            k_cache is None
+            or v_cache is None
+            or k_cache.dtype != torch.bfloat16
+            or v_cache.dtype != torch.bfloat16
+            or k_cache.device != hidden_states.device
+            or v_cache.device != hidden_states.device
+            or k_cache.shape[-1] != 256
+            or v_cache.shape[-1] != 256
+            or not k_cache.is_contiguous()
+            or not v_cache.is_contiguous()
+            or k_cache.numel() != v_cache.numel()
+        ):
+            return None
+        k_cache_flat = k_cache.view(-1, self.head_dim)
+        v_cache_flat = v_cache.view(-1, self.head_dim)
+
+        try:
+            from fused_qkv_proj_norm_rope_cache import (
+                compile_aot as compile_fused_qkv_aot,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "SGLANG_NPU_WELMV4_FUSED_QKV=1 requires "
+                "fused_qkv_proj_norm_rope_cache.py and cannbotdsl on "
+                "PYTHONPATH."
+            ) from exc
+
+        # All static extents are part of the CANNBotDSL artifact key. M is a
+        # symbolic Dim, so the compiled callable handles every prompt length.
+        artifact_key = (
+            expected_width,
+            k_cache_flat.shape[0],
+            cos_sin.shape[0],
+            True,
+        )
+        fused_program = _WELMV4_FUSED_QKV_PROGRAMS.get(artifact_key)
+        if fused_program is None:
+            logger.info(
+                "Compiling WeLMv4 fused QKV prefill artifact: "
+                "width=%s cache_rows=%s max_position=%s",
+                expected_width,
+                k_cache_flat.shape[0],
+                cos_sin.shape[0],
+            )
+            fused_program = compile_fused_qkv_aot(
+                expected_width,
+                k_cache_flat.shape[0],
+                cos_sin.shape[0],
+                return_v=True,
+                positions_contiguous=True,
+            )
+            _WELMV4_FUSED_QKV_PROGRAMS[artifact_key] = fused_program
+
+        if positions.dtype == torch.int32:
+            positions = positions.to(torch.int64)
+        if slot_mapping.dtype == torch.int32:
+            slot_mapping = slot_mapping.to(torch.int64)
+
+        q = torch.empty(
+            (num_tokens, self.q_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        k = torch.empty(
+            (num_tokens, self.kv_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        v = torch.empty_like(k)
+        if need_mirror:
+            mirror_k = torch.empty_like(k)
+            mirror_v = torch.empty_like(k)
+        else:
+            # The plain-layer specialization folds the mirror stores away.
+            mirror_k = torch.empty(
+                (1, self.head_dim),
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            mirror_v = mirror_k
+
+        fused_program(
+            hidden_states,
+            weight,
+            gamma.view(1, self.head_dim),
+            positions,
+            cos_sin,
+            slot_mapping,
+            q,
+            k,
+            v,
+            mirror_k,
+            mirror_v,
+            k_cache_flat,
+            v_cache_flat,
+            float(self.k_norm.eps),
+        )
+        if need_mirror:
+            return q, k, v, mirror_k, mirror_v
+        return q, k, v
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2039,6 +2265,7 @@ class Qwen2MoeAttention(nn.Module):
                 "active draft decode."
             )
 
+        fused_qkv = None
         if frozen_mtp_decode:
             if hasattr(self, "kv_mirror_query_proj"):
                 q, _ = self.kv_mirror_query_proj(hidden_states)
@@ -2088,7 +2315,28 @@ class Qwen2MoeAttention(nn.Module):
             else:
                 q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         elif self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
-            if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
+            fused_qkv = self._try_npu_fused_qkv_prefill(
+                hidden_states,
+                positions,
+                forward_batch,
+                need_mirror=True,
+            )
+            if fused_qkv is not None:
+                q, k, v, mirror_k, mirror_v = fused_qkv
+                consumer_layer_id = self.kv_mirror_layers[
+                    self.kv_mirror_imitated_layers.index(
+                        self.kv_mirror_layer_idx
+                    )
+                ]
+                if consumer_layer_id >= LayerManager.num_target_layers:
+                    _set_welm_mtp_mirror_state(
+                        forward_batch, consumer_layer_id, mirror_k, mirror_v
+                    )
+                else:
+                    KVMirrorManager.set_kv_activation(
+                        self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                    )
+            elif getattr(self, "_kv_mirror_mxfp8_source_projection", False):
                 if reuse_prefill_mxfp8_input:
                     (
                         qkv,
@@ -2169,7 +2417,16 @@ class Qwen2MoeAttention(nn.Module):
                         hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
                     )
         else:
-            if reuse_prefill_mxfp8_input:
+            if not reuse_prefill_mxfp8_input:
+                fused_qkv = self._try_npu_fused_qkv_prefill(
+                    hidden_states,
+                    positions,
+                    forward_batch,
+                    need_mirror=False,
+                )
+            if fused_qkv is not None:
+                q, k, v = fused_qkv
+            elif reuse_prefill_mxfp8_input:
                 (
                     qkv,
                     prefill_gate_hidden_states,
@@ -2179,7 +2436,10 @@ class Qwen2MoeAttention(nn.Module):
                 )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if fused_qkv is None:
+                q, k, v = qkv.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=-1
+                )
 
         gate = None
         is_prefill_batch = (
@@ -2229,7 +2489,7 @@ class Qwen2MoeAttention(nn.Module):
             k_by_head = k.view(
                 *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
             )
-            if self.k_norm is not None:
+            if self.k_norm is not None and fused_qkv is None:
                 k_by_head = mmq_style_k_rms_norm(
                     k_by_head.contiguous(),
                     self.k_norm.weight,
@@ -2250,7 +2510,11 @@ class Qwen2MoeAttention(nn.Module):
         )
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-        if k is None:
+        if fused_qkv is not None:
+            # Q/K already include the fused K norm and tail RoPE.
+            q = q.view(q_shape)
+            k = k.view(k_shape)
+        elif k is None:
             # WeLM RoPE updates Q and K in place. They must not alias: passing
             # Q as both operands would rotate the same storage twice on NPU.
             unused_key = q.clone()
@@ -2325,7 +2589,9 @@ class Qwen2MoeAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not frozen_mtp_decode,
+            # The fused prologue already scattered K/V into this layer's
+            # paged cache (using the SWA-translated slots when applicable).
+            save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
             **attn_kwargs,
         )
         if self.gated_self_attention_headwise:
