@@ -77,6 +77,24 @@ def _load_welm_swa_sink_attention_ops():
     return swa_paged_prefill_impl, swa_paged_decode_impl
 
 
+def _load_cann_ops_transformer_flash_attn():
+    """Load the PR-9691 FlashAttn torch extension only when requested.
+
+    The custom package is intentionally optional: CPU-only imports and the
+    existing Triton/FIA paths must keep working when it is not installed.
+    """
+    try:
+        from cann_ops_transformer.ops import flash_attn, flash_attn_metadata
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "SGLANG_NPU_USE_OPS_FLASH_ATTN_SINK=1 requires an ops-transformer "
+            "build containing PR 9691 (flash_attn native sinks) and its "
+            "cann_ops_transformer torch extension."
+        ) from exc
+
+    return flash_attn, flash_attn_metadata
+
+
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -133,6 +151,12 @@ class ForwardMetadata:
     full_sink_prefill_cu_q_lens: Optional[torch.Tensor] = None
     full_sink_prefill_schedule: Optional[tuple] = None
     full_sink_prefill_schedule_key: Optional[tuple] = None
+
+    # PR-9691 flash_attn_metadata is an AICPU load-balancing operation. Cache
+    # its output across layers with identical attention semantics in one
+    # forward pass instead of paying the metadata cost once per layer.
+    ops_flash_attn_sink_metadata: Optional[dict] = None
+    ops_flash_attn_sink_decode_cu_q_lens: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -383,6 +407,9 @@ class AscendAttnBackend(AttentionBackend):
         self.enable_welm_fia_sink_lse = get_bool_env_var(
             "ASCEND_USE_FIA_SINK_LSE", "False"
         )
+        self.enable_welm_ops_flash_attn_sink = get_bool_env_var(
+            "SGLANG_NPU_USE_OPS_FLASH_ATTN_SINK", "False"
+        )
         # A WeLMv4 decode graph can contain a mixture of full-attention,
         # sliding-window, and attention-sink layers. Keep non-sink layers on
         # FIA v2 during graph capture so they share one dynamic CPU sequence-
@@ -401,6 +428,11 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
+        )
+        self.ops_flash_attn_sink_mask = (
+            self.fia_mask.to(torch.int8)
+            if self.enable_welm_ops_flash_attn_sink
+            else None
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
@@ -480,6 +512,22 @@ class AscendAttnBackend(AttentionBackend):
             self.is_welm_v4
             and sinks is not None
             and not self.enable_welm_fia_sink_lse
+            # PR 9691's torchair converter still reports GE unsupported.
+            # Preserve the graph-safe Triton path during decode capture.
+            and (
+                not self.enable_welm_ops_flash_attn_sink or self.graph_mode
+            )
+        )
+
+    def _use_welm_ops_flash_attn_sink(
+        self, sinks: Optional[torch.Tensor]
+    ) -> bool:
+        """Use ops-transformer PR-9691 native sink attention."""
+        return (
+            self.is_welm_v4
+            and sinks is not None
+            and self.enable_welm_ops_flash_attn_sink
+            and not self.graph_mode
         )
 
     def _use_welm_fia_sink_lse(self, sinks: Optional[torch.Tensor]) -> bool:
@@ -488,6 +536,9 @@ class AscendAttnBackend(AttentionBackend):
             self.is_welm_v4
             and sinks is not None
             and self.enable_welm_fia_sink_lse
+            and (
+                not self.enable_welm_ops_flash_attn_sink or self.graph_mode
+            )
         )
 
     @staticmethod
@@ -602,6 +653,221 @@ class AscendAttnBackend(AttentionBackend):
                 f"count: q={q.shape[0]}, real={real_q_tokens}."
             )
         return cu_q_lens
+
+    def _get_welm_ops_flash_attn_decode_cu_q_lens(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return fixed one-query-per-request TND offsets for decode."""
+        metadata = self.forward_metadata
+        cu_q_lens = metadata.ops_flash_attn_sink_decode_cu_q_lens
+        if (
+            cu_q_lens is None
+            or cu_q_lens.numel() != batch_size + 1
+            or cu_q_lens.device != device
+        ):
+            cu_q_lens = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            metadata.ops_flash_attn_sink_decode_cu_q_lens = cu_q_lens
+        return cu_q_lens
+
+    def _forward_welm_ops_flash_attn_sink(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sinks: torch.Tensor,
+        *,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Run PR-9691 FlashAttn with native sink and paged KV cache.
+
+        SGLang stores KV as [block, block_size, head, dim], which maps to
+        PA_BBND directly.  This path therefore needs neither an external LSE
+        correction nor a KV transpose/copy.
+        """
+        flash_attn, flash_attn_metadata = (
+            _load_cann_ops_transformer_flash_attn()
+        )
+
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise RuntimeError(
+                "ops-transformer FlashAttn sink path requires equal QK/V "
+                f"head dimensions, got QK={layer.qk_head_dim}, "
+                f"V={layer.v_head_dim}."
+            )
+        if layer.tp_k_head_num != layer.tp_v_head_num:
+            raise RuntimeError(
+                "ops-transformer FlashAttn sink path requires equal K/V head "
+                f"counts, got K={layer.tp_k_head_num}, V={layer.tp_v_head_num}."
+            )
+        if layer.qk_head_dim not in (64, 128, 256):
+            raise RuntimeError(
+                "ops-transformer FlashAttn supports head dimensions "
+                f"64/128/256, got {layer.qk_head_dim}."
+            )
+        if self.page_size < 16 or self.page_size > 1024 or self.page_size % 16:
+            raise RuntimeError(
+                "ops-transformer PA_BBND requires page_size in [16, 1024] "
+                f"and divisible by 16, got {self.page_size}."
+            )
+        if sinks.dtype != torch.float32 or sinks.dim() != 1:
+            raise RuntimeError(
+                "ops-transformer FlashAttn requires sinks with dtype float32 "
+                f"and shape [Q_N], got dtype={sinks.dtype}, "
+                f"shape={tuple(sinks.shape)}."
+            )
+        if sinks.shape[0] != layer.tp_q_head_num:
+            raise RuntimeError(
+                "ops-transformer FlashAttn sink head count mismatch: "
+                f"sinks={sinks.shape[0]}, Q_N={layer.tp_q_head_num}."
+            )
+
+        q_3d = q.reshape(
+            -1, layer.tp_q_head_num, layer.qk_head_dim
+        ).contiguous()
+        seq_lens_i32 = seq_lens.to(
+            device=q.device, dtype=torch.int32
+        ).contiguous()
+        block_tables_i32 = block_tables.to(
+            device=q.device, dtype=torch.int32
+        ).contiguous()
+        sinks = sinks.contiguous()
+
+        if is_prefill:
+            cu_q_lens = self._get_welm_sink_prefill_cu_q_lens(q_3d)
+            extend_lens_cpu = self.forward_metadata.extend_seq_lens_cpu_int
+            if extend_lens_cpu is None:
+                raise RuntimeError(
+                    "ops-transformer FlashAttn prefill requires CPU extend "
+                    "sequence lengths."
+                )
+            real_q_tokens = int(extend_lens_cpu.sum().item())
+        else:
+            real_q_tokens = seq_lens_i32.numel()
+            cu_q_lens = self._get_welm_ops_flash_attn_decode_cu_q_lens(
+                real_q_tokens, q.device
+            )
+
+        if block_tables_i32.shape[0] != seq_lens_i32.numel():
+            raise RuntimeError(
+                "ops-transformer FlashAttn requires one block table per "
+                f"request, got tables={block_tables_i32.shape[0]}, "
+                f"requests={seq_lens_i32.numel()}."
+            )
+        if q_3d.shape[0] < real_q_tokens:
+            raise RuntimeError(
+                "ops-transformer FlashAttn query buffer is shorter than the "
+                f"real token count: q={q_3d.shape[0]}, real={real_q_tokens}."
+            )
+        if real_q_tokens == 0:
+            return q.new_zeros(
+                (q_3d.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
+
+        k_cache_4d = k_cache.view(
+            -1,
+            self.page_size,
+            layer.tp_k_head_num,
+            layer.qk_head_dim,
+        )
+        v_cache_4d = v_cache.view(
+            -1,
+            self.page_size,
+            layer.tp_v_head_num,
+            layer.v_head_dim,
+        )
+
+        is_window = self._has_layerwise_sliding_window(layer)
+        if is_window:
+            mask_mode = 4
+            win_left = int(layer.sliding_window_size)
+            win_right = 0
+            attn_mask = self.ops_flash_attn_sink_mask
+        elif is_prefill:
+            mask_mode = 3
+            win_left = -1
+            win_right = -1
+            attn_mask = self.ops_flash_attn_sink_mask
+        else:
+            mask_mode = 0
+            win_left = -1
+            win_right = -1
+            attn_mask = None
+
+        if mask_mode != 0 and attn_mask is None:
+            raise RuntimeError(
+                "ops-transformer FlashAttn mask was not initialized; enable "
+                "SGLANG_NPU_USE_OPS_FLASH_ATTN_SINK before constructing the "
+                "attention backend."
+            )
+
+        metadata_cache = self.forward_metadata.ops_flash_attn_sink_metadata
+        if metadata_cache is None:
+            metadata_cache = {}
+            self.forward_metadata.ops_flash_attn_sink_metadata = metadata_cache
+        metadata_key = (
+            is_prefill,
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.qk_head_dim,
+            mask_mode,
+            win_left,
+            win_right,
+            seq_lens_i32.numel(),
+        )
+        metadata = metadata_cache.get(metadata_key)
+        if metadata is None:
+            metadata = flash_attn_metadata(
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                layer.qk_head_dim,
+                cu_seqlens_q=cu_q_lens,
+                seqused_kv=seq_lens_i32,
+                mask_mode=mask_mode,
+                win_left=win_left,
+                win_right=win_right,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                layout_out="TND",
+            )
+            metadata_cache[metadata_key] = metadata
+
+        output, _ = flash_attn(
+            q_3d[:real_q_tokens],
+            k_cache_4d,
+            v_cache_4d,
+            block_table=block_tables_i32,
+            cu_seqlens_q=cu_q_lens,
+            seqused_kv=seq_lens_i32,
+            sinks=sinks,
+            attn_mask=attn_mask,
+            metadata=metadata,
+            softmax_scale=layer.scaling,
+            mask_mode=mask_mode,
+            win_left=win_left,
+            win_right=win_right,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            layout_out="TND",
+            return_softmax_lse=False,
+        )
+        if real_q_tokens != q_3d.shape[0]:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        q_3d.shape[0] - real_q_tokens,
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                    ),
+                ],
+                dim=0,
+            )
+        return output.reshape(output.shape[0], -1)
 
     def _get_welm_sink_prefill_max_q_len(
         self, forward_batch: ForwardBatch
@@ -1964,6 +2230,17 @@ class AscendAttnBackend(AttentionBackend):
             if self._is_swa_layer(layer)
             else self.forward_metadata.block_tables
         )
+        if self._use_welm_ops_flash_attn_sink(sinks):
+            return self._forward_welm_ops_flash_attn_sink(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                layer=layer,
+                block_tables=block_tables,
+                seq_lens=self.forward_metadata.seq_lens[:num_queries],
+                sinks=sinks,
+                is_prefill=False,
+            )
         if self._use_welm_sink_triton(sinks):
             # KV-mirror prefill has one query per request, so it has the same
             # shape contract as the paged Triton decode kernel.
@@ -2219,6 +2496,22 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
+                if self._use_welm_ops_flash_attn_sink(sinks):
+                    if is_cp_mode:
+                        raise NotImplementedError(
+                            "ops-transformer FlashAttn native sinks are not "
+                            "yet integrated with context-parallel prefill."
+                        )
+                    return self._forward_welm_ops_flash_attn_sink(
+                        q=q,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        layer=layer,
+                        block_tables=block_tables,
+                        seq_lens=self.forward_metadata.seq_lens,
+                        sinks=sinks,
+                        is_prefill=True,
+                    )
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
                     use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self._can_use_tnd(layer):
@@ -3317,6 +3610,19 @@ class AscendAttnBackend(AttentionBackend):
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
+            if self._use_welm_ops_flash_attn_sink(sinks):
+                k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                return self._forward_welm_ops_flash_attn_sink(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    layer=layer,
+                    block_tables=block_tables,
+                    seq_lens=self.forward_metadata.seq_lens,
+                    sinks=sinks,
+                    is_prefill=False,
+                )
             if (
                 self.use_fia or self.force_fia_v2_decode_graph
             ) and not self._use_welm_sink_triton(sinks):
@@ -3672,6 +3978,17 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
+                if self._use_welm_ops_flash_attn_sink(sinks):
+                    return self._forward_welm_ops_flash_attn_sink(
+                        q=q,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        layer=layer,
+                        block_tables=block_tables,
+                        seq_lens=self.forward_metadata.seq_lens,
+                        sinks=sinks,
+                        is_prefill=False,
+                    )
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
                     use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self.forward_metadata.seq_lens_cpu_int is None:

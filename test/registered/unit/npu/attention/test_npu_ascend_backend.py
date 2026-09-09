@@ -116,11 +116,32 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
     def setUp(self):
         self.backend = AscendAttnBackend.__new__(AscendAttnBackend)
         self.backend.enable_welm_fia_sink_lse = False
+        self.backend.enable_welm_ops_flash_attn_sink = False
+        self.backend.graph_mode = False
 
     def test_welm_sink_tensor_uses_triton(self):
         self.backend.is_welm_v4 = True
         self.assertTrue(self.backend._use_welm_sink_triton(torch.ones(6)))
         self.assertFalse(self.backend._use_welm_sink_triton(None))
+
+    def test_ops_transformer_sink_backend_overrides_old_sink_paths(self):
+        self.backend.is_welm_v4 = True
+        self.backend.enable_welm_ops_flash_attn_sink = True
+        self.backend.enable_welm_fia_sink_lse = True
+        sinks = torch.ones(6)
+
+        self.assertTrue(self.backend._use_welm_ops_flash_attn_sink(sinks))
+        self.assertFalse(self.backend._use_welm_sink_triton(sinks))
+        self.assertFalse(self.backend._use_welm_fia_sink_lse(sinks))
+
+    def test_ops_transformer_sink_backend_falls_back_in_graph_mode(self):
+        self.backend.is_welm_v4 = True
+        self.backend.enable_welm_ops_flash_attn_sink = True
+        self.backend.graph_mode = True
+        sinks = torch.ones(6)
+
+        self.assertFalse(self.backend._use_welm_ops_flash_attn_sink(sinks))
+        self.assertTrue(self.backend._use_welm_sink_triton(sinks))
 
     def test_other_models_keep_existing_dispatch(self):
         self.backend.is_welm_v4 = False
@@ -343,6 +364,137 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.assertEqual(call["q"].shape, (3, 4, 2))
         self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
 
+    def test_ops_transformer_prefill_uses_native_sink_and_reuses_metadata(self):
+        self.backend.page_size = 16
+        self.backend.ops_flash_attn_sink_mask = torch.triu(
+            torch.ones(2048, 2048, dtype=torch.int8), diagonal=1
+        )
+        self.backend.forward_metadata = ForwardMetadata(
+            extend_seq_lens_cpu_int=torch.tensor([2, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            scaling=0.5,
+            sliding_window_size=-1,
+        )
+        q = torch.randn(4, 8)
+        k_cache = torch.randn(32, 2, 2)
+        v_cache = torch.randn(32, 2, 2)
+        block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
+        sinks = torch.ones(4, dtype=torch.float32)
+        fake_metadata = MagicMock(return_value=torch.tensor([7], dtype=torch.int32))
+        fake_flash_attn = MagicMock(
+            side_effect=lambda query, *_args, **_kwargs: (
+                torch.ones_like(query),
+                torch.empty(0),
+            )
+        )
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "_load_cann_ops_transformer_flash_attn",
+            return_value=(fake_flash_attn, fake_metadata),
+        ):
+            output = self.backend._forward_welm_ops_flash_attn_sink(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                block_tables,
+                self.backend.forward_metadata.seq_lens,
+                sinks,
+                is_prefill=True,
+            )
+            self.backend._forward_welm_ops_flash_attn_sink(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                block_tables,
+                self.backend.forward_metadata.seq_lens,
+                sinks,
+                is_prefill=True,
+            )
+
+        self.assertEqual(output.shape, (4, 8))
+        self.assertTrue(torch.equal(output[:3], torch.ones_like(output[:3])))
+        self.assertTrue(torch.equal(output[3], torch.zeros_like(output[3])))
+        self.assertEqual(fake_metadata.call_count, 1)
+        metadata_call = fake_metadata.call_args.kwargs
+        self.assertEqual(metadata_call["mask_mode"], 3)
+        self.assertEqual(metadata_call["layout_q"], "TND")
+        self.assertEqual(metadata_call["layout_kv"], "PA_BBND")
+        flash_call = fake_flash_attn.call_args.kwargs
+        self.assertIs(flash_call["sinks"], sinks)
+        self.assertEqual(flash_call["attn_mask"].dtype, torch.int8)
+        self.assertFalse(flash_call["return_softmax_lse"])
+
+    def test_ops_transformer_swa_decode_uses_band_mask(self):
+        self.backend.page_size = 16
+        self.backend.ops_flash_attn_sink_mask = torch.triu(
+            torch.ones(2048, 2048, dtype=torch.int8), diagonal=1
+        )
+        self.backend.forward_metadata = ForwardMetadata()
+        layer = SimpleNamespace(
+            tp_q_head_num=6,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            qk_head_dim=256,
+            v_head_dim=256,
+            scaling=0.0625,
+            sliding_window_size=511,
+        )
+        q = torch.randn(3, 6 * 256)
+        k_cache = torch.randn(32, 1, 256)
+        v_cache = torch.randn(32, 1, 256)
+        block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
+        seq_lens = torch.tensor([2, 2], dtype=torch.int32)
+        sinks = torch.ones(6, dtype=torch.float32)
+        fake_metadata = MagicMock(return_value=torch.tensor([7], dtype=torch.int32))
+        fake_flash_attn = MagicMock(
+            side_effect=lambda query, *_args, **_kwargs: (
+                torch.ones_like(query),
+                torch.empty(0),
+            )
+        )
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "_load_cann_ops_transformer_flash_attn",
+            return_value=(fake_flash_attn, fake_metadata),
+        ):
+            output = self.backend._forward_welm_ops_flash_attn_sink(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                block_tables,
+                seq_lens,
+                sinks,
+                is_prefill=False,
+            )
+
+        self.assertEqual(output.shape, (3, 6 * 256))
+        self.assertTrue(torch.equal(output[:2], torch.ones_like(output[:2])))
+        self.assertTrue(torch.equal(output[2], torch.zeros_like(output[2])))
+        metadata_call = fake_metadata.call_args.kwargs
+        self.assertEqual(metadata_call["mask_mode"], 4)
+        self.assertEqual(metadata_call["win_left"], 511)
+        self.assertEqual(metadata_call["win_right"], 0)
+        flash_call = fake_flash_attn.call_args
+        self.assertEqual(flash_call.args[0].shape, (2, 6, 256))
+        self.assertTrue(
+            torch.equal(
+                flash_call.kwargs["cu_seqlens_q"],
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+            )
+        )
+
     def test_full_sink_decode_ignores_attention_dp_padding(self):
         self.backend.page_size = 2
         self.backend.graph_mode = False
@@ -535,6 +687,8 @@ class TestForwardMetadata(unittest.TestCase):
             "full_sink_prefill_cu_q_lens",
             "full_sink_prefill_schedule",
             "full_sink_prefill_schedule_key",
+            "ops_flash_attn_sink_metadata",
+            "ops_flash_attn_sink_decode_cu_q_lens",
         }
         self.assertEqual(names, expected)
 
