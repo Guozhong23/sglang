@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -410,6 +414,28 @@ class AscendAttnBackend(AttentionBackend):
         self.enable_welm_ops_flash_attn_sink = get_bool_env_var(
             "SGLANG_NPU_USE_OPS_FLASH_ATTN_SINK", "False"
         )
+        self.ops_flash_attn_debug_dir = os.environ.get(
+            "SGLANG_NPU_FLASH_ATTN_DEBUG_DIR", ""
+        ).strip()
+        self.ops_flash_attn_debug_tensors = get_bool_env_var(
+            "SGLANG_NPU_FLASH_ATTN_DEBUG_TENSORS", "False"
+        )
+        self.ops_flash_attn_debug_full_kv = get_bool_env_var(
+            "SGLANG_NPU_FLASH_ATTN_DEBUG_FULL_KV", "False"
+        )
+        self.ops_flash_attn_debug_rank = int(
+            os.environ.get("SGLANG_NPU_FLASH_ATTN_DEBUG_RANK", "0")
+        )
+        self.ops_flash_attn_debug_layer = int(
+            os.environ.get("SGLANG_NPU_FLASH_ATTN_DEBUG_LAYER", "-1")
+        )
+        self.ops_flash_attn_debug_stage = os.environ.get(
+            "SGLANG_NPU_FLASH_ATTN_DEBUG_STAGE", "prefill"
+        ).strip().lower()
+        self.ops_flash_attn_debug_limit = int(
+            os.environ.get("SGLANG_NPU_FLASH_ATTN_DEBUG_LIMIT", "1")
+        )
+        self._ops_flash_attn_debug_count = 0
         # A WeLMv4 decode graph can contain a mixture of full-attention,
         # sliding-window, and attention-sink layers. Keep non-sink layers on
         # FIA v2 during graph capture so they share one dynamic CPU sequence-
@@ -671,6 +697,267 @@ class AscendAttnBackend(AttentionBackend):
             metadata.ops_flash_attn_sink_decode_cu_q_lens = cu_q_lens
         return cu_q_lens
 
+    @staticmethod
+    def _ops_flash_attn_tensor_info(
+        tensor: Optional[torch.Tensor],
+    ) -> Optional[dict]:
+        if tensor is None:
+            return None
+        return {
+            "shape": list(tensor.shape),
+            "stride": list(tensor.stride()),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "contiguous": tensor.is_contiguous(),
+            "numel": tensor.numel(),
+            "element_size": tensor.element_size(),
+            "bytes": tensor.numel() * tensor.element_size(),
+        }
+
+    def _should_dump_ops_flash_attn(
+        self, layer: RadixAttention, is_prefill: bool
+    ) -> bool:
+        if not self.ops_flash_attn_debug_dir:
+            return False
+        if self._ops_flash_attn_debug_count >= self.ops_flash_attn_debug_limit:
+            return False
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else 0
+        )
+        if rank != self.ops_flash_attn_debug_rank:
+            return False
+        if (
+            self.ops_flash_attn_debug_layer >= 0
+            and layer.layer_id != self.ops_flash_attn_debug_layer
+        ):
+            return False
+        stage = "prefill" if is_prefill else "decode"
+        return self.ops_flash_attn_debug_stage in ("any", stage)
+
+    @staticmethod
+    def _compact_pa_cache_for_flash_attn_dump(
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Keep only PA blocks referenced by this call and remap block ids.
+
+        A production KV pool can be multiple GiB even when the failing request
+        references a single page. The compact cache and remapped block table
+        are mathematically equivalent inputs for standalone operator replay.
+        """
+        if block_tables.dim() != 2:
+            raise RuntimeError(
+                "FlashAttn replay dump requires a 2D block table, got "
+                f"shape={tuple(block_tables.shape)}."
+            )
+        if k_cache.shape[0] != v_cache.shape[0]:
+            raise RuntimeError(
+                "FlashAttn replay dump requires K/V caches with the same "
+                f"block count, got K={k_cache.shape[0]}, V={v_cache.shape[0]}."
+            )
+        block_tables_cpu = block_tables.detach().to(
+            device="cpu", dtype=torch.int32
+        )
+        seq_lens_cpu = seq_lens.detach().to(device="cpu", dtype=torch.int32)
+        replay_block_tables = torch.zeros_like(block_tables_cpu)
+        referenced_block_ids = []
+        used_blocks_per_request = []
+        for request_idx, seq_len in enumerate(seq_lens_cpu.tolist()):
+            used_blocks = (int(seq_len) + page_size - 1) // page_size
+            if used_blocks > block_tables_cpu.shape[1]:
+                raise RuntimeError(
+                    "FlashAttn block table is shorter than seqused_kv: "
+                    f"request={request_idx}, seq_len={seq_len}, "
+                    f"required_blocks={used_blocks}, "
+                    f"table_width={block_tables_cpu.shape[1]}."
+                )
+            used_blocks_per_request.append(used_blocks)
+            request_block_ids = [
+                int(block_id)
+                for block_id in block_tables_cpu[
+                    request_idx, :used_blocks
+                ].tolist()
+            ]
+            if any(block_id < 0 for block_id in request_block_ids):
+                raise RuntimeError(
+                    "FlashAttn block table contains a negative id in its "
+                    f"valid range: request={request_idx}, "
+                    f"block_ids={request_block_ids}."
+                )
+            referenced_block_ids.extend(request_block_ids)
+
+        unique_block_ids = sorted(set(referenced_block_ids))
+        if not unique_block_ids:
+            raise RuntimeError(
+                "FlashAttn tensor dump found no referenced PA blocks for a "
+                "non-empty attention call."
+            )
+        if unique_block_ids[-1] >= k_cache.shape[0]:
+            raise RuntimeError(
+                "FlashAttn block table references a block outside the KV "
+                f"cache: max_block_id={unique_block_ids[-1]}, "
+                f"num_cache_blocks={k_cache.shape[0]}."
+            )
+
+        block_id_to_replay = {
+            block_id: replay_id
+            for replay_id, block_id in enumerate(unique_block_ids)
+        }
+        for request_idx, used_blocks in enumerate(used_blocks_per_request):
+            for block_idx in range(used_blocks):
+                original_id = int(block_tables_cpu[request_idx, block_idx])
+                replay_block_tables[request_idx, block_idx] = block_id_to_replay[
+                    original_id
+                ]
+
+        block_ids_device = torch.tensor(
+            unique_block_ids, dtype=torch.long, device=k_cache.device
+        )
+        compact_k = k_cache.index_select(0, block_ids_device).detach().cpu()
+        compact_v = v_cache.index_select(0, block_ids_device).detach().cpu()
+        return (
+            compact_k,
+            compact_v,
+            replay_block_tables,
+            torch.tensor(unique_block_ids, dtype=torch.int64),
+        )
+
+    def _dump_ops_flash_attn_debug_inputs(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sinks: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        metadata: torch.Tensor,
+        layer: RadixAttention,
+        is_prefill: bool,
+        mask_mode: int,
+        win_left: int,
+        win_right: int,
+    ) -> None:
+        if not self._should_dump_ops_flash_attn(layer, is_prefill):
+            return
+
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else 0
+        )
+        stage = "prefill" if is_prefill else "decode"
+        dump_index = self._ops_flash_attn_debug_count
+        self._ops_flash_attn_debug_count += 1
+        dump_dir = Path(self.ops_flash_attn_debug_dir)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        stem = (
+            f"flash_attn_rank{rank}_layer{layer.layer_id}_{stage}_"
+            f"{dump_index}_{time.time_ns()}"
+        )
+
+        tensor_inputs = {
+            "q": q,
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "block_table": block_tables,
+            "cu_seqlens_q": cu_q_lens,
+            "seqused_kv": seq_lens,
+            "sinks": sinks,
+            "attn_mask": attn_mask,
+            "metadata": metadata,
+        }
+        manifest = {
+            "format_version": 1,
+            "rank": rank,
+            "layer_id": layer.layer_id,
+            "stage": stage,
+            "attributes": {
+                "num_heads_q": layer.tp_q_head_num,
+                "num_heads_kv": layer.tp_k_head_num,
+                "head_dim": layer.qk_head_dim,
+                "page_size": self.page_size,
+                "softmax_scale": layer.scaling,
+                "mask_mode": mask_mode,
+                "win_left": win_left,
+                "win_right": win_right,
+                "layout_q": "TND",
+                "layout_kv": "PA_BBND",
+                "layout_out": "TND",
+                "return_softmax_lse": False,
+            },
+            "tensors": {
+                name: self._ops_flash_attn_tensor_info(tensor)
+                for name, tensor in tensor_inputs.items()
+            },
+            "small_tensor_values": {
+                name: tensor.detach().cpu().tolist()
+                for name, tensor in tensor_inputs.items()
+                if tensor is not None and tensor.numel() <= 64
+            },
+        }
+
+        manifest_path = dump_dir / f"{stem}.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        logger.warning("Saved FlashAttn shape manifest to %s", manifest_path)
+
+        if not self.ops_flash_attn_debug_tensors:
+            return
+
+        if self.ops_flash_attn_debug_full_kv:
+            dump_k = k_cache.detach().cpu()
+            dump_v = v_cache.detach().cpu()
+            replay_block_table = block_tables.detach().cpu()
+            original_block_ids = None
+        else:
+            dump_k, dump_v, replay_block_table, original_block_ids = (
+                self._compact_pa_cache_for_flash_attn_dump(
+                    k_cache,
+                    v_cache,
+                    block_tables,
+                    seq_lens,
+                    self.page_size,
+                )
+            )
+        payload = {
+            "format_version": 1,
+            "attributes": manifest["attributes"],
+            "compact_kv": not self.ops_flash_attn_debug_full_kv,
+            "original_cache_num_blocks": k_cache.shape[0],
+            "q": q.detach().cpu(),
+            "k": dump_k,
+            "v": dump_v,
+            "block_table": replay_block_table,
+            "cu_seqlens_q": cu_q_lens.detach().cpu(),
+            "seqused_kv": seq_lens.detach().cpu(),
+            "sinks": sinks.detach().cpu(),
+            "attn_mask": (
+                attn_mask.detach().cpu() if attn_mask is not None else None
+            ),
+            "metadata": metadata.detach().cpu(),
+            "original_block_ids": original_block_ids,
+        }
+        tensor_path = dump_dir / f"{stem}.pt"
+        torch.save(payload, tensor_path)
+        logger.warning(
+            "Saved %s FlashAttn replay data to %s (%d/%d PA blocks)",
+            "full" if self.ops_flash_attn_debug_full_kv else "compact",
+            tensor_path,
+            dump_k.shape[0],
+            k_cache.shape[0],
+        )
+
     def _forward_welm_ops_flash_attn_sink(
         self,
         q: torch.Tensor,
@@ -835,6 +1122,23 @@ class AscendAttnBackend(AttentionBackend):
                 layout_out="TND",
             )
             metadata_cache[metadata_key] = metadata
+
+        self._dump_ops_flash_attn_debug_inputs(
+            q=q_3d[:real_q_tokens],
+            k_cache=k_cache_4d,
+            v_cache=v_cache_4d,
+            block_tables=block_tables_i32,
+            cu_q_lens=cu_q_lens,
+            seq_lens=seq_lens_i32,
+            sinks=sinks,
+            attn_mask=attn_mask,
+            metadata=metadata,
+            layer=layer,
+            is_prefill=is_prefill,
+            mask_mode=mask_mode,
+            win_left=win_left,
+            win_right=win_right,
+        )
 
         output, _ = flash_attn(
             q_3d[:real_q_tokens],
