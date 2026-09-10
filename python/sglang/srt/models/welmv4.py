@@ -2072,6 +2072,10 @@ class Qwen2MoeAttention(nn.Module):
             expected_width = 2048
 
         gamma = self.k_norm.weight
+        if isinstance(weight, torch.nn.Parameter):
+            weight = weight.data
+        if isinstance(gamma, torch.nn.Parameter):
+            gamma = gamma.data
         cos_sin = self.rotary_emb.cos_sin_cache
         if (
             weight is None
