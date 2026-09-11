@@ -414,6 +414,7 @@ class FusedMoE(torch.nn.Module):
                 last_expert_idx=first_expert_idx + self._num_local_routed,
             )
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
+        self._use_ascend_megamoe = _is_npu and get_moe_a2a_backend().is_megamoe()
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -1375,6 +1376,12 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if self._use_ascend_megamoe:
+            from sglang.srt.hardware_backend.npu.moe.mega_moe import (
+                forward_megamoe,
+            )
+
+            return forward_megamoe(self, hidden_states, topk_output)
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 

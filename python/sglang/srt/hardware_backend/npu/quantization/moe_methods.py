@@ -788,6 +788,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
     def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
+        self.use_megamoe_canonical_layout = False
         if weight_prefix == "w13":
             self.matmul = GroupedMatmulSwigluQuant()
             self.hidden_states_quantizer = HiddenStatesDynamicQuant(
@@ -819,9 +820,123 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             weight = weight.to(f"npu:{torch.npu.current_device()}")
         return torch.ops.npu.npu_dynamic_mx_quant(weight, dst_type=torch.float8_e4m3fn)
 
+    @classmethod
+    def maybe_process_megamoe_weights(cls, layer: torch.nn.Module) -> bool:
+        """Keep one canonical MXFP8 layout shared by MegaMoE and local-EP.
+
+        MegaMoE consumes [E, N, K] weights and [E, N, ceil(K/64), 2]
+        E8M0 scales. This must run before the regular Ascend GMM path casts the
+        weights to FRACTAL_NZ and publishes transposed views.
+        """
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_megamoe():
+            return False
+        if getattr(layer, "_npu_megamoe_weights_processed", False):
+            return True
+
+        # MegaMoE''s public tensor contract needs the real torch dtype. Do not
+        # use _require_e8m0_dtype() here: on NPU that helper intentionally
+        # returns torch_npu''s integer operator enum for GMM dtype attributes.
+        e8m0_tensor_dtype = _get_float8_e8m0fnu_dtype()
+        if e8m0_tensor_dtype is None:
+            raise RuntimeError(
+                "Ascend MegaMoE requires torch.float8_e8m0fnu for its scale "
+                "tensors. Upgrade to the matching torch/torch_npu build."
+            )
+        for prefix in ("w13", "w2"):
+            kernel = getattr(layer, f"{prefix}_kernel", None)
+            if not isinstance(kernel, cls):
+                raise RuntimeError(
+                    "Ascend MegaMoE supports only MXFP8 routed experts, but "
+                    f"{prefix}_kernel is {type(kernel).__name__}."
+                )
+
+            weight = getattr(layer, f"{prefix}_weight").data
+            if weight.dtype == torch.float8_e4m3fn:
+                scale = getattr(layer, f"{prefix}_weight_scale").data
+            else:
+                weight, scale = kernel._quantize_weight_online(weight, prefix)
+
+            expected_weight_shape = (
+                (
+                    layer.num_local_experts,
+                    2 * layer.intermediate_size_per_partition,
+                    layer.hidden_size,
+                )
+                if prefix == "w13"
+                else (
+                    layer.num_local_experts,
+                    layer.hidden_size,
+                    layer.intermediate_size_per_partition,
+                )
+            )
+            if tuple(weight.shape) != expected_weight_shape:
+                raise RuntimeError(
+                    f"MegaMoE {prefix} must remain in canonical [E,N,K] "
+                    f"layout {expected_weight_shape}, got {tuple(weight.shape)}."
+                )
+
+            if scale.dim() == 3:
+                if scale.shape[-1] % 2 != 0:
+                    raise RuntimeError(
+                        f"MegaMoE {prefix} flat MXFP8 scale axis must be even, "
+                        f"got {tuple(scale.shape)}."
+                    )
+                scale = scale.reshape(
+                    scale.shape[0], scale.shape[1], scale.shape[2] // 2, 2
+                )
+            if scale.dim() != 4 or scale.shape[-1] != 2:
+                raise RuntimeError(
+                    f"MegaMoE {prefix} scale must be [E,N,K/64,2], got "
+                    f"{tuple(scale.shape)}."
+                )
+
+            expected_scale_shape = (
+                weight.shape[0],
+                weight.shape[1],
+                (weight.shape[2] + 63) // 64,
+                2,
+            )
+            if tuple(scale.shape) != expected_scale_shape:
+                raise RuntimeError(
+                    f"MegaMoE {prefix} scale shape mismatch: expected "
+                    f"{expected_scale_shape}, got {tuple(scale.shape)}."
+                )
+
+            # ModelSlim exports the E8M0 bit pattern as uint8. Reinterpret the
+            # byte; a numeric cast would corrupt the exponent encoding.
+            if scale.dtype == torch.uint8:
+                scale = scale.contiguous().view(e8m0_tensor_dtype)
+            elif scale.dtype != e8m0_tensor_dtype:
+                raise RuntimeError(
+                    f"MegaMoE {prefix} scale must be uint8/E8M0, got "
+                    f"{scale.dtype}."
+                )
+
+            setattr(
+                layer,
+                f"{prefix}_weight",
+                Parameter(weight.contiguous(), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}_weight_scale",
+                Parameter(scale.contiguous(), requires_grad=False),
+            )
+            kernel.use_megamoe_canonical_layout = True
+
+        layer._npu_megamoe_weights_processed = True
+        # The decode/verify local-EP fallback still uses InitRoutingV2 and must
+        # receive MXFP8 activations plus E8M0 scales.
+        layer.w13_kernel._set_dispatcher_output_dtype(layer, "mxfp8")
+        return True
+
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        if self.maybe_process_megamoe_weights(layer):
+            return
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight").data
@@ -904,7 +1019,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             hidden_states,
             expert_tokens,
             group_list_type=group_list_type,
-            transposed=True,
+            transposed=not self.use_megamoe_canonical_layout,
             weight_scale=[quant_info.w13_weight_scale],
             x_scale=pertoken_scale,
             dequant_mode=2,
@@ -951,6 +1066,6 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=True,
+            transposed=not self.use_megamoe_canonical_layout,
             **scale_args,
         )

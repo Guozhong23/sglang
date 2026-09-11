@@ -805,7 +805,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.welm_runner_plan = runner_plan
         legacy_local_ep_kernel_available = (
             _is_npu
-            and get_moe_a2a_backend().is_deepep()
+            and (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_megamoe()
+            )
             and get_parallel().moe_ep_size > 1
             and get_parallel().moe_ep_size == self.tp_size
             and get_parallel().moe_tp_size == 1
@@ -858,7 +861,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.register_buffer("_npu_router_compute_weight_t", None, persistent=False)
         if config.shared_expert_intermediate_size > 0:
             use_ep_replicated_shared_expert = (
-                get_moe_a2a_backend().is_deepep()
+                (
+                    get_moe_a2a_backend().is_deepep()
+                    or (_is_npu and get_moe_a2a_backend().is_megamoe())
+                )
                 and (runner_plan is None or runner_plan.has_moe_ep)
             )
             self.shared_expert = Qwen2MoeMLP(
@@ -1056,19 +1062,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
-            and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
+            and (
+                moe_a2a_backend.is_none()
+                or moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_megamoe()
+            )
             and use_decode_like_stream_policy
         )
-        enable_npu_prefill_normal_shared_overlap = (
+        enable_npu_prefill_routed_shared_overlap = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-            and envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
             and forward_batch is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not is_kv_mirror_prefill
-            and moe_a2a_backend.is_deepep()
             and get_parallel().moe_ep_size > 1
             and (
                 use_welm_prefill_normal_stream_policy
@@ -1077,11 +1085,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     and not forward_batch.welmv4_npu_deepep_full_mirror
                 )
             )
-            and self._resolve_deepep_mode_for_topk(True) == DeepEPMode.NORMAL
+            and (
+                (
+                    moe_a2a_backend.is_deepep()
+                    and envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+                    and self._resolve_deepep_mode_for_topk(True)
+                    == DeepEPMode.NORMAL
+                )
+                or moe_a2a_backend.is_megamoe()
+            )
         )
         enable_npu_shared_alt_stream = (
             enable_npu_decode_like_dual_stream
-            or enable_npu_prefill_normal_shared_overlap
+            or enable_npu_prefill_routed_shared_overlap
         )
         num_token_non_padded = (
             getattr(forward_batch, "num_token_non_padded", None)
@@ -1099,9 +1115,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # scattered prefill keeps the localized count; the explicitly NORMAL
         # NextN DRAFT_EXTEND_V2 path restores its full-layout real count before
         # entering this block, so it can still mask only the padded suffix.
-        is_full_deepep_decode_like = (
+        is_full_ep_decode_like = (
             _is_npu
-            and moe_a2a_backend.is_deepep()
+            and (
+                moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_megamoe()
+            )
             and forward_batch is not None
             and (
                 forward_batch.forward_mode.is_decode()
@@ -1109,7 +1128,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             and not forward_batch.welmv4_npu_deepep_scattered
         )
-        if is_full_deepep_decode_like:
+        if is_full_ep_decode_like:
             num_token_non_padded = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
@@ -1128,10 +1147,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
                 )
-            if enable_npu_decode_like_dual_stream:
-                # Start after the router Cube GEMM. The shared expert overlaps
-                # routing, dispatch, and the routed-expert path until final add;
-                # both paths only read the original hidden_states storage.
+            launch_shared_before_topk = (
+                enable_npu_decode_like_dual_stream
+                or (
+                    enable_npu_prefill_routed_shared_overlap
+                    and moe_a2a_backend.is_megamoe()
+                )
+            )
+            if launch_shared_before_topk:
+                # Start after the router Cube GEMM. MegaMoE can overlap the
+                # shared expert with both TopK and the complete fused routed
+                # path; both streams only read the original hidden_states.
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_expert
                 )
@@ -1180,9 +1206,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # mode is enabled, so keep the router's valid, distinct expert IDs
             # there and make dummy routes numerically inert via zero weights.
             preserve_padded_ids = (
-                moe_a2a_backend.is_deepep()
-                and self._resolve_deepep_mode_for_topk(is_prefill_batch)
-                == DeepEPMode.LOW_LATENCY
+                moe_a2a_backend.is_megamoe()
+                or (
+                    moe_a2a_backend.is_deepep()
+                    and self._resolve_deepep_mode_for_topk(is_prefill_batch)
+                    == DeepEPMode.LOW_LATENCY
+                )
             )
             topk_output = self._mask_npu_padded_topk(
                 topk_output,
@@ -1192,12 +1221,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 invalid_row_mask=invalid_row_mask,
                 invalid_topk_id=invalid_topk_id,
             )
-        if enable_npu_prefill_normal_shared_overlap:
-            # Ordinary non-mirror prefill keeps LOCAL token rows and DeepEP
-            # NORMAL+AllGather starts with communication. Launch only after
-            # router/TopK work so the shared expert's primary overlap window
-            # begins at dispatch. The existing final-add wait remains the
-            # consumption boundary, matching decode/mirror behavior.
+        if enable_npu_prefill_routed_shared_overlap and shared_output is None:
+            # Ordinary prefill keeps LOCAL token rows. Launch only after
+            # router/TopK for the DeepEP control path. MegaMoE starts before
+            # TopK above for a wider overlap window. The final add remains the
+            # first shared-output consumption boundary.
             shared_output = process_shared_expert(
                 hidden_states, self._forward_shared_expert
             )
@@ -1264,7 +1292,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     self.welm_runner_plan is not None
                     and not self.welm_runner_plan.has_moe_ep
                 )
-                or not get_moe_a2a_backend().is_deepep()
+                or not (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_megamoe()
+                )
             )
         ):
             final_hidden_states = (
@@ -2729,7 +2760,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return (
             _is_npu
             and not self.is_nextn
-            and get_moe_a2a_backend().is_deepep()
+            and (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_megamoe()
+            )
             and forward_batch.forward_mode.is_extend_without_speculative()
             and tp_size > 1
             and get_parallel().moe_ep_size == tp_size
