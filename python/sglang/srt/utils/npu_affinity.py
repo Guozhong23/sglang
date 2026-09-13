@@ -880,7 +880,7 @@ def log_npu_affinity_result(
     result: NpuAffinityApplyResult,
     phase: Literal["early", "final"],
 ) -> None:
-    """Log two result lines; full topology and thread issues stay in the summary."""
+    """Log binding results, with an optional final thread snapshot for debugging."""
 
     if phase not in ("early", "final"):
         raise ValueError(f"Unsupported NPU affinity phase {phase!r}")
@@ -915,8 +915,40 @@ def log_npu_affinity_result(
         f"physical_npu={assignment.physical_npu_id} numa={assignment.numa_node} "
         f"raw_cpu_affinity={raw_affinity}",
         binding,
-        "=============== END NPU CPU AFFINITY RESULT ===============",
     ]
+    if (
+        phase == "final"
+        and result.bind_all_threads
+        and envs.SGLANG_NPU_AFFINITY_DEBUG_THREADS.get()
+    ):
+        # Only inspect names in debug mode. Native runtime threads are absent
+        # from threading.enumerate(), so /proc's comm is the primary name.
+        python_names = {t.native_id: t.name for t in threading.enumerate()}
+        lines.append("thread_details (final binding snapshot):")
+        for thread in result.thread_results:
+            tid = thread.thread_id
+            name = "<unavailable>"
+            if tid is not None:
+                try:
+                    name = (
+                        Path(f"/proc/self/task/{tid}/comm")
+                        .read_text(encoding="utf-8", errors="replace")
+                        .rstrip("\n")
+                    )
+                except OSError:
+                    # A short-lived runtime thread may exit after binding.
+                    pass
+            detail = (
+                f"  tid={tid} name={name!r} main={tid == os.getpid()}"
+                f" cpu_mask={format_cpu_list(thread.actual_cpu_ids) or 'unavailable'}"
+                f" status={thread.status}"
+            )
+            if tid in python_names:
+                detail += f" python_name={python_names[tid]!r}"
+            if thread.error:
+                detail += f" error={thread.error!r}"
+            lines.append(detail)
+    lines.append("=============== END NPU CPU AFFINITY RESULT ===============")
     log = logger.info if result.success else logger.warning
     log("\n" + "\n".join(lines) + "\n")
 

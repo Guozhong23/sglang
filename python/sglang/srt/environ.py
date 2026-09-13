@@ -314,6 +314,8 @@ class Envs:
     # NPU CPU affinity always binds early and reapplies to all threads after init.
     # Zero uses the NPU's full, non-overlapping share of local physical cores.
     SGLANG_NPU_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    # Dump thread names/IDs and read-back CPU masks after final NPU binding.
+    SGLANG_NPU_AFFINITY_DEBUG_THREADS = EnvBool(False)
     SGLANG_NPU_MEMORY_PREFERRED_BIND = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
