@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from typing import List
@@ -120,14 +121,38 @@ class AscendTransferEngine(MooncakeTransferEngine):
             return None
 
     def _get_worker_hcom_url(self, hcom_url: str, world_rank: int) -> str:
+        """Select a URL by runtime NPU ID, then offset its port by world rank."""
         if not hcom_url:
             return hcom_url
+
+        if hcom_url.lstrip().startswith("{"):
+            try:
+                npu_urls = json.loads(hcom_url)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "Invalid JSON NPU-to-URL mapping in ASCEND_MF_HCOM_URL"
+                ) from exc
+
+            npu_key = str(self.npu_id)
+            if npu_key not in npu_urls:
+                raise ValueError(
+                    "ASCEND_MF_HCOM_URL mapping has no entry for "
+                    f"npu_id={self.npu_id}"
+                )
+            hcom_url = npu_urls[npu_key]
+            if not isinstance(hcom_url, str) or not hcom_url.strip():
+                raise ValueError(
+                    "ASCEND_MF_HCOM_URL mapping requires a non-empty URL string "
+                    f"for npu_id={self.npu_id}"
+                )
+            hcom_url = hcom_url.strip()
 
         address, separator, port_str = hcom_url.rpartition(":")
         if not separator or not address.startswith("tcp://"):
             raise ValueError(
                 "ASCEND_MF_HCOM_URL must use tcp://<IPv4>:<port> or "
-                "tcp://<IPv4>/<mask>:<port>"
+                "tcp://<IPv4>/<mask>:<port>, or a JSON object mapping NPU IDs "
+                "to these URLs"
             )
 
         try:
@@ -152,9 +177,10 @@ class AscendTransferEngine(MooncakeTransferEngine):
 
         worker_hcom_url = f"{address}:{worker_port}"
         logger.info(
-            "Resolved Ascend Host RDMA endpoint: role=%s, world_rank=%d, "
-            "base=%s, endpoint=%s",
+            "Resolved Ascend Host RDMA endpoint: role=%s, npu_id=%d, "
+            "world_rank=%d, base=%s, endpoint=%s",
             self.role,
+            self.npu_id,
             world_rank,
             hcom_url,
             worker_hcom_url,
