@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import (
     finish_welm_attn_partial_full,
     reduce_attn_partial_to_scattered,
@@ -872,12 +873,54 @@ class WelmDpAttentionExecutor:
                     input_is_scattered=input_is_scattered,
                 )
 
+            max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
+            oproj_rs_pipeline_chunks = 0
+            use_fused_oproj_rs = False
+            # MAX_LEN may represent a logical decode shard as EXTEND. Only a
+            # real target prefill may replace this shard's original OProj path.
+            local_forward_mode = (
+                getattr(forward_batch, "_original_forward_mode", None)
+                or forward_batch.forward_mode
+            )
+            if (
+                max_chunks >= 2
+                and plan.role is WelmRunnerRole.TARGET_DP
+                and local_forward_mode.is_extend_without_speculative()
+                and is_non_consumer_attention_layer
+                and batch_plan.attention_finish
+                is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
+                and state.hidden_states.dtype == torch.bfloat16
+                and layer.self_attn.o_proj.weight.dtype == torch.bfloat16
+            ):
+                tp_size = plan.attn_tp_size
+                attention_num_rows = state.hidden_states.shape[0] * (
+                    tp_size if defer_hidden_all_gather else 1
+                )
+                min_chunk_tokens = max(
+                    1,
+                    envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get(),
+                )
+                local_rows = attention_num_rows // tp_size
+                min_local_rows = (min_chunk_tokens + tp_size - 1) // tp_size
+                actual_chunks = min(max_chunks, local_rows // min_local_rows)
+                if actual_chunks >= 2:
+                    oproj_rs_pipeline_chunks = actual_chunks
+                else:
+                    use_fused_oproj_rs = True
+            oproj_output_is_reduce_scattered = (
+                oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
+            )
             attn_output = layer.self_attn(
                 positions=positions,
                 hidden_states=state.hidden_states,
                 forward_batch=forward_batch,
                 skip_o_norm=True,
                 skip_o_proj_all_reduce=plan.o_proj_returns_partial,
+                use_o_proj_matmul_reduce_scatter=use_fused_oproj_rs,
+                o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
+                o_proj_rs_group=(
+                    plan.attn_tp_group if oproj_output_is_reduce_scattered else None
+                ),
                 reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
                 prefill_mxfp8_all_gather_group=(
                     # A nontrivial attention-TP group enters the split
@@ -896,6 +939,7 @@ class WelmDpAttentionExecutor:
                 active_view=active_view,
                 mirror_transition=mirror_transition,
                 mirror_row_indices=mirror_row_indices,
+                input_is_reduce_scattered=oproj_output_is_reduce_scattered,
             )
         else:
             # Eager idle only.  Skip norm/attention entirely and reuse the
@@ -1180,6 +1224,7 @@ class WelmDpAttentionExecutor:
         active_view: "WelmDpRowView",
         mirror_transition: bool,
         mirror_row_indices: Optional[torch.Tensor],
+        input_is_reduce_scattered: bool = False,
     ) -> WelmDpLayerState:
         plan = self.runner_plan
         if (
@@ -1190,11 +1235,29 @@ class WelmDpAttentionExecutor:
                 batch_plan.attention_finish
                 is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
             ):
-                attn_output, residual = reduce_attn_partial_to_scattered(
-                    attn_output,
-                    state.residual,
-                    attn_tp_group=plan.attn_tp_group,
-                )
+                if input_is_reduce_scattered:
+                    residual = state.residual
+                    assert residual is not None
+                    self._assert_fp32_residual(residual)
+                    local_rows = attn_output.shape[0]
+                    if state.residual_layout is WelmDpLayout.DP_LOCAL_TP_ATTN_FULL:
+                        if residual.shape[0] != local_rows * plan.attn_tp_size:
+                            raise RuntimeError(
+                                "WeLMv4 FULL residual does not match OProj RS rows"
+                            )
+                        residual = residual.narrow(
+                            0, plan.attn_tp_rank * local_rows, local_rows
+                        ).contiguous()
+                    elif residual.shape[0] != local_rows:
+                        raise RuntimeError(
+                            "WeLMv4 scattered residual does not match OProj RS rows"
+                        )
+                else:
+                    attn_output, residual = reduce_attn_partial_to_scattered(
+                        attn_output,
+                        state.residual,
+                        attn_tp_group=plan.attn_tp_group,
+                    )
             elif plan.attn_tp_size == 1:
                 residual = state.residual
             else:

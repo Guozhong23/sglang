@@ -1665,7 +1665,7 @@ class Qwen2MoeAttention(nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=add_prefix("o_proj", prefix),
         )
-        self._welm_npu_o_proj_hcom_name = None
+        self._welm_npu_o_proj_hcom_names = {}
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
         else:
@@ -1897,18 +1897,20 @@ class Qwen2MoeAttention(nn.Module):
             return self.qkv_proj_weight
         return self._linear_prefetch_tensors(self.qkv_proj)
 
-    def _get_welm_npu_o_proj_hcom_name(self) -> str:
-        if self._welm_npu_o_proj_hcom_name is None:
-            process_group = get_tp_group().device_group
+    def _get_welm_npu_o_proj_hcom_name(self, group: Optional[Any] = None) -> str:
+        group = get_tp_group() if group is None else group
+        process_group = group.device_group
+        name = self._welm_npu_o_proj_hcom_names.get(process_group)
+        if name is None:
             backend = process_group._get_backend(torch.device("npu"))
-            self._welm_npu_o_proj_hcom_name = backend.get_hccl_comm_name(
-                process_group.rank()
-            )
-        return self._welm_npu_o_proj_hcom_name
+            name = backend.get_hccl_comm_name(process_group.rank())
+            self._welm_npu_o_proj_hcom_names[process_group] = name
+        return name
 
     def _npu_o_proj_matmul_reduce_scatter(
-        self, attn_output: torch.Tensor
+        self, attn_output: torch.Tensor, *, group: Optional[Any] = None
     ) -> torch.Tensor:
+        group = get_tp_group() if group is None else group
         bias = (
             self.o_proj.bias
             if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
@@ -1917,13 +1919,52 @@ class Qwen2MoeAttention(nn.Module):
         return torch_npu.npu_mm_reduce_scatter_base(
             attn_output.contiguous(),
             self.o_proj.weight.transpose(0, 1),
-            self._get_welm_npu_o_proj_hcom_name(),
-            self.o_proj.tp_size,
+            self._get_welm_npu_o_proj_hcom_name(group),
+            group.world_size,
             reduce_op="sum",
             bias=bias,
             comm_turn=0,
             comm_mode="ccu",
         )
+
+    def _npu_o_proj_chunked_reduce_scatter(
+        self, attn_output: torch.Tensor, chunks: int, *, group: Any
+    ) -> torch.Tensor:
+        tp_size = group.world_size
+        num_tokens, input_size = attn_output.shape
+        local_rows = num_tokens // tp_size
+        hidden_size = self.o_proj.weight.shape[0]
+        # Each chunk contains the same local-row interval for every RS rank.
+        # Splitting the flat token dimension would change token ownership.
+        rank_major_input = attn_output.contiguous().view(
+            tp_size, local_rows, input_size
+        )
+        output = attn_output.new_empty((local_rows, hidden_size))
+        bias = (
+            self.o_proj.bias
+            if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
+            else None
+        )
+        pending = []
+        for chunk_idx in range(chunks):
+            start = local_rows * chunk_idx // chunks
+            end = local_rows * (chunk_idx + 1) // chunks
+            chunk_input = (
+                rank_major_input[:, start:end, :].contiguous().view(-1, input_size)
+            )
+            partial = F.linear(chunk_input, self.o_proj.weight, bias)
+            work = torch.distributed.reduce_scatter_tensor(
+                output[start:end],
+                partial,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group.device_group,
+                async_op=True,
+            )
+            # Keep send buffers alive and submit the next MM before joining RS.
+            pending.append((work, partial))
+        for work, _ in pending:
+            work.wait()
+        return output
 
     @staticmethod
     def _is_npu_mxfp8_projection(projection: nn.Module) -> bool:
@@ -2141,6 +2182,8 @@ class Qwen2MoeAttention(nn.Module):
         use_o_proj_matmul_reduce_scatter: bool = False,
         reuse_prefill_mxfp8_input: bool = False,
         prefill_mxfp8_all_gather_group: Optional[Any] = None,
+        o_proj_rs_pipeline_chunks: int = 0,
+        o_proj_rs_group: Optional[Any] = None,
     ) -> torch.Tensor:
         prefill_gate_hidden_states = None
         prefill_gate_all_gather_on_alt_stream = False
@@ -2498,8 +2541,16 @@ class Qwen2MoeAttention(nn.Module):
                 inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
 
-        if use_o_proj_matmul_reduce_scatter:
-            output = self._npu_o_proj_matmul_reduce_scatter(attn_output)
+        if o_proj_rs_pipeline_chunks:
+            output = self._npu_o_proj_chunked_reduce_scatter(
+                attn_output,
+                o_proj_rs_pipeline_chunks,
+                group=get_tp_group() if o_proj_rs_group is None else o_proj_rs_group,
+            )
+        elif use_o_proj_matmul_reduce_scatter:
+            output = self._npu_o_proj_matmul_reduce_scatter(
+                attn_output, group=o_proj_rs_group
+            )
         else:
             output, _ = self.o_proj(
                 attn_output,
@@ -3125,17 +3176,42 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states = hidden_states.index_select(
                 0, custom_last_index.to(torch.long)
             )
+        tp_size = get_tensor_model_parallel_world_size()
         attention_num_rows = hidden_states.shape[0] * (
-            get_tensor_model_parallel_world_size()
-            if defer_hidden_all_gather
-            else 1
+            tp_size if defer_hidden_all_gather else 1
         )
-        use_npu_prefill_oproj_matmul_reduce_scatter = (
-            envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
-            and output_hidden_is_scattered
+        can_oproj_reduce_scatter = (
+            output_hidden_is_scattered
             and not use_full_mirror_layout
-            and attention_num_rows % get_tensor_model_parallel_world_size()
-            == 0
+            and attention_num_rows % tp_size == 0
+        )
+        use_fused_oproj_rs = (
+            envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
+            and can_oproj_reduce_scatter
+        )
+        max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
+        oproj_rs_pipeline_chunks = 0
+        if (
+            max_chunks >= 2
+            and can_oproj_reduce_scatter
+            and is_ordinary_prefill_non_consumer_layer
+            and hidden_states.dtype == torch.bfloat16
+            and self.self_attn.o_proj.weight.dtype == torch.bfloat16
+        ):
+            min_chunk_tokens = max(
+                1, envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get()
+            )
+            local_rows = attention_num_rows // tp_size
+            min_local_rows = (min_chunk_tokens + tp_size - 1) // tp_size
+            actual_chunks = min(max_chunks, local_rows // min_local_rows)
+            if actual_chunks >= 2:
+                oproj_rs_pipeline_chunks = actual_chunks
+            else:
+                # The enabled target path falls back to fused MM+RS, regardless
+                # of the old fusion switch. Other modes keep their old path.
+                use_fused_oproj_rs = True
+        oproj_output_is_reduce_scattered = (
+            oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -3147,9 +3223,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     or output_hidden_is_scattered
                 ),
                 skip_o_proj_all_reduce=output_hidden_is_scattered,
-                use_o_proj_matmul_reduce_scatter=(
-                    use_npu_prefill_oproj_matmul_reduce_scatter
-                ),
+                use_o_proj_matmul_reduce_scatter=use_fused_oproj_rs,
+                o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
                 reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
                 prefill_mxfp8_all_gather_group=(
                     get_tp_group() if defer_hidden_all_gather else None
@@ -3200,9 +3275,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     hidden_states,
                     residual,
                     use_mmq_norm_after_attn=use_mmq_norm_after_attn,
-                    input_is_reduce_scattered=(
-                        use_npu_prefill_oproj_matmul_reduce_scatter
-                    ),
+                    input_is_reduce_scattered=oproj_output_is_reduce_scattered,
                 )
             )
         elif use_mmq_norm_after_attn:
