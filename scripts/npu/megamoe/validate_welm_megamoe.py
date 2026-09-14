@@ -200,7 +200,14 @@ def percentile(values: Iterable[float], q: float) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--m", type=parse_int_list, default=parse_int_list("1,16,128"))
+    parser.add_argument(
+        "--token-counts",
+        "--m",
+        dest="m",
+        type=parse_int_list,
+        default=parse_int_list("1,16,128"),
+        help="Comma-separated local token counts. --m is kept for direct use.",
+    )
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=512)
     parser.add_argument("--num-experts", type=int, default=512)

@@ -11,8 +11,9 @@ export NPU_OPS_TRANSFORMER_OPS_IMPORT_MODE=minimal
 torchrun \
   --standalone \
   --nproc-per-node="${NPROC_PER_NODE}" \
+  -- \
   "${SCRIPT_DIR}/validate_welm_megamoe.py" \
-  --m "${M_CASES}" \
+  --token-counts "${M_CASES}" \
   --reference-max-m "${REFERENCE_MAX_M}" \
   --csv "${SCRIPT_DIR}/welm_megamoe_op.csv" \
   "$@"
