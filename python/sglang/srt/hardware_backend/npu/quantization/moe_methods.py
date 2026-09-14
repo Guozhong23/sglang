@@ -798,6 +798,18 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             self.matmul = GroupedMatmul()
             self.hidden_states_quantizer = None
 
+    def _weight_scale_for_gmm(self, scale: torch.Tensor) -> torch.Tensor:
+        """Match the MX scale view to the weight view used by regular GMM.
+
+        MegaMoE keeps canonical [E,N,K] weights and [E,N,K/64,2] scales.
+        The local-EP fallback presents the weight to GMM as the zero-copy
+        [E,K,N] transpose, so its scale must use the matching
+        [E,K/64,N,2] view as well.
+        """
+        if scale is None:
+            raise RuntimeError("MXFP8 grouped matmul requires a weight scale")
+        return scale.transpose(1, 2) if self.use_megamoe_canonical_layout else scale
+
     @staticmethod
     def _quantize_weight_online(
         weight: torch.Tensor, weight_prefix: str
@@ -1013,6 +1025,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
 
         e8m0_dtype = _require_e8m0_dtype()
+        weight_scale = self._weight_scale_for_gmm(quant_info.w13_weight_scale)
         return self.matmul.forward(
             quant_info,
             "w13",
@@ -1020,7 +1033,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             group_list_type=group_list_type,
             transposed=not self.use_megamoe_canonical_layout,
-            weight_scale=[quant_info.w13_weight_scale],
+            weight_scale=[weight_scale],
             x_scale=pertoken_scale,
             dequant_mode=2,
             quant_mode=2,
@@ -1051,8 +1064,11 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             )
 
         e8m0_dtype = _require_e8m0_dtype()
+        weight_scale = self._weight_scale_for_gmm(
+            getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        )
         scale_args: Dict[str, Any] = {
-            "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
+            "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
             "scale_dtype": e8m0_dtype,
             "per_token_scale_dtype": e8m0_dtype,
