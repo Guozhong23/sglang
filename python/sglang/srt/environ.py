@@ -311,12 +311,13 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
-    # NPU CPU affinity always binds early and reapplies to all threads after init.
+    # NPU CPU affinity is planned early and applied to all threads after warmup.
     # Zero uses the NPU's full, non-overlapping share of local physical cores.
     SGLANG_NPU_AFFINITY_PCORES_PER_PROC = EnvInt(0)
     # Dump thread names/IDs and read-back CPU masks after final NPU binding.
     SGLANG_NPU_AFFINITY_DEBUG_THREADS = EnvBool(False)
-    SGLANG_NPU_MEMORY_PREFERRED_BIND = EnvBool(False)
+    # Optionally migrate existing host pages after final NPU CPU binding.
+    SGLANG_NPU_MIGRATE_PAGES = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)

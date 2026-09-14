@@ -1,8 +1,8 @@
 """Topology-aware CPU affinity helpers for Ascend NPU scheduler processes.
 
-This module intentionally does not import ``torch`` or ``torch_npu``.  Early CPU
-binding runs before the accelerator runtime is initialized, so the scheduler's
-existing ``gpu_id`` argument is the authoritative runtime NPU id.  The physical
+This module intentionally does not import ``torch`` or ``torch_npu``.  CPU
+assignment is planned before the accelerator runtime is initialized, so the
+scheduler's ``gpu_id`` argument is the authoritative runtime NPU id.  The physical
 NPU id used by ``npu-smi`` is resolved from the Ascend visibility environment.
 """
 
@@ -12,6 +12,7 @@ import errno
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 from collections import defaultdict
@@ -771,12 +772,14 @@ def apply_npu_cpu_affinity(
     phase: Literal["early", "final"],
     bind_all_threads: bool,
     emit_log: bool = True,
+    pid: Optional[int] = None,
 ) -> NpuAffinityApplyResult:
     """Apply the saved target exactly and verify every surviving thread.
 
-    ``assignment`` must be resolved before early binding and reused for final
+    ``assignment`` must be resolved before initialization and reused for final
     binding. A runtime may narrow the main thread's mask in between; intersecting
     with that mask here would prevent restoring the originally selected CPUs.
+    ``pid`` allows the HTTP launcher to bind a scheduler after HTTP warmup.
     """
 
     if phase not in ("early", "final"):
@@ -797,9 +800,11 @@ def apply_npu_cpu_affinity(
             logical_npu_id=assignment.logical_npu_id,
             physical_npu_id=assignment.physical_npu_id,
         )
+    process_pid = os.getpid() if pid is None else pid
+    main_tid = 0 if pid is None else pid
     try:
-        os.sched_setaffinity(0, target_cpu_ids)
-        main_actual_cpu_ids = tuple(sorted(os.sched_getaffinity(0)))
+        os.sched_setaffinity(main_tid, target_cpu_ids)
+        main_actual_cpu_ids = tuple(sorted(os.sched_getaffinity(main_tid)))
     except OSError as exc:
         raise NpuAffinityError(
             f"Failed to bind scheduler main thread: {exc}",
@@ -818,7 +823,7 @@ def apply_npu_cpu_affinity(
     thread_results: list[NpuAffinityThreadResult] = []
     if bind_all_threads:
         try:
-            threads = psutil.Process(os.getpid()).threads()
+            threads = psutil.Process(process_pid).threads()
         except (psutil.Error, OSError) as exc:
             threads = []
             threads_failed += 1
@@ -871,7 +876,7 @@ def apply_npu_cpu_affinity(
         bind_all_threads=bind_all_threads,
     )
     if emit_log:
-        log_npu_affinity_result(assignment, result, phase=phase)
+        log_npu_affinity_result(assignment, result, phase=phase, pid=pid)
     return result
 
 
@@ -879,12 +884,15 @@ def log_npu_affinity_result(
     assignment: NpuAffinityAssignment,
     result: NpuAffinityApplyResult,
     phase: Literal["early", "final"],
+    *,
+    pid: Optional[int] = None,
 ) -> None:
     """Log binding results, with an optional final thread snapshot for debugging."""
 
     if phase not in ("early", "final"):
         raise ValueError(f"Unsupported NPU affinity phase {phase!r}")
     status = "SUCCESS" if result.success else "INCOMPLETE"
+    process_pid = os.getpid() if pid is None else pid
     raw_affinity = assignment.raw_cpu_affinity or format_cpu_list(
         assignment.local_cpu_ids
     )
@@ -910,7 +918,7 @@ def log_npu_affinity_result(
         binding += f" requested_pcores={assignment.requested_pcores} (clipped)"
     lines = [
         "=============== NPU CPU AFFINITY RESULT ===============",
-        f"phase={phase} status={status} pid={os.getpid()} "
+        f"phase={phase} status={status} pid={process_pid} "
         f"runtime_npu={assignment.runtime_npu_id} "
         f"physical_npu={assignment.physical_npu_id} numa={assignment.numa_node} "
         f"raw_cpu_affinity={raw_affinity}",
@@ -923,7 +931,11 @@ def log_npu_affinity_result(
     ):
         # Only inspect names in debug mode. Native runtime threads are absent
         # from threading.enumerate(), so /proc's comm is the primary name.
-        python_names = {t.native_id: t.name for t in threading.enumerate()}
+        python_names = (
+            {t.native_id: t.name for t in threading.enumerate()}
+            if process_pid == os.getpid()
+            else {}
+        )
         lines.append("thread_details (final binding snapshot):")
         for thread in result.thread_results:
             tid = thread.thread_id
@@ -931,7 +943,7 @@ def log_npu_affinity_result(
             if tid is not None:
                 try:
                     name = (
-                        Path(f"/proc/self/task/{tid}/comm")
+                        Path(f"/proc/{process_pid}/task/{tid}/comm")
                         .read_text(encoding="utf-8", errors="replace")
                         .rstrip("\n")
                     )
@@ -939,7 +951,7 @@ def log_npu_affinity_result(
                     # A short-lived runtime thread may exit after binding.
                     pass
             detail = (
-                f"  tid={tid} name={name!r} main={tid == os.getpid()}"
+                f"  tid={tid} name={name!r} main={tid == process_pid}"
                 f" cpu_mask={format_cpu_list(thread.actual_cpu_ids) or 'unavailable'}"
                 f" status={thread.status}"
             )
@@ -962,6 +974,7 @@ def build_npu_affinity_report(
     pp_rank: int,
     dp_rank: Optional[int],
     error: Optional[NpuAffinityError] = None,
+    pid: Optional[int] = None,
 ) -> dict:
     """Attach the actual final read-back to the existing scheduler ready message."""
     if error is not None or result is None:
@@ -971,7 +984,7 @@ def build_npu_affinity_report(
     else:
         status = "INCOMPLETE"
     return {
-        "pid": os.getpid(),
+        "pid": os.getpid() if pid is None else pid,
         "runtime_npu_id": runtime_npu_id,
         "physical_npu_id": (
             assignment.physical_npu_id
@@ -1018,6 +1031,73 @@ def build_npu_affinity_report(
         ),
         "error": str(error) if error is not None else None,
     }
+
+
+def migrate_npu_pages(pid: int, numa_node: int) -> None:
+    """Best-effort, opt-in migration of existing host pages; no memory policy."""
+    if not envs.SGLANG_NPU_MIGRATE_PAGES.get():
+        return
+    executable = shutil.which("migratepages")
+    if executable is None:
+        logger.warning("NPU page migration skipped: migratepages is not installed")
+        return
+    try:
+        result = subprocess.run(
+            [executable, str(pid), "all", str(numa_node)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        # A successful command does not guarantee that pinned/shared pages moved.
+        log = logger.info if result.returncode == 0 else logger.warning
+        log(
+            "NPU page migration: pid=%s numa=%s exit_code=%s output=%s",
+            pid,
+            numa_node,
+            result.returncode,
+            ((result.stdout or "") + (result.stderr or "")).strip()[:2000] or "none",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "NPU page migration failed: pid=%s numa=%s: %s", pid, numa_node, exc
+        )
+
+
+def finalize_npu_cpu_affinity(plan: dict) -> dict:
+    """Apply a scheduler's saved plan after HTTP warmup, then optionally migrate."""
+    assignment = plan["assignment"]
+    pid = plan["pid"]
+    result = None
+    error = None
+    try:
+        # Do not apply a stale plan to an unrelated process after PID reuse.
+        if psutil.Process(pid).create_time() != plan["create_time"]:
+            raise NpuAffinityError(
+                f"Scheduler PID {pid} was reused", stage="finalize_scheduler"
+            )
+        result = apply_npu_cpu_affinity(
+            assignment, phase="final", bind_all_threads=True, pid=pid
+        )
+        if result.success:
+            migrate_npu_pages(pid, assignment.numa_node)
+    except (NpuAffinityError, psutil.Error) as exc:
+        error = (
+            exc
+            if isinstance(exc, NpuAffinityError)
+            else NpuAffinityError(str(exc), stage="finalize_scheduler")
+        )
+        logger.warning("NPU final CPU binding failed: pid=%s: %s", pid, error)
+    return build_npu_affinity_report(
+        assignment,
+        result,
+        runtime_npu_id=assignment.runtime_npu_id,
+        tp_rank=plan["tp_rank"],
+        pp_rank=plan["pp_rank"],
+        dp_rank=plan["dp_rank"],
+        error=error,
+        pid=pid,
+    )
 
 
 def log_npu_affinity_summary(
