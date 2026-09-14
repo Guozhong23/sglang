@@ -147,10 +147,13 @@ class SchedulerInitResult:
 
     def finalize_npu_affinity(self, server_args: ServerArgs) -> None:
         """Finalize only the schedulers that explicitly deferred their binding."""
-        infos = [
-            {"npu_cpu_affinity": finalize_npu_cpu_affinity(plan)}
-            for plan in self.npu_affinity_plans
-        ]
+        infos = []
+        failed_pd_pids = []
+        for plan in self.npu_affinity_plans:
+            report = finalize_npu_cpu_affinity(plan)
+            infos.append({"npu_cpu_affinity": report})
+            if plan.get("pd_assignment") is not None and report["status"] != "SUCCESS":
+                failed_pd_pids.append(plan["pid"])
         self.npu_affinity_plans.clear()
         log_npu_affinity_summary(
             infos,
@@ -158,6 +161,10 @@ class SchedulerInitResult:
             tp_size=server_args.tp_size,
             port=server_args.port,
         )
+        if failed_pd_pids:
+            raise RuntimeError(
+                f"PD CPU affinity finalization failed for schedulers {failed_pd_pids}"
+            )
 
 
 def init_tokenizer_manager(

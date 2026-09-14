@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Callable, Iterable, Literal, Optional
 
 import psutil
 
@@ -107,11 +107,23 @@ class NpuAffinityAssignment:
 
 
 @dataclass(frozen=True)
+class NpuPdAffinityAssignment:
+    physical_npu_id: int
+    physical_core_keys: tuple[tuple[int, int], ...]
+    logical_cpu_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class NpuAffinityThreadResult:
     thread_id: Optional[int]
     status: Literal["bound", "exited", "failed", "mismatched"]
     actual_cpu_ids: tuple[int, ...] = ()
     error: str = ""
+    expected_cpu_ids: tuple[int, ...] = ()
+    role: str = "compute"
+    source: str = "default"
+    name: str = ""
+    start_time: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +138,7 @@ class NpuAffinityApplyResult:
     threads_mismatched: int
     thread_results: tuple[NpuAffinityThreadResult, ...] = ()
     bind_all_threads: bool = False
+    pd_assignment: Optional[NpuPdAffinityAssignment] = None
 
     @property
     def success(self) -> bool:
@@ -766,6 +779,50 @@ def resolve_npu_affinity_assignment(
     )
 
 
+def build_npu_pd_affinity_assignment(
+    topology: NpuTopology,
+    compute: NpuAffinityAssignment,
+    requested_pcores: int,
+) -> NpuPdAffinityAssignment:
+    """Use only unused, complete cores from the compute plan's saved slice."""
+    if requested_pcores <= 0:
+        raise NpuAffinityError(
+            "PD core budget must be positive", stage="plan_pd_affinity"
+        )
+    entry = topology.entries[compute.physical_npu_id]
+    owned_keys = set(compute.owned_physical_core_keys)
+    compute_keys = set(compute.physical_core_keys)
+    unused_keys = owned_keys - compute_keys
+    allowed = (
+        entry.local_cpu_ids & topology.online_cpu_ids & set(compute.allowed_cpu_ids)
+    )
+    remaining = [
+        core
+        for core in sorted(entry.physical_cores, key=lambda c: (c.socket_id, c.core_id))
+        if (core.socket_id, core.core_id) in unused_keys
+        and core.logical_cpu_ids
+        and set(core.logical_cpu_ids) <= allowed
+    ]
+    if len(remaining) < requested_pcores:
+        raise NpuAffinityError(
+            f"NPU{compute.physical_npu_id} cannot allocate {requested_pcores} extra "
+            f"PD physical cores: compute={compute.effective_pcores}, "
+            f"remaining={len(remaining)} in its fixed ownership slice; "
+            "the compute assignment will not be reduced",
+            stage="plan_pd_affinity",
+            logical_npu_id=compute.logical_npu_id,
+            physical_npu_id=compute.physical_npu_id,
+        )
+    selected = remaining[:requested_pcores]
+    return NpuPdAffinityAssignment(
+        physical_npu_id=compute.physical_npu_id,
+        physical_core_keys=tuple((c.socket_id, c.core_id) for c in selected),
+        logical_cpu_ids=tuple(
+            sorted(cpu for core in selected for cpu in core.logical_cpu_ids)
+        ),
+    )
+
+
 def apply_npu_cpu_affinity(
     assignment: NpuAffinityAssignment,
     *,
@@ -773,6 +830,8 @@ def apply_npu_cpu_affinity(
     bind_all_threads: bool,
     emit_log: bool = True,
     pid: Optional[int] = None,
+    thread_binder: Optional[Callable[[int, int], NpuAffinityThreadResult]] = None,
+    pd_assignment: Optional[NpuPdAffinityAssignment] = None,
 ) -> NpuAffinityApplyResult:
     """Apply the saved target exactly and verify every surviving thread.
 
@@ -780,6 +839,8 @@ def apply_npu_cpu_affinity(
     binding. A runtime may narrow the main thread's mask in between; intersecting
     with that mask here would prevent restoring the originally selected CPUs.
     ``pid`` allows the HTTP launcher to bind a scheduler after HTTP warmup.
+    An optional ``thread_binder`` applies and verifies per-thread targets for
+    PD. With no binder the original uniform compute binding is unchanged.
     """
 
     if phase not in ("early", "final"):
@@ -838,6 +899,14 @@ def apply_npu_cpu_affinity(
         for thread in threads:
             tid = thread.id
             try:
+                if thread_binder is not None:
+                    thread_result = thread_binder(process_pid, tid)
+                    thread_results.append(thread_result)
+                    threads_bound += thread_result.status in ("bound", "mismatched")
+                    threads_mismatched += thread_result.status == "mismatched"
+                    threads_failed += thread_result.status == "failed"
+                    threads_exited += thread_result.status == "exited"
+                    continue
                 os.sched_setaffinity(tid, target_cpu_ids)
                 actual_cpu_ids = tuple(sorted(os.sched_getaffinity(tid)))
                 threads_bound += 1
@@ -874,6 +943,7 @@ def apply_npu_cpu_affinity(
         threads_mismatched=threads_mismatched,
         thread_results=tuple(thread_results),
         bind_all_threads=bind_all_threads,
+        pd_assignment=pd_assignment,
     )
     if emit_log:
         log_npu_affinity_result(assignment, result, phase=phase, pid=pid)
@@ -916,6 +986,20 @@ def log_npu_affinity_result(
         )
     if 0 < assignment.effective_pcores < assignment.requested_pcores:
         binding += f" requested_pcores={assignment.requested_pcores} (clipped)"
+    if result.pd_assignment is not None:
+        pd = result.pd_assignment
+        overlap = set(assignment.physical_core_keys) & set(pd.physical_core_keys)
+        binding += (
+            f"\npd_cpu_mask={format_cpu_list(pd.logical_cpu_ids)} "
+            f"pd_physical_cores={len(pd.physical_core_keys)} "
+            f"compute_pd_core_overlap={len(overlap)}"
+        )
+        for source in ("python_pd", "native_pd", "default"):
+            matched = sum(
+                t.source == source and t.status == "bound"
+                for t in result.thread_results
+            )
+            binding += f" {source}_threads={matched}"
     lines = [
         "=============== NPU CPU AFFINITY RESULT ===============",
         f"phase={phase} status={status} pid={process_pid} "
@@ -929,8 +1013,9 @@ def log_npu_affinity_result(
         and result.bind_all_threads
         and envs.SGLANG_NPU_AFFINITY_DEBUG_THREADS.get()
     ):
-        # Only inspect names in debug mode. Native runtime threads are absent
-        # from threading.enumerate(), so /proc's comm is the primary name.
+        # Reuse the PD binder's identity snapshot when available. Otherwise
+        # inspect /proc names only in debug mode (native threads aren't in
+        # threading.enumerate()).
         python_names = (
             {t.native_id: t.name for t in threading.enumerate()}
             if process_pid == os.getpid()
@@ -939,8 +1024,8 @@ def log_npu_affinity_result(
         lines.append("thread_details (final binding snapshot):")
         for thread in result.thread_results:
             tid = thread.thread_id
-            name = "<unavailable>"
-            if tid is not None:
+            name = thread.name or "<unavailable>"
+            if tid is not None and not thread.name:
                 try:
                     name = (
                         Path(f"/proc/{process_pid}/task/{tid}/comm")
@@ -957,6 +1042,12 @@ def log_npu_affinity_result(
             )
             if tid in python_names:
                 detail += f" python_name={python_names[tid]!r}"
+            if result.pd_assignment is not None:
+                detail += (
+                    f" role={thread.role} source={thread.source}"
+                    f" starttime={thread.start_time}"
+                    f" expected_cpu_mask={format_cpu_list(thread.expected_cpu_ids)}"
+                )
             if thread.error:
                 detail += f" error={thread.error!r}"
             lines.append(detail)
@@ -983,7 +1074,7 @@ def build_npu_affinity_report(
         status = "SUCCESS"
     else:
         status = "INCOMPLETE"
-    return {
+    report = {
         "pid": os.getpid() if pid is None else pid,
         "runtime_npu_id": runtime_npu_id,
         "physical_npu_id": (
@@ -1031,6 +1122,23 @@ def build_npu_affinity_report(
         ),
         "error": str(error) if error is not None else None,
     }
+    if result is not None and result.pd_assignment is not None:
+        pd = result.pd_assignment
+        report["pd_cpu_ids"] = list(pd.logical_cpu_ids)
+        report["pd_physical_cores"] = len(pd.physical_core_keys)
+        report["pd_threads_bound"] = sum(
+            t.source in ("python_pd", "native_pd") and t.status == "bound"
+            for t in result.thread_results
+        )
+        issues = {t.thread_id: t for t in result.thread_results}
+        for issue in report["thread_issues"]:
+            thread = issues[issue["tid"]]
+            issue.update(
+                expected_cpu_ids=list(thread.expected_cpu_ids),
+                role=thread.role,
+                source=thread.source,
+            )
+    return report
 
 
 def migrate_npu_pages(pid: int, numa_node: int) -> None:
@@ -1076,8 +1184,18 @@ def finalize_npu_cpu_affinity(plan: dict) -> dict:
             raise NpuAffinityError(
                 f"Scheduler PID {pid} was reused", stage="finalize_scheduler"
             )
+        binding_options = {}
+        if plan.get("pd_assignment") is not None:
+            from sglang.srt.utils.npu_pd_affinity import make_pd_thread_binder
+
+            binding_options = {
+                "pd_assignment": plan["pd_assignment"],
+                "thread_binder": make_pd_thread_binder(
+                    assignment, plan["pd_assignment"], plan["python_pd_threads"]
+                ),
+            }
         result = apply_npu_cpu_affinity(
-            assignment, phase="final", bind_all_threads=True, pid=pid
+            assignment, phase="final", bind_all_threads=True, pid=pid, **binding_options
         )
         if result.success:
             migrate_npu_pages(pid, assignment.numa_node)
@@ -1161,6 +1279,12 @@ def log_npu_affinity_summary(
                 f"threads_exited={report['threads_exited']}",
             ]
         )
+        if "pd_cpu_ids" in report:
+            lines.append(
+                f"pd_cpu_mask={cpu_mask(report['pd_cpu_ids'])} "
+                f"pd_physical_cores={report['pd_physical_cores']} "
+                f"pd_threads_bound={report['pd_threads_bound']}"
+            )
         for issue in report["thread_issues"]:
             lines.extend(
                 [
@@ -1170,6 +1294,11 @@ def log_npu_affinity_summary(
             )
             if issue["error"]:
                 lines.append(f"  error={issue['error']}")
+            if "expected_cpu_ids" in issue:
+                lines.append(
+                    f"  role={issue['role']} source={issue['source']} "
+                    f"expected_cpu_mask={cpu_mask(issue['expected_cpu_ids'])}"
+                )
         if report["error"]:
             lines.append(f"error={report['error']}")
     lines.append("=============== END NPU CPU AFFINITY SUMMARY ===============")

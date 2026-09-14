@@ -225,7 +225,8 @@ class MooncakeKVManager(CommonKVManager):
             )
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
-                    transfer_thread_pool_size // transfer_queue_size
+                    transfer_thread_pool_size // transfer_queue_size,
+                    initializer=self._get_transfer_pool_initializer(),
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -238,8 +239,9 @@ class MooncakeKVManager(CommonKVManager):
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
-                threading.Thread(
+                self._start_transfer_thread(
                     target=self.transfer_worker,
+                    role="transfer_worker",
                     args=(
                         queue,
                         executor,
@@ -251,7 +253,7 @@ class MooncakeKVManager(CommonKVManager):
                         i,
                     ),
                     daemon=True,
-                ).start()
+                )
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -260,11 +262,12 @@ class MooncakeKVManager(CommonKVManager):
                     envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
                 )
                 self._failed_session_probe_shutdown = threading.Event()
-                threading.Thread(
+                self._start_transfer_thread(
                     target=self._failed_session_probe_loop,
+                    role="failed_session_probe",
                     name="MooncakeFailedSessionProbe",
                     daemon=True,
-                ).start()
+                )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
@@ -1917,7 +1920,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        self._start_transfer_thread(bootstrap_thread, role="bootstrap")
 
     def start_decode_thread(self):
         def decode_thread():
@@ -1988,7 +1991,7 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     self.update_status(bootstrap_room, status)
 
-        threading.Thread(target=decode_thread).start()
+        self._start_transfer_thread(decode_thread, role="decode_completion")
         self._start_heartbeat_checker_thread()
 
     def add_transfer_request(

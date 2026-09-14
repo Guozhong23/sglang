@@ -306,8 +306,15 @@ from sglang.srt.utils.npu_affinity import (
     NpuAffinityError,
     apply_npu_cpu_affinity,
     build_npu_affinity_report,
+    build_npu_pd_affinity_assignment,
     migrate_npu_pages,
+    query_npu_smi_topology,
     resolve_npu_affinity_assignment,
+)
+from sglang.srt.utils.npu_pd_affinity import (
+    get_pd_affinity_budget,
+    install_pd_thread_affinity,
+    make_pd_thread_binder,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -4958,6 +4965,24 @@ def run_scheduler_process(
     npu_assignment, npu_affinity_error = (
         _prepare_npu_scheduler_cpu_affinity(server_args, gpu_id)
     )
+    pd_affinity = install_pd_thread_affinity(None)
+    pd_affinity_error = None
+    try:
+        pd_budget = get_pd_affinity_budget(server_args, is_npu=_is_npu)
+        if pd_budget:
+            if npu_assignment is None:
+                raise NpuAffinityError(
+                    f"PD affinity needs a valid compute plan: {npu_affinity_error}",
+                    stage="plan_pd_affinity",
+                )
+            pd_assignment = build_npu_pd_affinity_assignment(
+                # Cached topology and the compute plan's saved allowed CPUs:
+                # do not re-read affinity after the runtime has narrowed it.
+                query_npu_smi_topology(), npu_assignment, pd_budget
+            )
+            pd_affinity = install_pd_thread_affinity(pd_assignment)
+    except NpuAffinityError as exc:
+        pd_affinity_error = exc
 
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
@@ -4998,6 +5023,8 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     scheduler = None
     try:
+        if pd_affinity_error is not None:
+            raise pd_affinity_error
         scheduler = Scheduler(
             server_args,
             port_args,
@@ -5015,12 +5042,32 @@ def run_scheduler_process(
         npu_final_result = None
         if npu_assignment is not None and not defer_npu_affinity_final:
             try:
+                binding_options = {}
+                if pd_affinity is not None:
+                    binding_options = {
+                        "pd_assignment": pd_affinity.assignment,
+                        "thread_binder": make_pd_thread_binder(
+                            npu_assignment,
+                            pd_affinity.assignment,
+                            pd_affinity.snapshot(),
+                        ),
+                        "pid": os.getpid(),
+                    }
                 npu_final_result = apply_npu_cpu_affinity(
-                    npu_assignment, phase="final", bind_all_threads=True
+                    npu_assignment,
+                    phase="final",
+                    bind_all_threads=True,
+                    **binding_options,
                 )
+                if pd_affinity is not None and not npu_final_result.success:
+                    raise NpuAffinityError(
+                        "Grouped PD CPU binding failed", stage="finalize_scheduler"
+                    )
                 if npu_final_result.success:
                     migrate_npu_pages(os.getpid(), npu_assignment.numa_node)
             except NpuAffinityError as exc:
+                if pd_affinity is not None:
+                    raise
                 npu_affinity_error = exc
                 _log_npu_scheduler_affinity_failure(exc, phase="final")
 
@@ -5035,6 +5082,13 @@ def run_scheduler_process(
                 "pp_rank": pp_rank,
                 "dp_rank": dp_rank,
             }
+            if pd_affinity is not None:
+                # Current dummy warmup does not create transfer pool workers.
+                # Later workers bind in their initializer, after ready/final.
+                init_info["npu_cpu_affinity_plan"].update(
+                    pd_assignment=pd_affinity.assignment,
+                    python_pd_threads=pd_affinity.snapshot(),
+                )
         elif _is_npu and envs.SGLANG_SET_CPU_AFFINITY.get():
             init_info["npu_cpu_affinity"] = build_npu_affinity_report(
                 npu_assignment,

@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.npu_pd_affinity import get_pd_thread_affinity
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,19 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def _start_transfer_thread(self, target, *, role, args=(), name=None, daemon=None):
+        affinity = get_pd_thread_affinity()
+        start = (
+            affinity.start_thread
+            if affinity is not None
+            else super()._start_transfer_thread
+        )
+        return start(target, role=role, args=args, name=name, daemon=daemon)
+
+    def _get_transfer_pool_initializer(self):
+        affinity = get_pd_thread_affinity()
+        return affinity.initialize_pool_thread if affinity is not None else None
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)
