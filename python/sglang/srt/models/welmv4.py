@@ -1132,6 +1132,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if is_full_deepep_decode_like:
             num_token_non_padded = None
+        if (
+            _is_npu
+            and is_kv_mirror_prefill
+            and forward_batch.welmv4_npu_deepep_full_mirror
+        ):
+            # FULL mirror prefill has exactly B valid request rows, with no
+            # padded suffix. Skip the all-false scalar mask without changing
+            # batch metadata or the explicit segmented masks used by DP.
+            num_token_non_padded = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
@@ -2560,6 +2569,9 @@ class Qwen2MoeAttention(nn.Module):
             and self.gated_self_attention_headwise
             and hidden_states.shape[0] > 0
             and use_decode_like_stream_policy
+            # Fused QKV has already completed norm/RoPE; keep gate GEMM on
+            # the main stream after attention instead of overlapping it.
+            and fused_qkv is None
         )
         if enable_npu_gate_alt_stream:
             device_module = torch.get_device_module()
