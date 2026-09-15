@@ -29,6 +29,7 @@ import gc
 import logging
 import os
 import pickle
+import sys
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -2858,6 +2859,11 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    welm_megamoe = sys.modules.get(
+        "sglang.srt.hardware_backend.npu.moe.welmv4_megamoe"
+    )
+    if welm_megamoe is not None:
+        welm_megamoe.close_welm_megamoe_runtimes()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

@@ -5123,4 +5123,9 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                welm_megamoe = sys.modules.get(
+                    "sglang.srt.hardware_backend.npu.moe.welmv4_megamoe"
+                )
+                if welm_megamoe is not None:
+                    welm_megamoe.close_welm_megamoe_runtimes()
                 scheduler.release_host_resources()

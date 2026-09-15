@@ -816,6 +816,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ) + int(config.num_hidden_layers)
         self.last_final_experts_output: Optional[torch.Tensor] = None
         self.last_final_shared_output: Optional[torch.Tensor] = None
+        # Bound by the target runner after loading, never by a draft forward.
+        self.welm_prefill_megamoe = None
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -1057,6 +1059,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_welm_local_ep_moe: bool = False,
         use_welm_decode_like_stream_policy: bool = False,
         use_welm_prefill_normal_stream_policy: bool = False,
+        use_welm_prefill_megamoe: bool = False,
+        force_serial_shared_expert: bool = False,
         valid_row_mask: Optional[torch.Tensor] = None,
         invalid_row_mask: Optional[torch.Tensor] = None,
         invalid_topk_id: Optional[int] = None,
@@ -1094,6 +1098,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         enable_npu_decode_like_dual_stream = (
             _is_npu
+            and not force_serial_shared_expert
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
@@ -1102,6 +1107,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         enable_npu_prefill_normal_shared_overlap = (
             _is_npu
+            and not force_serial_shared_expert
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
             and self.shared_expert is not None
@@ -1161,6 +1167,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # padded suffix. Skip the all-false scalar mask without changing
             # batch metadata or the explicit segmented masks used by DP.
             num_token_non_padded = None
+        megamoe_invalid_rows = None
+        if use_welm_prefill_megamoe:
+            megamoe_invalid_rows = self.welm_prefill_megamoe.invalid_rows(
+                num_tokens, num_token_non_padded, invalid_row_mask
+            )
+            if megamoe_invalid_rows is not None:
+                # Sanitize before both shared expert and router, not only at
+                # dispatch: zero weights cannot make NaN dummy inputs safe.
+                hidden_states = hidden_states.masked_fill(
+                    megamoe_invalid_rows[:, None], 0
+                )
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
@@ -1251,7 +1268,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = process_shared_expert(
                 hidden_states, self._forward_shared_expert
             )
-        if use_welm_local_ep_moe:
+        if use_welm_prefill_megamoe:
+            experts_output = self.welm_prefill_megamoe.forward_layer(
+                self.experts, hidden_states, topk_output, megamoe_invalid_rows
+            )
+        elif use_welm_local_ep_moe:
             if not self.welm_local_ep_kernel_available:
                 raise RuntimeError(
                     "WeLMv4 local EP MoE was selected for an unsupported "
@@ -3594,6 +3615,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     f"FULL request-row count: {mirror_ll_capacity} < "
                     f"{hidden_states.shape[0]}"
                 )
+        megamoe = self.mlp.welm_prefill_megamoe
+        use_megamoe_prefill = (
+            megamoe is not None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and output_hidden_is_scattered
+        )
         with get_forward().scoped(
             deepep_mode_override=(
                 DeepEPMode.LOW_LATENCY
@@ -3610,6 +3637,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch,
                 use_reduce_scatter,
                 use_welm_local_ep_moe=use_welm_local_ep_moe,
+                use_welm_prefill_megamoe=(
+                    use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
+                ),
+                force_serial_shared_expert=use_megamoe_prefill,
                 return_components=self.is_final_layer,
                 skip_component_output=(
                     self.is_final_layer

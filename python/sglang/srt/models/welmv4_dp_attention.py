@@ -1344,6 +1344,8 @@ class WelmDpAttentionExecutor:
         batch_plan: WelmBatchExecutionPlan,
         active_view: "WelmDpRowView",
     ) -> WelmDpLayerState:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
         plan = self.runner_plan
         transport = batch_plan.moe_transport
         layer.final_mlp_experts_output = None
@@ -1366,6 +1368,15 @@ class WelmDpAttentionExecutor:
             state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
             assert state.residual is not None
             state.residual.masked_fill_(invalid_mask[:, None], 0)
+            megamoe = layer.mlp.welm_prefill_megamoe
+            use_megamoe = (
+                megamoe is not None
+                and forward_batch.welm_dp_all_active_ordinary_prefill
+                and megamoe.can_run(active_view.local_slot_rows // plan.attn_tp_size)
+            )
+            original_mode = forward_batch._original_forward_mode
+            if original_mode is None:
+                original_mode = forward_batch.forward_mode
             mlp_output = layer.mlp(
                 state.hidden_states,
                 None,
@@ -1373,6 +1384,11 @@ class WelmDpAttentionExecutor:
                 False,
                 return_components=False,
                 use_welm_prefill_normal_stream_policy=True,
+                use_welm_prefill_megamoe=use_megamoe,
+                force_serial_shared_expert=(
+                    megamoe is not None
+                    and (original_mode == ForwardMode.EXTEND or use_megamoe)
+                ),
                 valid_row_mask=valid_mask,
                 invalid_row_mask=invalid_mask,
                 invalid_topk_id=-1,
