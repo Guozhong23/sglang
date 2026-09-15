@@ -134,6 +134,50 @@ _is_npu = is_npu()
 # Cache only compiled programs, never per-forward Q/K/V or mirror activations.
 _WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
 
+# Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
+# rank's packed segment prevents a bulk-RoPE AIV tile from crossing ranks.
+_WELMV4_FUSED_QKV_TILE_ROWS = 256
+
+
+def _get_welm_prefill_ag_qkv_slices(
+    local_rows: int, tp_size: int, min_chunk_tokens: int, max_chunks: int
+) -> Optional[List[Tuple[int, int]]]:
+    if max_chunks < 2:
+        return None
+    tile_rows = _WELMV4_FUSED_QKV_TILE_ROWS
+    min_local_rows = (max(1, min_chunk_tokens) + tp_size - 1) // tp_size
+    min_tiles = (min_local_rows + tile_rows - 1) // tile_rows
+    num_tiles = local_rows // tile_rows
+    chunks = min(max_chunks, num_tiles // min_tiles)
+    if chunks < 2:
+        return None
+    boundaries = [tile_rows * (num_tiles * c // chunks) for c in range(chunks)]
+    boundaries.append(local_rows)
+    return list(zip(boundaries, boundaries[1:]))
+
+
+def _get_welm_fused_qkv_program(
+    device: Any,
+    qkv_width: int,
+    num_slots: int,
+    max_pos: int,
+    positions_contiguous: bool,
+) -> Any:
+    key = (device, qkv_width, num_slots, max_pos, positions_contiguous)
+    program = _WELMV4_FUSED_QKV_PROGRAMS.get(key)
+    if program is None:
+        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache import compile_aot
+
+        program = compile_aot(
+            qkv_width,
+            num_slots,
+            max_pos,
+            return_v=True,
+            positions_contiguous=positions_contiguous,
+        )
+        _WELMV4_FUSED_QKV_PROGRAMS[key] = program
+    return program
+
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
     """Adapt WeLM fused RMSNorm to LayerCommunicator's return-value contract."""
@@ -1779,25 +1823,13 @@ class Qwen2MoeAttention(nn.Module):
             else forward_batch.out_cache_loc
         )
 
-        key = (
+        program = _get_welm_fused_qkv_program(
             hidden_states.device,
             weight.shape[0],
             k_cache.shape[0],
             cos_sin_cache.shape[0],
             positions_contiguous,
         )
-        program = _WELMV4_FUSED_QKV_PROGRAMS.get(key)
-        if program is None:
-            from sglang.srt.layers.fused_qkv_proj_norm_rope_cache import compile_aot
-
-            program = compile_aot(
-                weight.shape[0],
-                k_cache.shape[0],
-                cos_sin_cache.shape[0],
-                return_v=True,
-                positions_contiguous=positions_contiguous,
-            )
-            _WELMV4_FUSED_QKV_PROGRAMS[key] = program
 
         q = hidden_states.new_empty((num_tokens, self.q_size))
         k = hidden_states.new_empty((num_tokens, self.kv_size))
@@ -1829,6 +1861,156 @@ class Qwen2MoeAttention(nn.Module):
             mirror_k if has_mirror else None,
             mirror_v if has_mirror else None,
         )
+
+    def _npu_prefill_ag_fused_qkv(
+        self,
+        positions: torch.Tensor,
+        local_hidden: torch.Tensor,
+        forward_batch: ForwardBatch,
+        slices: List[Tuple[int, int]],
+    ) -> Tuple[
+        torch.Tensor,
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ],
+    ]:
+        """Prefetch AG(c+1) while fused QKV(c) computes; return original row order."""
+        group = get_tp_group()
+        tp_size = group.world_size
+        local_rows, hidden_size = local_hidden.shape
+        num_tokens = tp_size * local_rows
+        has_mirror = (
+            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers
+            and hasattr(self, "qkv_proj_weight")
+        )
+        weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
+        weight = weight.data
+        gamma = self.k_norm.weight.data.view(1, self.head_dim)
+        epsilon = float(self.k_norm.eps)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        backend = get_attn_backend()
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        k_cache = k_cache.view(-1, self.head_dim)
+        v_cache = v_cache.view(-1, self.head_dim)
+        # These are physical slots in this layer's pool, not token positions.
+        # The backend has already translated Full -> SWA when needed.
+        slots = (
+            backend.forward_metadata.swa_out_cache_loc
+            if backend._is_swa_layer(self.attn)
+            else forward_batch.out_cache_loc
+        )
+        position_rows = positions.to(torch.int64).view(tp_size, local_rows)
+        slot_rows = slots.to(torch.int64).view(tp_size, local_rows)
+
+        # Each aligned rank segment consists of complete 256-row Cube tiles
+        # (two 128-row AIV halves). Thus each bulk load sees consecutive positions
+        # even though adjacent rank segments need not be globally contiguous.
+        # Keep the original FULL padded extent for the table-tail safety check.
+        bulk_rope_safe = (
+            forward_batch.batch_size == 1
+            and forward_batch.extend_prefix_lens_cpu[0] + num_tokens
+            <= cos_sin_cache.shape[0]
+        )
+        rope_modes = [
+            bulk_rope_safe and (end - start) % _WELMV4_FUSED_QKV_TILE_ROWS == 0
+            for start, end in slices
+        ]
+        # Compile all needed dynamic-M variants before any collective is in
+        # flight. Neither M nor the current positions/slots enter the cache key.
+        programs = {
+            mode: _get_welm_fused_qkv_program(
+                local_hidden.device,
+                weight.shape[0],
+                k_cache.shape[0],
+                cos_sin_cache.shape[0],
+                mode,
+            )
+            for mode in dict.fromkeys(rope_modes)
+        }
+
+        max_tokens = tp_size * max(end - start for start, end in slices)
+        gathered = [
+            local_hidden.new_empty((max_tokens, hidden_size)) for _ in range(2)
+        ]
+        full_hidden = local_hidden.new_empty((num_tokens, hidden_size))
+        widths = [self.q_size, self.kv_size, self.kv_size]
+        if has_mirror:
+            widths.extend([self.kv_size, self.kv_size])
+        full_outputs = [
+            local_hidden.new_empty((num_tokens, width)) for width in widths
+        ]
+        scratch_outputs = [
+            local_hidden.new_empty((max_tokens, width)) for width in widths
+        ]
+        if not has_mirror:
+            # The plain-layer artifact never writes its one-row mirror stand-ins.
+            scratch_outputs.extend(
+                [local_hidden.new_empty((1, self.kv_size)) for _ in range(2)]
+            )
+        position_scratch = positions.new_empty((max_tokens,), dtype=torch.int64)
+        slot_scratch = slots.new_empty((max_tokens,), dtype=torch.int64)
+        full_row_views = [
+            tensor.view(tp_size, local_rows, -1)
+            for tensor in [full_hidden, *full_outputs]
+        ]
+        # Forward-local ownership only: keep work and send/receive views alive
+        # through their joins, without sharing mutable buffers across batches.
+        pending = []
+
+        def launch_ag(chunk_idx):
+            start, end = slices[chunk_idx]
+            n = tp_size * (end - start)
+            send = local_hidden[start:end].contiguous()
+            receive = gathered[chunk_idx % 2][:n]
+            work = torch.distributed.all_gather_into_tensor(
+                receive, send, group=group.device_group, async_op=True
+            )
+            pending.append((work, send, receive))
+            return work
+
+        work = launch_ag(0)
+        for chunk_idx, (start, end) in enumerate(slices):
+            work.wait()
+            # Submit the next AG BEFORE this chunk's fused compute, otherwise
+            # HCCL's input-stream dependency would serialize the intended overlap.
+            work = launch_ag(chunk_idx + 1) if chunk_idx + 1 < len(slices) else None
+            rows = end - start
+            n = tp_size * rows
+            chunk_hidden = gathered[chunk_idx % 2][:n]
+            chunk_positions = position_scratch[:n]
+            chunk_slots = slot_scratch[:n]
+            chunk_positions.view(tp_size, rows).copy_(position_rows[:, start:end])
+            chunk_slots.view(tp_size, rows).copy_(slot_rows[:, start:end])
+            # Slice FLAT storage before reshaping: a short chunk must not retain
+            # max_tokens-sized gaps between its packed rank segments.
+            chunk_outputs = [tensor[:n] for tensor in scratch_outputs]
+            programs[rope_modes[chunk_idx]](
+                chunk_hidden,
+                weight,
+                gamma,
+                chunk_positions,
+                cos_sin_cache,
+                chunk_slots,
+                *chunk_outputs,
+                k_cache,
+                v_cache,
+                epsilon,
+            )
+            # packed r*rows+j -> original r*local_rows+start+j. Attention,
+            # gate and mirror consumers all retain their original full-row ABI.
+            for dst, src in zip(full_row_views, [chunk_hidden, *chunk_outputs]):
+                dst[:, start:end, :].copy_(src.view(tp_size, rows, -1))
+
+        q, k, v = full_outputs[:3]
+        mirror_k, mirror_v = full_outputs[3:] if has_mirror else (None, None)
+        # Every cache write/restore was enqueued on the current compute stream.
+        # The caller now publishes mirror K/V once and runs attention once, with
+        # no external RoPE or duplicate cache write.
+        return full_hidden, (q, k, v, mirror_k, mirror_v)
 
     @staticmethod
     def _linear_prefetch_tensors(
@@ -2161,6 +2343,7 @@ class Qwen2MoeAttention(nn.Module):
         prefill_mxfp8_all_gather_group: Optional[Any] = None,
         o_proj_rs_pipeline_chunks: int = 0,
         o_proj_rs_group: Optional[Any] = None,
+        prefill_ag_qkv_slices: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
         prefill_gate_hidden_states = None
         prefill_gate_all_gather_on_alt_stream = False
@@ -2186,11 +2369,16 @@ class Qwen2MoeAttention(nn.Module):
                 "active draft decode."
             )
 
-        fused_qkv = (
-            self._try_npu_fused_qkv(positions, hidden_states, forward_batch)
-            if self.use_npu_fused_qkv
-            else None
-        )
+        if prefill_ag_qkv_slices is not None:
+            hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
+                positions, hidden_states, forward_batch, prefill_ag_qkv_slices
+            )
+        else:
+            fused_qkv = (
+                self._try_npu_fused_qkv(positions, hidden_states, forward_batch)
+                if self.use_npu_fused_qkv
+                else None
+            )
         if fused_qkv is not None:
             q, k, v, mirror_k, mirror_v = fused_qkv
             if mirror_k is not None:
@@ -3077,9 +3265,37 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and is_non_consumer_attention_layer
             and self.self_attn.can_reuse_prefill_mxfp8_input()
         )
-        defer_hidden_all_gather = (
+        defer_mxfp8_hidden_ag = (
             input_hidden_is_scattered and reuse_prefill_mxfp8_input
         )
+        prefill_ag_qkv_slices = None
+        if (
+            input_hidden_is_scattered
+            and self.self_attn.use_npu_fused_qkv
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and is_non_consumer_attention_layer
+            and not reuse_prefill_mxfp8_input
+        ):
+            max_ag_chunks = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS.get()
+            if max_ag_chunks >= 2:
+                has_mirror = (
+                    self.self_attn.kv_mirror_layer_idx
+                    in self.self_attn.kv_mirror_imitated_layers
+                    and hasattr(self.self_attn, "qkv_proj_weight")
+                )
+                qkv_weight = (
+                    self.self_attn.qkv_proj_weight
+                    if has_mirror
+                    else self.self_attn.qkv_proj.weight
+                )
+                if qkv_weight.dtype == torch.bfloat16:
+                    prefill_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
+                        hidden_states.shape[0],
+                        get_tensor_model_parallel_world_size(),
+                        envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get(),
+                        max_ag_chunks,
+                    )
+        defer_bf16_fused_qkv_ag = prefill_ag_qkv_slices is not None
         use_full_mirror_layout = (
             use_npu_prefill_deepep_scattered
             and is_kv_mirror_prefill
@@ -3115,8 +3331,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 residual_after_layernorm=residual_after_layernorm,
-                defer_hidden_all_gather=defer_hidden_all_gather,
+                defer_hidden_all_gather=(
+                    defer_mxfp8_hidden_ag or defer_bf16_fused_qkv_ag
+                ),
             )
+            # Judge the actual norm output, not the potentially FP32 incoming
+            # hidden. Restore the original AG before any QKV/cache side effects
+            # when this invocation cannot use the BF16 pipeline.
+            if defer_bf16_fused_qkv_ag and hidden_states.dtype != torch.bfloat16:
+                hidden_states = self._all_gather_tp_rows(hidden_states)
+                prefill_ag_qkv_slices = None
+                defer_bf16_fused_qkv_ag = False
         elif residual_after_layernorm:
             # 纯TP layer0 layer2-47
             hidden_states, _, residual = self.input_layernorm(
@@ -3155,7 +3380,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         tp_size = get_tensor_model_parallel_world_size()
         attention_num_rows = hidden_states.shape[0] * (
-            tp_size if defer_hidden_all_gather else 1
+            tp_size if defer_mxfp8_hidden_ag or defer_bf16_fused_qkv_ag else 1
         )
         can_oproj_reduce_scatter = (
             output_hidden_is_scattered
@@ -3204,8 +3429,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
                 reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
                 prefill_mxfp8_all_gather_group=(
-                    get_tp_group() if defer_hidden_all_gather else None
+                    get_tp_group() if defer_mxfp8_hidden_ag else None
                 ),
+                prefill_ag_qkv_slices=prefill_ag_qkv_slices,
             )
         if is_first_kv_mirror_consumer:
             mirror_num_real_rows = int(forward_batch.batch_size)
