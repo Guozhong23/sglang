@@ -849,6 +849,44 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             enable_local_ep_dispatcher=self.welm_local_ep_kernel_available,
         )
 
+        # MegaMoE consumes the token-sharded (ReduceScatter) prefill layout.
+        # The first target KV-mirror consumer switches WeLM back to full rows
+        # and the original local-EP + AllReduce path. Keep the boundary tied
+        # to the model configuration instead of hard-coding layer 33.
+        target_layer_count = int(config.num_hidden_layers)
+        target_kv_mirror_layers = [
+            int(mirror_layer_id)
+            for mirror_layer_id in (getattr(config, "kv_mirror_layers", []) or [])
+            if 0 <= int(mirror_layer_id) < target_layer_count
+        ]
+        kv_mirror_enabled = bool(
+            getattr(get_global_server_args(), "enable_kv_mirror", False)
+        )
+        megamoe_prefill_end_layer = (
+            min(target_kv_mirror_layers, default=target_layer_count)
+            if kv_mirror_enabled
+            else target_layer_count
+        )
+        self.experts._npu_megamoe_prefill_enabled = bool(
+            _is_npu
+            and get_moe_a2a_backend().is_megamoe()
+            and not self.is_nextn
+            and 0 <= self.layer_id < megamoe_prefill_end_layer
+        )
+        self.experts._npu_megamoe_prefill_end_layer = megamoe_prefill_end_layer
+        if (
+            _is_npu
+            and get_moe_a2a_backend().is_megamoe()
+            and not self.is_nextn
+            and self.layer_id == 0
+        ):
+            logger.info(
+                "WeLM MegaMoE is restricted to token-sharded prefill layers "
+                "[0, %d); later target layers and all decode batches use "
+                "local-EP plus AllReduce.",
+                megamoe_prefill_end_layer,
+            )
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,

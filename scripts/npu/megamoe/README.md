@@ -83,8 +83,18 @@ unset USE_MX_FP8_QUANT
 tensors to check ID range and uniqueness. After one curl/accuracy smoke run,
 restart with it set to `0` before collecting performance.
 
-The B path uses MegaMoE only for ordinary scattered prefill. Decode, verify,
-KV-mirror full rows, and MTP keep the existing local-EP plus AllReduce path.
+The B path uses MegaMoE only for ordinary token-sharded prefill layers before
+the first target KV-mirror consumer. For the current 48-layer WeLM model this
+is layers 0-32. Layers 33-47, decode, verify, KV-mirror full rows, and MTP keep
+the existing local-EP plus AllReduce path. The boundary is read from
+`kv_mirror_layers` rather than hard-coded. When KV mirror is disabled, the
+ordinary prefill layout remains token-sharded and all target layers are
+eligible for MegaMoE.
+
+Weight post-processing follows the same split: eligible prefix layers retain
+the canonical MegaMoE MXFP8 layout, while the full-row suffix uses the regular
+Ascend GMM/FRACTAL_NZ layout. Prefix-layer decode reuses the canonical weights
+through the existing zero-copy GMM transpose view; it does not call MegaMoE.
 Shared experts remain replicated and execute on SGLang's independent NPU
 stream; the main stream waits only at the routed/shared addition.
 

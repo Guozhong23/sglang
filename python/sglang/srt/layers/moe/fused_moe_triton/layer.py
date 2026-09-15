@@ -1377,6 +1377,11 @@ class FusedMoE(torch.nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if self._use_ascend_megamoe:
+            if not getattr(self, "_npu_megamoe_prefill_enabled", True):
+                raise RuntimeError(
+                    "This MoE layer is outside the configured MegaMoE prefill "
+                    "range and must use forward_local_ep_partial plus AllReduce."
+                )
             from sglang.srt.hardware_backend.npu.moe.mega_moe import (
                 forward_megamoe,
             )

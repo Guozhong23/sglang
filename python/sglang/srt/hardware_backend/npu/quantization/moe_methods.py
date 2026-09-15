@@ -842,7 +842,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         """
         from sglang.srt.layers.moe import get_moe_a2a_backend
 
-        if not get_moe_a2a_backend().is_megamoe():
+        if not get_moe_a2a_backend().is_megamoe() or not getattr(
+            layer, "_npu_megamoe_prefill_enabled", True
+        ):
             return False
         if getattr(layer, "_npu_megamoe_weights_processed", False):
             return True

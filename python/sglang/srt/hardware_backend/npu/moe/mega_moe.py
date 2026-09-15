@@ -567,6 +567,12 @@ def forward_megamoe(
     """Run the fused routed-expert path and return LOCAL combined rows."""
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+    if not getattr(layer, "_npu_megamoe_prefill_enabled", True):
+        end_layer = getattr(layer, "_npu_megamoe_prefill_end_layer", "unknown")
+        raise RuntimeError(
+            "Ascend MegaMoE was invoked outside the WeLM token-sharded "
+            f"prefill range: layer={layer.layer_id}, end_layer={end_layer}."
+        )
     if not TopKOutputChecker.format_is_standard(topk_output):
         raise RuntimeError(
             "Ascend MegaMoE requires StandardTopKOutput; grouped/bypassed "
