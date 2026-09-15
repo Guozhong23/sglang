@@ -1075,6 +1075,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
+        router_logits = None
         moe_a2a_backend = get_moe_a2a_backend()
         is_prefill_batch = (
             forward_batch is not None
@@ -1082,6 +1083,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 include_draft_extend_v2=True
             )
         )
+        stage_dump_call = None
+        stage_dump_input = None
+        if _is_npu and envs.SGLANG_NPU_WELMV4_MOE_STAGE_DUMP.get():
+            from sglang.srt.hardware_backend.npu.moe.welm_moe_stage_dump import (
+                begin_welm_moe_stage_dump,
+            )
+
+            stage_dump_call = begin_welm_moe_stage_dump(
+                self.layer_id, is_prefill_batch
+            )
+            if stage_dump_call is not None:
+                # Some MoE implementations support in-place buffers. Preserve
+                # the true entry tensor before routed/shared computation.
+                stage_dump_input = hidden_states.detach().clone()
         is_kv_mirror_prefill = (
             forward_batch is not None
             and forward_batch.enable_kv_mirror
@@ -1291,6 +1306,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             experts_output = self.experts(hidden_states, topk_output)
+        routed_output_for_dump = (
+            experts_output.detach().clone()
+            if stage_dump_call is not None
+            else None
+        )
+        shared_output_for_dump = None
         if return_components and skip_component_output:
             if enable_npu_shared_alt_stream:
                 # This early return hands shared_output to the caller, so it is
@@ -1318,6 +1339,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if enable_npu_shared_alt_stream:
                 # Normal inference first consumes shared_output in this add.
                 wait_share_stream()
+            if stage_dump_call is not None:
+                # Capture only after the alternate shared stream has reached
+                # its normal consumption boundary.
+                shared_output_for_dump = shared_output.detach().clone()
             if allow_inplace_expert_shared_merge:
                 final_hidden_states.add_(shared_output)
             else:
@@ -1343,6 +1368,41 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
+        if stage_dump_call is not None:
+            if not isinstance(topk_output, StandardTopKOutput):
+                raise RuntimeError(
+                    "WeLM NPU MoE stage dump requires StandardTopKOutput, got "
+                    f"{type(topk_output).__name__}."
+                )
+            from sglang.srt.hardware_backend.npu.moe.welm_moe_stage_dump import (
+                dump_welm_moe_stages,
+            )
+
+            assert stage_dump_input is not None
+            assert routed_output_for_dump is not None
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 0
+            )
+            dump_welm_moe_stages(
+                layer_id=self.layer_id,
+                call_index=stage_dump_call,
+                rank=rank,
+                backend=str(moe_a2a_backend),
+                is_prefill=is_prefill_batch,
+                moe_input=stage_dump_input,
+                router_logits=router_logits,
+                topk_ids=topk_output.topk_ids,
+                topk_weights=topk_output.topk_weights,
+                routed_output=routed_output_for_dump,
+                shared_output=shared_output_for_dump,
+                moe_output=final_hidden_states,
+                valid_row_mask=valid_row_mask,
+                invalid_row_mask=invalid_row_mask,
+                num_token_non_padded=num_token_non_padded,
+            )
         if return_components:
             return (
                 final_hidden_states,

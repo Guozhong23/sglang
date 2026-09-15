@@ -181,7 +181,127 @@ grep -E 'MegaMoE-(Debug|Shadow|Dump)' server.log
 
 Disable all debug switches and restart before profiling performance.
 
-## 4. Acceptance criteria
+## 4. Four-step precision localization
+
+Restart all four ranks after every environment change. Use the exact same
+deterministic curl (`temperature=0`, one output token) in every run. These
+experiments apply only to the MegaMoE-eligible, token-sharded prefill prefix;
+the current KV-mirror model therefore limits them to layers 0-32.
+
+### Step 1: test the asynchronous completion dependency
+
+Disable every dump and shadow mode because copying a tensor to the CPU also
+synchronizes the NPU and would mask a stream-order bug:
+
+```bash
+export SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS=all
+export SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP=1
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_NPU_MEGAMOE_SHADOW_COMPARE=0
+export SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE=0
+export SGLANG_NPU_MEGAMOE_DUMP=0
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP=0
+```
+
+If this alone restores the expected token, the fused operator or its wrapper
+is returning before its output is ready on the stream consumed by the next
+operation. Keep this switch at `0` for every later experiment and for all
+performance runs.
+
+### Step 2: find the first failing prefix
+
+`ACTUAL_LAYERS` chooses which eligible layers return the real MegaMoE output.
+Every unselected eligible layer uses the existing LocalEP plus AllReduce
+reference without changing the checkpoint or surrounding execution plan.
+
+```bash
+export SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP=0
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_NPU_MEGAMOE_SHADOW_COMPARE=0
+export SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE=0
+export SGLANG_NPU_MEGAMOE_DUMP=0
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP=0
+
+# All-reference control, then increase the real MegaMoE prefix after each
+# server restart: 0, 0-1, 0-3, 0-7, 0-15, 0-23, 0-32.
+export SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS=none
+```
+
+The first prefix that changes the first token identifies the interval in
+which MegaMoE error becomes model-visible. `none` is the all-reference
+control; `all` is the original all-MegaMoE behavior.
+
+### Step 3: test one real MegaMoE layer at a time
+
+Use a single layer id after each server restart. Start with the interval found
+in Step 2, for example:
+
+```bash
+export SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS=16
+```
+
+If one layer fails by itself, focus on that layer's routing and weights. If
+every single layer passes but a longer prefix fails, the issue is cumulative
+numerical drift rather than a single malformed layer. Do not enable
+`SHADOW_USE_REFERENCE` in Steps 2-3 because it would overwrite the selected
+fused result and invalidate the experiment.
+
+### Step 4: dump aligned MoE stages in two runs
+
+Run this only after Step 1. Stage dumping copies full tensors to the CPU and
+therefore changes synchronization and performance. First create a reference
+run in which all eligible layers use LocalEP:
+
+```bash
+DUMP_ROOT=/data2/hw_sgz/welm/05_profiling/welm_moe_stage_$(date +%Y%m%d_%H%M%S)
+export SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP=0
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_NPU_MEGAMOE_SHADOW_COMPARE=0
+export SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE=0
+export SGLANG_NPU_MEGAMOE_DUMP=0
+export SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS=none
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP=1
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_DIR="${DUMP_ROOT}"
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_TAG=reference
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_LAYERS=0-32
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_SKIP_CALLS=1
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_MAX_CALLS=1
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_PREFILL_ONLY=1
+```
+
+Send the curl, stop the server, retain the same literal `DUMP_ROOT`, change
+only these settings, restart, and send the identical curl:
+
+```bash
+export SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS=all
+export SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_TAG=megamoe
+```
+
+If startup performs no MoE warmup, use `SKIP_CALLS=0`. Confirm the intended
+curl was captured from `[WeLM-MoE-StageDump]` log lines. Then compare every
+rank, layer and stage:
+
+```bash
+python scripts/npu/megamoe/compare_welm_moe_stage_dumps.py \
+  "${DUMP_ROOT}/reference" "${DUMP_ROOT}/megamoe" \
+  --csv "${DUMP_ROOT}/reference_vs_megamoe.csv"
+```
+
+Interpret the first divergence in execution order:
+
+1. Different `moe_input`: an earlier layer already introduced drift.
+2. Same input but different `router_logits`/`topk_ids`: routing became
+   unstable; inspect boundary logits and expert ownership.
+3. Same route but different `routed_output`: isolate MegaMoE dispatch, MXFP8
+   GMM/SwiGLU, scale layout, and Combine semantics.
+4. Matching routed output but different `moe_output`: inspect shared-expert
+   merge, padding masks, or stream ordering.
+
+For an independent production baseline, repeat the reference run with
+`--moe-a2a-backend deepep --deepep-mode auto` and a new tag such as `deepep`.
+The stage hooks are backend-neutral, so the same comparison script applies.
+
+## 5. Acceptance criteria
 
 1. Functional: deterministic curl output is coherent and no rank exceeds the
    registered local-token capacity.

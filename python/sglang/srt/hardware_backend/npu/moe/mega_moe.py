@@ -92,6 +92,7 @@ def _get_state():
             debug_calls={},
             debug_seen_calls={},
             debug_weight_layers=set(),
+            layer_selection_logged=set(),
         )
         buffers[_STATE_KEY] = state
     return state
@@ -243,6 +244,55 @@ def _debug_layer_selected(layer_id: int) -> bool:
             raw,
         )
         return False
+
+
+def _parse_layer_selection(raw: str) -> Optional[frozenset[int]]:
+    """Parse an inclusive layer selection used by correctness experiments.
+
+    ``None`` means all layers. An empty set means no layers. The explicit
+    parser is intentionally strict so a typo cannot silently switch a run from
+    a single-layer experiment back to the full fused path.
+    """
+
+    normalized = (raw or "").strip().lower()
+    if normalized in ("", "*", "all"):
+        return None
+    if normalized in ("none", "off"):
+        return frozenset()
+
+    selected: set[int] = set()
+    for item in normalized.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" not in item:
+            layer_id = int(item)
+            if layer_id < 0:
+                raise ValueError("layer ids must be non-negative")
+            selected.add(layer_id)
+            continue
+
+        bounds = item.split("-")
+        if len(bounds) != 2 or not bounds[0] or not bounds[1]:
+            raise ValueError(f"invalid inclusive layer range {item!r}")
+        start, end = (int(value) for value in bounds)
+        if start < 0 or end < start:
+            raise ValueError(f"invalid inclusive layer range {item!r}")
+        selected.update(range(start, end + 1))
+    return frozenset(selected)
+
+
+def _megamoe_actual_layer_selected(layer_id: int) -> bool:
+    raw = envs.SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS.get()
+    try:
+        selected = _parse_layer_selection(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Invalid SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS="
+            f"{raw!r}; expected 'all', 'none', comma-separated ids, or "
+            "inclusive ranges such as '0-7,16'."
+        ) from exc
+    return selected is None or int(layer_id) in selected
 
 
 def _begin_debug_call(layer: "FusedMoE") -> Optional[int]:
@@ -483,6 +533,32 @@ def _log_expert_counts(
 
 
 @torch.no_grad()
+def _compute_local_ep_reference(
+    layer: "FusedMoE",
+    ep_group: Any,
+    row_sizes: Sequence[int],
+    global_x: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    global_topk_weights: torch.Tensor,
+    ep_rank: int,
+) -> torch.Tensor:
+    """Return reference routed output for this rank's token-sharded rows."""
+
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    # AscendLocalEPDispatcher consumes only ids and weights; avoid gathering
+    # the unnecessary and much larger [M, num_experts] router-logit tensor.
+    reference_topk = StandardTopKOutput(
+        topk_weights=global_topk_weights,
+        topk_ids=global_topk_ids,
+        router_logits=torch.empty(0, dtype=torch.float32, device=global_x.device),
+    )
+    reference_partial = layer.forward_local_ep_partial(global_x, reference_topk)
+    reference_global = ep_group.all_reduce(reference_partial)
+    offset = sum(row_sizes[:ep_rank])
+    return reference_global[offset : offset + row_sizes[ep_rank]]
+
+
 def _log_shadow_comparison(
     layer: "FusedMoE",
     output: torch.Tensor,
@@ -507,19 +583,15 @@ def _log_shadow_comparison(
         )
         return None
 
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-    # AscendLocalEPDispatcher consumes only ids and weights; avoid gathering
-    # the unnecessary and much larger [M, num_experts] router-logit tensor.
-    reference_topk = StandardTopKOutput(
-        topk_weights=global_topk_weights,
-        topk_ids=global_topk_ids,
-        router_logits=torch.empty(0, dtype=torch.float32, device=global_x.device),
+    reference = _compute_local_ep_reference(
+        layer,
+        ep_group,
+        row_sizes,
+        global_x,
+        global_topk_ids,
+        global_topk_weights,
+        ep_rank,
     )
-    reference_partial = layer.forward_local_ep_partial(global_x, reference_topk)
-    reference_global = ep_group.all_reduce(reference_partial)
-    offset = sum(row_sizes[:ep_rank])
-    reference = reference_global[offset : offset + row_sizes[ep_rank]]
 
     if not log_comparison:
         return reference
@@ -624,8 +696,43 @@ def forward_megamoe(
     # Routing selection stays FP32. Only Combine's routing weights are cast to
     # BF16 because that is the vendor operator's public contract.
     topk_weights = reference_topk_weights.to(torch.bfloat16).contiguous()
-    sym_buffer = _get_symm_buffer(layer)
     _validate_inputs(layer, x, topk_ids, topk_weights)
+
+    # A non-selected layer is a correctness oracle, not a backend change. It
+    # keeps the canonical MegaMoE weight layout and the token-sharded prefill
+    # plan, but computes the routed result with LocalEP + AllReduce. This makes
+    # prefix and single-layer experiments differ only in which layers consume
+    # the fused operator's actual output.
+    if not _megamoe_actual_layer_selected(layer.layer_id):
+        (
+            ep_group,
+            row_sizes,
+            global_x,
+            global_topk_ids,
+            global_topk_weights,
+        ) = _collect_debug_inputs(x, topk_ids, reference_topk_weights)
+        ep_rank = torch.distributed.get_rank(ep_group.device_group)
+        state = _get_state()
+        if int(layer.layer_id) not in state.layer_selection_logged:
+            state.layer_selection_logged.add(int(layer.layer_id))
+            logger.info(
+                "[MegaMoE-LayerSelect] layer=%d ep_rank=%d output=local_ep_reference "
+                "actual_layers=%r",
+                layer.layer_id,
+                ep_rank,
+                envs.SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS.get(),
+            )
+        return _compute_local_ep_reference(
+            layer,
+            ep_group,
+            row_sizes,
+            global_x,
+            global_topk_ids,
+            global_topk_weights,
+            ep_rank,
+        )
+
+    sym_buffer = _get_symm_buffer(layer)
 
     debug_call = _begin_debug_call(layer)
     use_shadow_reference = (
@@ -687,6 +794,11 @@ def forward_megamoe(
         l2_weights_sf=[layer.w2_weight_scale],
         x_active_mask=None,
     )
+    if envs.SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP.get():
+        # Diagnostic only. If this changes model correctness while returning
+        # the same fused output, the vendor op/wrapper is missing a stream
+        # completion dependency. Do not use this as a performance workaround.
+        torch.npu.synchronize()
     if debug_inputs is not None:
         (
             ep_group,

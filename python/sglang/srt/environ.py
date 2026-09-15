@@ -658,11 +658,31 @@ class Envs:
     # Debug-only correctness oracle. The fused operator still runs, but the
     # local-EP shadow result is forwarded to the following layer.
     SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE = EnvBool(False)
+    # Select the prefill layers whose routed output comes from MegaMoE. Accepts
+    # "all" (default), "none", comma-separated ids, and inclusive ranges such
+    # as "0-7,16". Non-selected eligible layers run the same local-EP reference
+    # used by SHADOW_USE_REFERENCE, which enables prefix/single-layer bisection
+    # without changing weight layout or the surrounding WeLM execution plan.
+    SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS = EnvStr("all")
+    # Debug-only synchronization immediately after the vendor MegaMoE call.
+    # This distinguishes a missing private-stream dependency from numerical
+    # drift. It must remain disabled for performance measurements.
+    SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP = EnvBool(False)
     # Persist selected calls as rank-local torch.save files. Layer/call
     # selection reuses the MEGAMOE_DEBUG_* controls above.
     SGLANG_NPU_MEGAMOE_DUMP = EnvBool(False)
     SGLANG_NPU_MEGAMOE_DUMP_DIR = EnvStr("/tmp/sglang_megamoe_dump")
     SGLANG_NPU_MEGAMOE_DUMP_WEIGHT_SAMPLES = EnvBool(True)
+    # Backend-neutral WeLM MoE stage dumps for paired DeepEP/reference versus
+    # MegaMoE runs. Saving tensors synchronizes the device and is therefore a
+    # correctness diagnostic only, never a performance or stream-order test.
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP = EnvBool(False)
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_DIR = EnvStr("/tmp/sglang_welm_moe_stages")
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_TAG = EnvStr("run")
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_LAYERS = EnvStr("0-32")
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_SKIP_CALLS = EnvInt(0)
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_MAX_CALLS = EnvInt(1)
+    SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_PREFILL_ONLY = EnvBool(True)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
