@@ -162,19 +162,39 @@ def _get_welm_fused_qkv_program(
     num_slots: int,
     max_pos: int,
     positions_contiguous: bool,
+    *,
+    rank_chunk_layout: bool = False,
 ) -> Any:
-    key = (device, qkv_width, num_slots, max_pos, positions_contiguous)
+    key = (
+        device,
+        qkv_width,
+        num_slots,
+        max_pos,
+        positions_contiguous,
+        rank_chunk_layout,
+    )
     program = _WELMV4_FUSED_QKV_PROGRAMS.get(key)
     if program is None:
-        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache import compile_aot
-
-        program = compile_aot(
-            qkv_width,
-            num_slots,
-            max_pos,
-            return_v=True,
-            positions_contiguous=positions_contiguous,
+        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache import (
+            compile_aot,
+            compile_aot_rank_chunk,
         )
+
+        if rank_chunk_layout:
+            program = compile_aot_rank_chunk(
+                qkv_width,
+                num_slots,
+                max_pos,
+                positions_contiguous=positions_contiguous,
+            )
+        else:
+            program = compile_aot(
+                qkv_width,
+                num_slots,
+                max_pos,
+                return_v=True,
+                positions_contiguous=positions_contiguous,
+            )
         _WELMV4_FUSED_QKV_PROGRAMS[key] = program
     return program
 
@@ -1887,7 +1907,7 @@ class Qwen2MoeAttention(nn.Module):
             Optional[torch.Tensor],
         ],
     ]:
-        """Prefetch AG(c+1) while fused QKV(c) computes; return original row order."""
+        """Pre-submit all AGs to disjoint buffers; fused QKV writes final rows."""
         group = get_tp_group()
         tp_size = group.world_size
         local_rows, hidden_size = local_hidden.shape
@@ -1912,8 +1932,8 @@ class Qwen2MoeAttention(nn.Module):
             if backend._is_swa_layer(self.attn)
             else forward_batch.out_cache_loc
         )
-        position_rows = positions.to(torch.int64).view(tp_size, local_rows)
-        slot_rows = slots.to(torch.int64).view(tp_size, local_rows)
+        full_positions = positions.to(torch.int64)
+        full_slots = slots.to(torch.int64)
 
         # Each aligned rank segment consists of complete 256-row Cube tiles
         # (two 128-row AIV halves). Thus each bulk load sees consecutive positions
@@ -1937,82 +1957,75 @@ class Qwen2MoeAttention(nn.Module):
                 k_cache.shape[0],
                 cos_sin_cache.shape[0],
                 mode,
+                rank_chunk_layout=True,
             )
             for mode in dict.fromkeys(rope_modes)
         }
 
-        max_tokens = tp_size * max(end - start for start, end in slices)
-        gathered = [
-            local_hidden.new_empty((max_tokens, hidden_size)) for _ in range(2)
-        ]
+        send_hidden = local_hidden.contiguous()
+        receive_storage = local_hidden.new_empty((num_tokens, hidden_size))
         full_hidden = local_hidden.new_empty((num_tokens, hidden_size))
+        full_hidden_view = full_hidden.view(tp_size, local_rows, hidden_size)
         widths = [self.q_size, self.kv_size, self.kv_size]
         if has_mirror:
             widths.extend([self.kv_size, self.kv_size])
         full_outputs = [
             local_hidden.new_empty((num_tokens, width)) for width in widths
         ]
-        scratch_outputs = [
-            local_hidden.new_empty((max_tokens, width)) for width in widths
-        ]
+        kernel_outputs = list(full_outputs)
         if not has_mirror:
             # The plain-layer artifact never writes its one-row mirror stand-ins.
-            scratch_outputs.extend(
+            kernel_outputs.extend(
                 [local_hidden.new_empty((1, self.kv_size)) for _ in range(2)]
             )
-        position_scratch = positions.new_empty((max_tokens,), dtype=torch.int64)
-        slot_scratch = slots.new_empty((max_tokens,), dtype=torch.int64)
-        full_row_views = [
-            tensor.view(tp_size, local_rows, -1)
-            for tensor in [full_hidden, *full_outputs]
+        # Each chunk owns a contiguous, disjoint region of one allocation.
+        # The arena is chunk-major, then rank-major within each chunk; it is
+        # NOT the original full-hidden row order and must not alias full_hidden.
+        chunk_buffers = [
+            (
+                start,
+                end,
+                send_hidden[start:end],
+                receive_storage[tp_size * start : tp_size * end],
+            )
+            for start, end in slices
         ]
         # Forward-local ownership only: keep work and send/receive views alive
         # through their joins, without sharing mutable buffers across batches.
         pending = []
 
-        def launch_ag(chunk_idx):
-            start, end = slices[chunk_idx]
-            n = tp_size * (end - start)
-            send = local_hidden[start:end].contiguous()
-            receive = gathered[chunk_idx % 2][:n]
+        # Submit every AG before any wait, restore or fused computation. HCCL's
+        # input-stream dependencies then cannot include earlier chunk consumers.
+        # All allocations, input packing and compilation are already complete.
+        for start, end, send, receive in chunk_buffers:
             work = torch.distributed.all_gather_into_tensor(
                 receive, send, group=group.device_group, async_op=True
             )
-            pending.append((work, send, receive))
-            return work
+            pending.append((work, start, end, send, receive))
 
-        work = launch_ag(0)
-        for chunk_idx, (start, end) in enumerate(slices):
+        for chunk_idx, (work, start, end, send, receive) in enumerate(pending):
             work.wait()
-            # Submit the next AG BEFORE this chunk's fused compute, otherwise
-            # HCCL's input-stream dependency would serialize the intended overlap.
-            work = launch_ag(chunk_idx + 1) if chunk_idx + 1 < len(slices) else None
             rows = end - start
-            n = tp_size * rows
-            chunk_hidden = gathered[chunk_idx % 2][:n]
-            chunk_positions = position_scratch[:n]
-            chunk_slots = slot_scratch[:n]
-            chunk_positions.view(tp_size, rows).copy_(position_rows[:, start:end])
-            chunk_slots.view(tp_size, rows).copy_(slot_rows[:, start:end])
-            # Slice FLAT storage before reshaping: a short chunk must not retain
-            # max_tokens-sized gaps between its packed rank segments.
-            chunk_outputs = [tensor[:n] for tensor in scratch_outputs]
+            # BF16 gate still needs full hidden in r*local_rows+start+j order.
+            # Q/K/V/mirror and cache are written directly by the fused kernel.
+            full_hidden_view[:, start:end, :].copy_(
+                receive.view(tp_size, rows, hidden_size)
+            )
             programs[rope_modes[chunk_idx]](
-                chunk_hidden,
+                receive,
                 weight,
                 gamma,
-                chunk_positions,
+                full_positions,
                 cos_sin_cache,
-                chunk_slots,
-                *chunk_outputs,
+                full_slots,
+                *kernel_outputs,
                 k_cache,
                 v_cache,
                 epsilon,
+                local_rows,
+                rows,
+                start,
             )
-            # packed r*rows+j -> original r*local_rows+start+j. Attention,
-            # gate and mirror consumers all retain their original full-row ABI.
-            for dst, src in zip(full_row_views, [chunk_hidden, *chunk_outputs]):
-                dst[:, start:end, :].copy_(src.view(tp_size, rows, -1))
 
         q, k, v = full_outputs[:3]
         mirror_k, mirror_v = full_outputs[3:] if has_mirror else (None, None)
