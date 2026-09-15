@@ -182,40 +182,18 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    request_private_swa = False
+    # Decode radix cache is unsupported with hybrid SWA/SSM models —
+    # these use specialized memory pools incompatible with the
+    # prefix-match-and-lock allocation path.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-            from sglang.srt.utils import is_npu
-
-            # Only the ordinary paged NPU Full+SWA layout has this ownership
-            # policy. Specialized state/shared allocators retain their checks.
-            request_private_swa = (
-                is_npu()
-                and type(token_to_kv_pool_allocator) is SWATokenToKVPoolAllocator
-                and isinstance(token_to_kv_pool_allocator.get_kvcache(), SWAKVPool)
-                and token_to_kv_pool_allocator.page_size > 1
-                and bool(full_tokens_per_layer)
-                and bool(sliding_window_size and sliding_window_size > 0)
+            raise ValueError(
+                "--disaggregation-decode-enable-radix-cache is incompatible "
+                "with sliding window attention (SWA) models"
             )
-            if not request_private_swa:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with SWA requires "
-                    "the ordinary paged NPU Full+SWA pool"
-                )
-            if (
-                enable_hierarchical_cache
-                or server_args.enable_lmcache
-                or server_args.enable_flexkv
-            ):
-                raise ValueError(
-                    "Decode Full-prefix reuse with request-private SWA supports "
-                    "device-resident cache only, not HiCache/LMCache/FlexKV"
-                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -265,7 +243,6 @@ def build_kv_cache(
             full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
             is_dsa=is_dsa,
-            request_private_swa=request_private_swa,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,
             effective_chunked_prefill_size=effective_chunked_prefill_size,

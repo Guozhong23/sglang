@@ -1739,7 +1739,7 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
-                                ret = self.maybe_send_extra(
+                                self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
@@ -1747,14 +1747,11 @@ class MooncakeKVManager(CommonKVManager):
                                 )
 
                             # Only the last chunk we need to send the aux data
-                            # A successful aux write must not hide an SWA/state
-                            # failure or publish incomplete KV as reusable.
-                            if ret == 0:
-                                ret = self.send_aux(
-                                    req,
-                                    kv_chunk.prefill_aux_index,
-                                    target_rank_registration_info.dst_aux_ptrs,
-                                )
+                            ret = self.send_aux(
+                                req,
+                                kv_chunk.prefill_aux_index,
+                                target_rank_registration_info.dst_aux_ptrs,
+                            )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)

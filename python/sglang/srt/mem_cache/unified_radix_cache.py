@@ -124,13 +124,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
-        *,
-        request_private_swa: bool = False,
     ):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
-        self.request_private_swa = request_private_swa
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -162,11 +159,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # The tree may store only Full while requests still own an SWA tail.
+        # SWA window size (None when SWA is not enabled).
         self._sliding_window_size = (
-            params.sliding_window_size
-            if self.is_swa_enabled or self.request_private_swa
-            else None
+            params.sliding_window_size if self.is_swa_enabled else None
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
@@ -1994,19 +1989,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Keep a private tail out of prefix matches. In PD it is received from
-        prefill, not recomputed on decode; no SWA mappings may attach to shared
-        Full pages.
-
-        unified_kv + HiCache also needs this: SWA lives in a per-request ring
+        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never offloaded to host, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring
         (what plain radix reuse does via its SWA match gate). 0 for every other
         layout.
         """
-        if self.request_private_swa:
-            return self.sliding_window_size
         swa = self.components.get(ComponentType.SWA)
         unified_compress_only_hicache = (
             self.cache_controller is not None
@@ -2090,7 +2079,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def available_and_evictable_str(self) -> str:
         # TODO(zhangmj): need more detailed log info for session reference.
-        if self.supports_swa() or self.request_private_swa:
+        if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()

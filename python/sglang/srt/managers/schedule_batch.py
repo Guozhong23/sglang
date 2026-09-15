@@ -3217,13 +3217,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
-        if self.tree_cache.supports_swa() or self.tree_cache.request_private_swa:
+        if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_server_args()
 
             release_leaf_lock = (
-                self.tree_cache.supports_swa()
-                and envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
+                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
 
@@ -3275,9 +3274,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
-        assert (
-            self.tree_cache.supports_swa() or self.tree_cache.request_private_swa
-        ), "prefix cache must maintain swa"
+        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
         free_swa_out_of_window_slots(
             req,
             pre_len,
