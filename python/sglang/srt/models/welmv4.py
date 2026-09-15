@@ -950,14 +950,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     "WeLMv4 invalid-row mask must match the valid-row mask"
                 )
             padded_rows = invalid_row_mask
-            if invalid_topk_id is not None:
-                topk_output.topk_ids.masked_fill_(
-                    padded_rows[:, None], int(invalid_topk_id)
-                )
-            elif not preserve_padded_ids:
-                topk_output.topk_ids.masked_fill_(padded_rows[:, None], -1)
-            topk_output.topk_weights.masked_fill_(padded_rows[:, None], 0)
-            return topk_output
         else:
             if invalid_row_mask is not None:
                 raise RuntimeError(
@@ -970,26 +962,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ) >= num_token_non_padded
         topk_ids = topk_output.topk_ids
         if invalid_topk_id is not None:
-            topk_ids = torch.where(
-                padded_rows[:, None],
-                torch.full_like(topk_output.topk_ids, int(invalid_topk_id)),
-                topk_output.topk_ids,
-            )
+            topk_ids.masked_fill_(padded_rows[:, None], int(invalid_topk_id))
         elif not preserve_padded_ids:
-            topk_ids = torch.where(
-                padded_rows[:, None],
-                torch.full_like(topk_output.topk_ids, -1),
-                topk_output.topk_ids,
-            )
-        return StandardTopKOutput(
-            torch.where(
-                padded_rows[:, None],
-                torch.zeros_like(topk_output.topk_weights),
-                topk_output.topk_weights,
-            ),
-            topk_ids,
-            topk_output.router_logits,
-        )
+            topk_ids.masked_fill_(padded_rows[:, None], -1)
+        topk_output.topk_weights.masked_fill_(padded_rows[:, None], 0)
+        return topk_output
 
     @staticmethod
     def _resolve_deepep_mode_for_topk(is_prefill_batch: bool) -> DeepEPMode:

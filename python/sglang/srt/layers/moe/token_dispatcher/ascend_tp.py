@@ -284,14 +284,9 @@ class AscendLocalEPDispatcher(BaseDispatcher):
         ):
             topk_weights = topk_weights.to(hidden_states.dtype)
 
-        # A direct range comparison is safe for graph padding ids such as -1;
-        # indexing a global-to-local map with those ids would not be.
-        owned = (topk_ids >= self.first_expert_idx) & (
-            topk_ids < self.last_expert_idx
-        )
-        local_topk_weights = torch.where(
-            owned, topk_weights, torch.zeros_like(topk_weights)
-        )
+        # InitRouting excludes non-local experts through active_expert_range.
+        # Regbase token_unpermute skips their -1 row indices independently of
+        # the probabilities, so keep the original weights for combine.
         topk_ids = topk_ids.to(torch.int32)
 
         (
@@ -303,13 +298,13 @@ class AscendLocalEPDispatcher(BaseDispatcher):
             hidden_states,
             topk_ids,
             self.num_experts,
-            local_topk_weights.shape[-1],
+            topk_weights.shape[-1],
         )
 
         return AscendLocalEPDispatchOutput(
             hidden_states=permuted_hidden_states,
             hidden_states_scale=hidden_states_scale,
-            topk_weights=local_topk_weights,
+            topk_weights=topk_weights,
             expanded_row_idx=expanded_row_idx,
             expert_tokens=expert_tokens,
             group_list_type=self.group_list_type,
@@ -317,9 +312,9 @@ class AscendLocalEPDispatcher(BaseDispatcher):
 
     def combine(self, combine_input: AscendLocalEPCombineInput) -> torch.Tensor:
         # Keep the raw -1 entries emitted by row_idx_type=0. They mark routes
-        # outside this rank's active expert range for token_unpermute. This is
-        # safe only because dispatch() gives every such route an exact zero
-        # probability; do not remove that mask or replace this with abs().
+        # outside this rank's active expert range. Regbase token_unpermute
+        # skips them before loading expert outputs or applying probabilities;
+        # replacing -1 with abs()/clamp() would incorrectly include a route.
         return torch.ops.npu.npu_moe_token_unpermute(
             permuted_tokens=combine_input.hidden_states,
             sorted_indices=combine_input.expanded_row_idx,

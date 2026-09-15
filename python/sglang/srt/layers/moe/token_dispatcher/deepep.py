@@ -723,6 +723,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
         self.quant_config = {}
+        # NPU AllGather routes with int32 IDs; avoid an int64 round trip.
+        # Buffer binding validates this same strategy selection. Other normal
+        # strategies keep their int64 contract, as does the separate LL path.
+        self.topk_ids_dtype = (
+            torch.int32
+            if _is_npu
+            and DeepEPBuffer._requested_normal_strategy(self.deepep_mode) == "allgather"
+            else torch.int64
+        )
 
     def dispatch_a(
         self,
@@ -730,7 +739,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(self.topk_ids_dtype)
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
