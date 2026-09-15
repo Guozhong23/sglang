@@ -1907,7 +1907,7 @@ class Qwen2MoeAttention(nn.Module):
             Optional[torch.Tensor],
         ],
     ]:
-        """Pre-submit all AGs to disjoint buffers; fused QKV writes final rows."""
+        """Return chunk-major Gate input and original-row-order fused QKV."""
         group = get_tp_group()
         tp_size = group.world_size
         local_rows, hidden_size = local_hidden.shape
@@ -1964,8 +1964,6 @@ class Qwen2MoeAttention(nn.Module):
 
         send_hidden = local_hidden.contiguous()
         receive_storage = local_hidden.new_empty((num_tokens, hidden_size))
-        full_hidden = local_hidden.new_empty((num_tokens, hidden_size))
-        full_hidden_view = full_hidden.view(tp_size, local_rows, hidden_size)
         widths = [self.q_size, self.kv_size, self.kv_size]
         if has_mirror:
             widths.extend([self.kv_size, self.kv_size])
@@ -1980,7 +1978,7 @@ class Qwen2MoeAttention(nn.Module):
             )
         # Each chunk owns a contiguous, disjoint region of one allocation.
         # The arena is chunk-major, then rank-major within each chunk; it is
-        # NOT the original full-hidden row order and must not alias full_hidden.
+        # returned as Gate input only, NOT as original-row-order hidden.
         chunk_buffers = [
             (
                 start,
@@ -2006,11 +2004,6 @@ class Qwen2MoeAttention(nn.Module):
         for chunk_idx, (work, start, end, send, receive) in enumerate(pending):
             work.wait()
             rows = end - start
-            # BF16 gate still needs full hidden in r*local_rows+start+j order.
-            # Q/K/V/mirror and cache are written directly by the fused kernel.
-            full_hidden_view[:, start:end, :].copy_(
-                receive.view(tp_size, rows, hidden_size)
-            )
             programs[rope_modes[chunk_idx]](
                 receive,
                 weight,
@@ -2029,10 +2022,11 @@ class Qwen2MoeAttention(nn.Module):
 
         q, k, v = full_outputs[:3]
         mirror_k, mirror_v = full_outputs[3:] if has_mirror else (None, None)
-        # Every cache write/restore was enqueued on the current compute stream.
+        # Every Q/K/V/mirror and cache write uses the original row mapping.
         # The caller now publishes mirror K/V once and runs attention once, with
-        # no external RoPE or duplicate cache write.
-        return full_hidden, (q, k, v, mirror_k, mirror_v)
+        # no external RoPE or duplicate cache write. Keep the receive arena alive
+        # until Gate MM consumes it, then restore only the small Gate output.
+        return receive_storage, (q, k, v, mirror_k, mirror_v)
 
     @staticmethod
     def _linear_prefetch_tensors(
@@ -2392,7 +2386,9 @@ class Qwen2MoeAttention(nn.Module):
             )
 
         if prefill_ag_qkv_slices is not None:
-            hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
+            # Only Gate consumes this chunk-major arena. Attention and mirror
+            # consumers continue to use the fused outputs in original row order.
+            prefill_gate_hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
                 positions, hidden_states, forward_batch, prefill_ag_qkv_slices
             )
         else:
@@ -2719,6 +2715,20 @@ class Qwen2MoeAttention(nn.Module):
                         )
                     gate_input = prefill_gate_hidden_states
                 gate = self.gate_proj(gate_input)[0].unsqueeze(-1)
+                if prefill_ag_qkv_slices is not None:
+                    # One BF16 Gate MM over the whole chunk-major receive arena.
+                    # Restore only [M, local_heads, 1] (6 heads at TP4), not
+                    # [M, hidden_size], before pairing Gate with attention rows.
+                    tp_size = get_tp_group().world_size
+                    restored_gate = gate.new_empty(gate.shape)
+                    gate_rows = restored_gate.view(tp_size, -1, *gate.shape[1:])
+                    for start, end in prefill_ag_qkv_slices:
+                        gate_rows[:, start:end].copy_(
+                            gate[tp_size * start : tp_size * end].view(
+                                tp_size, end - start, *gate.shape[1:]
+                            )
+                        )
+                    gate = restored_gate
             # gate: (bs * seq_len, num_heads, 1)
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             if enable_npu_gate_alt_stream:
