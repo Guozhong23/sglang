@@ -44,6 +44,7 @@ class TreeCacheBuildContext:
     tp_group: Any
     full_tokens_per_layer: Optional[int] = None
     is_dsa: bool = False
+    request_private_swa: bool = False
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -170,7 +171,7 @@ def _create_unified_radix_cache(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree_components = [ComponentType.FULL]
-    if ctx.is_hybrid_swa:
+    if ctx.is_hybrid_swa and not ctx.request_private_swa:
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
@@ -184,7 +185,16 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
-    cache = UnifiedRadixCache(params)
+    if ctx.request_private_swa:
+        from sglang.srt.mem_cache.unified_cache.components.pd_decode_full_component import (
+            PDDecodeFullComponent,
+        )
+
+        params.component_registry_override = {
+            **(params.component_registry_override or {}),
+            ComponentType.FULL: PDDecodeFullComponent,
+        }
+    cache = UnifiedRadixCache(params, request_private_swa=ctx.request_private_swa)
     if ctx.enable_hierarchical_cache:
         cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
@@ -196,7 +206,15 @@ def _create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = ctx.server_args.radix_cache_backend
-    if name:
+    if ctx.request_private_swa:
+        if name or envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+            raise ValueError(
+                "Decode Full-prefix reuse with request-private SWA requires "
+                "the built-in UnifiedRadixCache"
+            )
+        cache = _create_unified_radix_cache(ctx, ctx.server_args, ctx.params)
+        source = "default"
+    elif name:
         factory = get_radix_cache_factory(name)
         if factory is None:
             raise ValueError(

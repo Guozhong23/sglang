@@ -230,6 +230,9 @@ def zero_match_result(
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
+    # Full-only PD trees can still have request-owned SWA outside the tree.
+    request_private_swa: bool = False
+
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )

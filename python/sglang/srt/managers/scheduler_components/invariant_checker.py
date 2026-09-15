@@ -458,7 +458,13 @@ class SchedulerInvariantChecker:
     def _check_tree_cache(self):
         if (
             self.tree_cache.is_tree_cache()
-            and (self.is_hybrid_swa and self.tree_cache.supports_swa())
+            and (
+                self.is_hybrid_swa
+                and (
+                    self.tree_cache.supports_swa()
+                    or self.tree_cache.request_private_swa
+                )
+            )
             or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
