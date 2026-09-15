@@ -246,7 +246,11 @@ def _debug_layer_selected(layer_id: int) -> bool:
 
 
 def _begin_debug_call(layer: "FusedMoE") -> Optional[int]:
-    if not envs.SGLANG_NPU_MEGAMOE_DEBUG.get():
+    if not (
+        envs.SGLANG_NPU_MEGAMOE_DEBUG.get()
+        or envs.SGLANG_NPU_MEGAMOE_SHADOW_COMPARE.get()
+        or envs.SGLANG_NPU_MEGAMOE_DUMP.get()
+    ):
         return None
     layer_id = int(layer.layer_id)
     if not _debug_layer_selected(layer_id):
@@ -335,6 +339,23 @@ def _collect_debug_inputs(
 
 
 @torch.no_grad()
+def _select_raw_byte_sample(
+    tensor: torch.Tensor,
+    selections: Sequence[tuple[int, Sequence[int]]],
+) -> torch.Tensor:
+    """Index a one-byte FP8 tensor through its supported UINT8 view."""
+    if tensor.element_size() != 1:
+        raise RuntimeError(
+            f"MegaMoE raw-byte sampling requires one-byte tensors, got {tensor.dtype}."
+        )
+    selected = tensor.detach().view(torch.uint8)
+    for dim, indices in selections:
+        index = torch.tensor(indices, dtype=torch.int64, device=tensor.device)
+        selected = torch.index_select(selected, dim, index)
+    return selected.contiguous().cpu()
+
+
+@torch.no_grad()
 def _log_weight_samples(layer: "FusedMoE", ep_rank: int) -> None:
     """Log checkpoint bytes around gate/up and MX block boundaries."""
     state = _get_state()
@@ -362,20 +383,23 @@ def _log_weight_samples(layer: "FusedMoE", ep_rank: int) -> None:
             }
         )
         block_indices = sorted({0, scale.shape[2] - 1})
-        weight_sample = (
-            weight[expert_indices][:, row_indices][:, :, k_indices].float().cpu()
+        weight_sample = _select_raw_byte_sample(
+            weight,
+            ((0, expert_indices), (1, row_indices), (2, k_indices)),
         )
-        scale_sample = scale[expert_indices][:, row_indices][:, :, block_indices]
-        scale_bytes = scale_sample.contiguous().view(torch.uint8).cpu()
+        scale_bytes = _select_raw_byte_sample(
+            scale,
+            ((0, expert_indices), (1, row_indices), (2, block_indices)),
+        )
         try:
-            scale_values = scale_sample.float().cpu().tolist()
+            scale_values = scale_bytes.view(scale.dtype).float().tolist()
         except Exception:
             scale_values = "E8M0 float conversion unavailable"
         logger.info(
             "[MegaMoE-Debug] layer=%d ep_rank=%d %s real-weight sample "
             "weight(shape=%s,dtype=%s,stride=%s,contiguous=%s) "
             "scale(shape=%s,dtype=%s,stride=%s,contiguous=%s) "
-            "experts=%s rows=%s k=%s values=%s scale_blocks=%s "
+            "experts=%s rows=%s k=%s weight_raw_u8=%s scale_blocks=%s "
             "scale_raw_u8=%s scale_values=%s",
             layer_id,
             ep_rank,
@@ -468,10 +492,12 @@ def _log_shadow_comparison(
     global_topk_ids: torch.Tensor,
     global_topk_weights: torch.Tensor,
     ep_rank: int,
-) -> None:
+    log_comparison: bool = True,
+    allow_large_reference: bool = False,
+) -> Optional[torch.Tensor]:
     global_rows = sum(row_sizes)
     limit = max(0, envs.SGLANG_NPU_MEGAMOE_SHADOW_MAX_GLOBAL_ROWS.get())
-    if global_rows > limit:
+    if global_rows > limit and not allow_large_reference:
         logger.warning(
             "[MegaMoE-Debug] layer=%d shadow comparison skipped: global_rows=%d "
             "> SGLANG_NPU_MEGAMOE_SHADOW_MAX_GLOBAL_ROWS=%d",
@@ -479,7 +505,7 @@ def _log_shadow_comparison(
             global_rows,
             limit,
         )
-        return
+        return None
 
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -494,6 +520,9 @@ def _log_shadow_comparison(
     reference_global = ep_group.all_reduce(reference_partial)
     offset = sum(row_sizes[:ep_rank])
     reference = reference_global[offset : offset + row_sizes[ep_rank]]
+
+    if not log_comparison:
+        return reference
 
     actual_f = output.detach().float()
     reference_f = reference.detach().float()
@@ -557,6 +586,7 @@ def _log_shadow_comparison(
         actual_f[0, :sample_width].cpu().tolist() if output.shape[0] else [],
         reference_f[0, :sample_width].cpu().tolist() if reference.shape[0] else [],
     )
+    return reference
 
 
 def forward_megamoe(
@@ -598,8 +628,15 @@ def forward_megamoe(
     _validate_inputs(layer, x, topk_ids, topk_weights)
 
     debug_call = _begin_debug_call(layer)
+    use_shadow_reference = (
+        envs.SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE.get()
+    )
     debug_inputs = None
     ep_rank = -1
+    if use_shadow_reference and debug_call is None:
+        debug_inputs = _collect_debug_inputs(x, topk_ids, reference_topk_weights)
+        ep_group, _, _, _, _ = debug_inputs
+        ep_rank = torch.distributed.get_rank(ep_group.device_group)
     if debug_call is not None:
         debug_inputs = _collect_debug_inputs(x, topk_ids, reference_topk_weights)
         ep_group, row_sizes, _, global_topk_ids, _ = debug_inputs
@@ -658,19 +695,29 @@ def forward_megamoe(
             global_topk_ids,
             global_topk_weights,
         ) = debug_inputs
-        logger.info(
-            "[MegaMoE-Debug] layer=%d call=%d ep_rank=%d output=%s "
-            "output_row0=%s expert_token_nums_shape=%s",
-            layer.layer_id,
-            debug_call,
-            ep_rank,
-            _tensor_stats(output),
-            output[0, :16].float().cpu().tolist() if output.shape[0] else [],
-            tuple(expert_token_nums.shape),
+        should_log = debug_call is not None and (
+            envs.SGLANG_NPU_MEGAMOE_DEBUG.get()
+            or envs.SGLANG_NPU_MEGAMOE_SHADOW_COMPARE.get()
         )
-        _log_expert_counts(layer, ep_rank, global_topk_ids, expert_token_nums)
-        if envs.SGLANG_NPU_MEGAMOE_SHADOW_COMPARE.get():
-            _log_shadow_comparison(
+        if should_log:
+            logger.info(
+                "[MegaMoE-Debug] layer=%d call=%d ep_rank=%d output=%s "
+                "output_row0=%s expert_token_nums_shape=%s",
+                layer.layer_id,
+                debug_call,
+                ep_rank,
+                _tensor_stats(output),
+                output[0, :16].float().cpu().tolist() if output.shape[0] else [],
+                tuple(expert_token_nums.shape),
+            )
+            _log_expert_counts(layer, ep_rank, global_topk_ids, expert_token_nums)
+        needs_selected_reference = debug_call is not None and (
+            envs.SGLANG_NPU_MEGAMOE_SHADOW_COMPARE.get()
+            or envs.SGLANG_NPU_MEGAMOE_DUMP.get()
+        )
+        reference_output: Optional[torch.Tensor] = None
+        if use_shadow_reference or needs_selected_reference:
+            reference_output = _log_shadow_comparison(
                 layer,
                 output,
                 ep_group,
@@ -679,13 +726,53 @@ def forward_megamoe(
                 global_topk_ids,
                 global_topk_weights,
                 ep_rank,
+                log_comparison=(
+                    debug_call is not None
+                    and envs.SGLANG_NPU_MEGAMOE_SHADOW_COMPARE.get()
+                ),
+                allow_large_reference=use_shadow_reference,
             )
-        logger.info(
-            "[MegaMoE-Debug] END layer=%d call=%d ep_rank=%d",
-            layer.layer_id,
-            debug_call,
-            ep_rank,
-        )
+        if use_shadow_reference and reference_output is None:
+            raise RuntimeError(
+                "MegaMoE reference-output mode could not produce a reference "
+                f"for layer {layer.layer_id}."
+            )
+        if (
+            debug_call is not None
+            and reference_output is not None
+            and envs.SGLANG_NPU_MEGAMOE_DUMP.get()
+        ):
+            from sglang.srt.hardware_backend.npu.moe.mega_moe_dump import (
+                dump_megamoe_comparison,
+            )
+
+            dump_megamoe_comparison(
+                layer=layer,
+                call_index=debug_call,
+                ep_rank=ep_rank,
+                row_sizes=row_sizes,
+                x_local=x,
+                router_logits_local=getattr(topk_output, "router_logits", None),
+                topk_ids_local=topk_ids,
+                topk_weights_fp32_local=reference_topk_weights,
+                topk_weights_bf16_local=topk_weights,
+                x_global=global_x,
+                topk_ids_global=global_topk_ids,
+                topk_weights_global=global_topk_weights,
+                actual_output=output,
+                reference_output=reference_output,
+                expert_token_nums=expert_token_nums,
+            )
+        if use_shadow_reference:
+            assert reference_output is not None
+            output = reference_output
+        if should_log:
+            logger.info(
+                "[MegaMoE-Debug] END layer=%d call=%d ep_rank=%d",
+                layer.layer_id,
+                debug_call,
+                ep_rank,
+            )
     return output
 
 

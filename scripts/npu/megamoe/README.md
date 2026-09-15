@@ -138,6 +138,47 @@ grep -E 'MegaMoE-(Debug|Shadow)' server.log
 - The W13 samples include rows 511/512, the WeLM gate/up boundary, and both
   sides of the 32/64-element MX block boundary.
 
+To persist the fused and reference tensors for an isolated curl, use a new
+directory on every server launch and set the following variables on all ranks:
+
+```bash
+DUMP_ROOT=/data2/hw_sgz/welm/05_profiling/megamoe_dump_$(date +%Y%m%d_%H%M%S)
+
+export SGLANG_NPU_MEGAMOE_VALIDATE_INPUTS=1
+export SGLANG_NPU_MEGAMOE_DEBUG=1
+export SGLANG_NPU_MEGAMOE_DEBUG_LAYERS=0,1,2,4,8,16,32
+export SGLANG_NPU_MEGAMOE_DEBUG_SKIP_CALLS=1
+export SGLANG_NPU_MEGAMOE_DEBUG_MAX_CALLS=1
+export SGLANG_NPU_MEGAMOE_SHADOW_COMPARE=1
+export SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE=1
+export SGLANG_NPU_MEGAMOE_SHADOW_MAX_GLOBAL_ROWS=256
+export SGLANG_NPU_MEGAMOE_DUMP=1
+export SGLANG_NPU_MEGAMOE_DUMP_DIR="${DUMP_ROOT}"
+export SGLANG_NPU_MEGAMOE_DUMP_WEIGHT_SAMPLES=1
+```
+
+`SKIP_CALLS=1` targets the first curl when the server performs one MegaMoE
+warmup call. Use `SKIP_CALLS=0` if server warmup is disabled. The layer and
+call filters control only logging and dump selection.
+`SHADOW_USE_REFERENCE=1` intentionally runs the local-EP reference for every
+eligible MegaMoE invocation and feeds that reference into downstream layers;
+this preserves a gold input at every selected layer and prevents an early
+MegaMoE error from contaminating later comparisons. It is a correctness/debug
+oracle, not a performance mode.
+
+Each selected layer writes one file per rank containing local/global inputs,
+FP32 and BF16 routing weights, expert ids/counts, actual/reference outputs,
+their FP32 difference, and small raw-byte samples of W13/W2 weights and E8M0
+scales. Full expert weights are deliberately not dumped.
+
+After sending the curl, summarize all rank-local dumps with:
+
+```bash
+python scripts/npu/megamoe/compare_welm_megamoe_dump.py "${DUMP_ROOT}" \
+  --csv "${DUMP_ROOT}/summary.csv"
+grep -E 'MegaMoE-(Debug|Shadow|Dump)' server.log
+```
+
 Disable all debug switches and restart before profiling performance.
 
 ## 4. Acceptance criteria

@@ -655,6 +655,14 @@ class Envs:
     # all-reduce the partials, and compare the local rows with MegaMoE output.
     SGLANG_NPU_MEGAMOE_SHADOW_COMPARE = EnvBool(False)
     SGLANG_NPU_MEGAMOE_SHADOW_MAX_GLOBAL_ROWS = EnvInt(256)
+    # Debug-only correctness oracle. The fused operator still runs, but the
+    # local-EP shadow result is forwarded to the following layer.
+    SGLANG_NPU_MEGAMOE_SHADOW_USE_REFERENCE = EnvBool(False)
+    # Persist selected calls as rank-local torch.save files. Layer/call
+    # selection reuses the MEGAMOE_DEBUG_* controls above.
+    SGLANG_NPU_MEGAMOE_DUMP = EnvBool(False)
+    SGLANG_NPU_MEGAMOE_DUMP_DIR = EnvStr("/tmp/sglang_megamoe_dump")
+    SGLANG_NPU_MEGAMOE_DUMP_WEIGHT_SAMPLES = EnvBool(True)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
