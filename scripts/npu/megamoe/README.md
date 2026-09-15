@@ -88,7 +88,49 @@ KV-mirror full rows, and MTP keep the existing local-EP plus AllReduce path.
 Shared experts remain replicated and execute on SGLang's independent NPU
 stream; the main stream waits only at the routed/shared addition.
 
-## 3. Acceptance criteria
+## 3. Numerical debug against local EP
+
+The debug path is disabled by default. For a short, one-token curl, enable the
+following settings on all ranks. `MAX_CALLS=2` normally captures both the
+startup warmup and the first user request; set `SKIP_CALLS=1` and
+`MAX_CALLS=1` when the server always performs exactly one warmup invocation.
+
+```bash
+export SGLANG_NPU_MEGAMOE_VALIDATE_INPUTS=1
+export SGLANG_NPU_MEGAMOE_DEBUG=1
+export SGLANG_NPU_MEGAMOE_DEBUG_LAYERS=0,1,2,4,8,16,32
+export SGLANG_NPU_MEGAMOE_DEBUG_SKIP_CALLS=0
+export SGLANG_NPU_MEGAMOE_DEBUG_MAX_CALLS=2
+export SGLANG_NPU_MEGAMOE_SHADOW_COMPARE=1
+export SGLANG_NPU_MEGAMOE_SHADOW_MAX_GLOBAL_ROWS=256
+```
+
+Use only a short request while shadow comparison is enabled. The shadow path
+all-gathers the real input rows, runs the existing rank-local MXFP8 experts,
+all-reduces their partial outputs, and compares the corresponding local rows
+with MegaMoE. Requests above `SHADOW_MAX_GLOBAL_ROWS` are skipped rather than
+allocating a large reference workspace.
+
+Search the server log for these markers:
+
+```bash
+grep -E 'MegaMoE-(Debug|Shadow)' server.log
+```
+
+- `expert-counts mismatches > 0` identifies global expert-id, rank ownership,
+  or dispatch-count disagreement before inspecting GEMM numerics.
+- `rms_ratio` far from 1, especially by a power of two, points to E8M0 scale
+  byte/order or weight-scale block pairing.
+- Correct expert counts but a poor layer-0 cosine points to W13 gate/up order,
+  scale layout, SwiGLU, or Combine semantics.
+- A close layer-0 comparison that progressively worsens in later selected
+  layers indicates cumulative numerical error rather than routing ownership.
+- The W13 samples include rows 511/512, the WeLM gate/up boundary, and both
+  sides of the 32/64-element MX block boundary.
+
+Disable all debug switches and restart before profiling performance.
+
+## 4. Acceptance criteria
 
 1. Functional: deterministic curl output is coherent and no rank exceeds the
    registered local-token capacity.

@@ -642,6 +642,19 @@ class Envs:
     SGLANG_NPU_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Debug-only validation synchronizes routing tensors back to the host.
     SGLANG_NPU_MEGAMOE_VALIDATE_INPUTS = EnvBool(False)
+    # MegaMoE numerical diagnostics. Debugging is deliberately opt-in because
+    # it synchronizes NPU tensors and introduces extra EP collectives.
+    SGLANG_NPU_MEGAMOE_DEBUG = EnvBool(False)
+    # Comma-separated layer ids, "all", or "*". The default keeps a debug run
+    # small enough for a one-token curl while still locating first-layer drift.
+    SGLANG_NPU_MEGAMOE_DEBUG_LAYERS = EnvStr("0")
+    # Skip startup/warmup invocations before capturing real requests.
+    SGLANG_NPU_MEGAMOE_DEBUG_SKIP_CALLS = EnvInt(0)
+    SGLANG_NPU_MEGAMOE_DEBUG_MAX_CALLS = EnvInt(1)
+    # Re-run the selected layer through the existing local-EP MXFP8 kernels,
+    # all-reduce the partials, and compare the local rows with MegaMoE output.
+    SGLANG_NPU_MEGAMOE_SHADOW_COMPARE = EnvBool(False)
+    SGLANG_NPU_MEGAMOE_SHADOW_MAX_GLOBAL_ROWS = EnvInt(256)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
