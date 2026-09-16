@@ -953,6 +953,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.is_kv_mirror_consumer = self.layer_id in set(
             getattr(config, "kv_mirror_layers", []) or []
         )
+        # Set before weight postprocessing: MegaMoE reuses these weights in ND.
+        # Decode/verify and DeepEP fallback share the same storage as prefill.
+        self.experts.welm_megamoe_keep_nd = (
+            envs.WELM_NPU_USE_MEGAMOE.get()
+            and self.welm_local_ep_kernel_available
+            and not self.is_nextn
+            and not self.is_kv_mirror_consumer
+            and moe_clamp_limit is None
+        )
 
     def _forward_shared_expert(
         self, hidden_states: torch.Tensor

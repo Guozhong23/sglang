@@ -73,9 +73,9 @@ class WelmPrefillMegaMoE:
             hidden_states,
             ids,
             weights,
-            # BF16 weights already have the interface's [E, 2I, H]/[E, H, I]
-            # logical order. Keep their storage unchanged for fallback GMMs;
-            # the paired custom run must support that loaded NPU format.
+            # Opted-in BF16 experts retain ND during weight postprocessing,
+            # in [E, 2I, H]/[E, H, I] order. No per-forward format conversion
+            # or extra weight copy; fallback GMMs share these ND weights.
             [experts.w13_weight],
             [experts.w2_weight],
             self.symm_buffer,
