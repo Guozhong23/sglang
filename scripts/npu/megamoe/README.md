@@ -44,14 +44,16 @@ pass the accuracy thresholds, and the zero-weight padded row remains zero.
 ## 2. Framework A/B
 
 Use the same ModelSlim MXFP8 checkpoint, input corpus, server arguments, NPU
-frequency, warmup count and benchmark concurrency for both runs. Change only
-the MoE backend and the backend-specific environment variables.
+frequency, warmup count and benchmark concurrency for both runs. The preferred
+integration follows the BF16 WeLM design: DeepEP remains the outer backend and
+the target ordinary-prefill layers call a dtype-aware MegaMoE sidecar.
 
 ### A: current DeepEP AllGather path
 
 ```bash
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=1
+export WELM_NPU_USE_MEGAMOE=0
 unset SGLANG_NPU_MEGAMOE_MAX_TOKENS_PER_RANK
 unset SGLANG_NPU_MEGAMOE_VALIDATE_INPUTS
 
@@ -67,21 +69,23 @@ is 4128 rows. 4352 leaves padding headroom and registers about 80 MiB per rank.
 
 ```bash
 export NPU_OPS_TRANSFORMER_OPS_IMPORT_MODE=minimal
+export WELM_NPU_USE_MEGAMOE=1
+# The sidecar serializes the shared expert regardless of this global setting.
 export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=1
 export SGLANG_NPU_MEGAMOE_MAX_TOKENS_PER_RANK=4352
-export SGLANG_NPU_MEGAMOE_VALIDATE_INPUTS=1  # first functional run only
-unset SGLANG_DEEPEP_NORMAL_USE_ALLGATHER
-unset SGLANG_NPU_MXFP8_QUANT_BEFORE_ROUTE
-unset USE_MX_FP8_QUANT
+export SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS=all
+# Optional for DeepEP fallback layers; it does not affect the MegaMoE sidecar:
+export USE_MX_FP8_QUANT=1
 
 # Keep the existing launch command and use:
 #   --quantization modelslim
-#   --moe-a2a-backend megamoe
+#   --moe-a2a-backend deepep --deepep-mode auto
 ```
 
-`SGLANG_NPU_MEGAMOE_VALIDATE_INPUTS=1` intentionally synchronizes routing
-tensors to check ID range and uniqueness. After one curl/accuracy smoke run,
-restart with it set to `0` before collecting performance.
+Do not use `--moe-a2a-backend megamoe` for the preferred sidecar experiment.
+That value selects the older global-backend implementation and is retained
+only for compatibility and historical A/B tests.
 
 The B path uses MegaMoE only for ordinary token-sharded prefill layers before
 the first target KV-mirror consumer. For the current 48-layer WeLM model this
@@ -92,13 +96,19 @@ ordinary prefill layout remains token-sharded and all target layers are
 eligible for MegaMoE.
 
 Weight post-processing follows the same split: eligible prefix layers retain
-the canonical MegaMoE MXFP8 layout, while the full-row suffix uses the regular
-Ascend GMM/FRACTAL_NZ layout. Prefix-layer decode reuses the canonical weights
-through the existing zero-copy GMM transpose view; it does not call MegaMoE.
-Shared experts remain replicated and execute on SGLang's independent NPU
-stream; the main stream waits only at the routed/shared addition.
+physical ND `[E,N,K]` weights and ND E8M0 scales, while the full-row suffix uses
+the regular Ascend GMM/FRACTAL_NZ layout. Prefix-layer decode reuses the ND
+weights through the existing zero-copy GMM transpose view; it does not call
+MegaMoE. Startup fails early if `torch_npu.get_npu_format` reports any eligible
+weight or scale in a non-ND format. Shared experts remain replicated but run
+serially whenever the sidecar is selected, matching the BF16 integration.
 
-## 3. Numerical debug against local EP
+## 3. Legacy global-backend numerical debug
+
+The shadow-comparison controls in this section instrument the compatibility
+path selected by `--moe-a2a-backend megamoe`. For the preferred DeepEP sidecar,
+use the layer selection, synchronization and backend-neutral stage dumps in
+Section 4 instead.
 
 The debug path is disabled by default. For a short, one-token curl, enable the
 following settings on all ranks. `MAX_CALLS=2` normally captures both the
@@ -211,8 +221,9 @@ performance runs.
 ### Step 2: find the first failing prefix
 
 `ACTUAL_LAYERS` chooses which eligible layers return the real MegaMoE output.
-Every unselected eligible layer uses the existing LocalEP plus AllReduce
-reference without changing the checkpoint or surrounding execution plan.
+On the preferred sidecar path every unselected layer stays on the existing
+DeepEP implementation without changing the checkpoint or surrounding token
+layout. The legacy global backend instead uses LocalEP plus AllReduce.
 
 ```bash
 export SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP=0
@@ -250,7 +261,7 @@ fused result and invalidate the experiment.
 
 Run this only after Step 1. Stage dumping copies full tensors to the CPU and
 therefore changes synchronization and performance. First create a reference
-run in which all eligible layers use LocalEP:
+run in which all eligible layers stay on DeepEP:
 
 ```bash
 DUMP_ROOT=/data2/hw_sgz/welm/05_profiling/welm_moe_stage_$(date +%Y%m%d_%H%M%S)

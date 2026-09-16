@@ -849,9 +849,15 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         """
         from sglang.srt.layers.moe import get_moe_a2a_backend
 
-        if not get_moe_a2a_backend().is_megamoe() or not getattr(
+        use_global_backend = get_moe_a2a_backend().is_megamoe() and getattr(
             layer, "_npu_megamoe_prefill_enabled", True
-        ):
+        )
+        # The preferred WeLM path keeps DeepEP as the outer backend and binds
+        # MegaMoE as an ordinary-prefill sidecar after loading. The model sets
+        # this flag before weight postprocessing, so the ND-only operator never
+        # observes the regular GMM's FRACTAL_NZ conversion.
+        use_welm_sidecar = getattr(layer, "welm_megamoe_keep_nd", False)
+        if not (use_global_backend or use_welm_sidecar):
             return False
         if getattr(layer, "_npu_megamoe_weights_processed", False):
             return True
@@ -948,9 +954,13 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             kernel.use_megamoe_canonical_layout = True
 
         layer._npu_megamoe_weights_processed = True
-        # The decode/verify local-EP fallback still uses InitRoutingV2 and must
-        # receive MXFP8 activations plus E8M0 scales.
-        layer.w13_kernel._set_dispatcher_output_dtype(layer, "mxfp8")
+        # DeepEP has no MXFP8 dispatch dtype. Its normal/fallback paths carry
+        # BF16 and let fused GMM1 quantize the activations. The legacy global
+        # MegaMoE backend keeps the existing MXFP8 local-dispatch contract.
+        dispatcher_dtype = (
+            "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
+        )
+        layer.w13_kernel._set_dispatcher_output_dtype(layer, dispatcher_dtype)
         return True
 
     def process_weights_after_loading(

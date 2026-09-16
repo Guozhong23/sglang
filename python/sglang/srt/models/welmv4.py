@@ -1486,7 +1486,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 layer_id=self.layer_id,
                 call_index=stage_dump_call,
                 rank=rank,
-                backend=str(moe_a2a_backend),
+                backend=(
+                    "welm_megamoe_sidecar"
+                    if use_welm_prefill_megamoe
+                    else str(moe_a2a_backend)
+                ),
                 is_prefill=is_prefill_batch,
                 moe_input=stage_dump_input,
                 router_logits=router_logits,
@@ -3778,6 +3782,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and output_hidden_is_scattered
         )
+        run_welm_prefill_megamoe = (
+            use_megamoe_prefill
+            and megamoe.can_run(hidden_states.shape[0], self.mlp.layer_id)
+        )
         with get_forward().scoped(
             deepep_mode_override=(
                 DeepEPMode.LOW_LATENCY
@@ -3794,10 +3802,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch,
                 use_reduce_scatter,
                 use_welm_local_ep_moe=use_welm_local_ep_moe,
-                use_welm_prefill_megamoe=(
-                    use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
-                ),
-                force_serial_shared_expert=use_megamoe_prefill,
+                use_welm_prefill_megamoe=run_welm_prefill_megamoe,
+                force_serial_shared_expert=run_welm_prefill_megamoe,
                 return_components=self.is_final_layer,
                 skip_component_output=(
                     self.is_final_layer
