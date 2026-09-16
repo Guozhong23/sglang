@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import (
     finish_welm_attn_partial_full,
     reduce_attn_partial_to_scattered,
@@ -872,12 +873,54 @@ class WelmDpAttentionExecutor:
                     input_is_scattered=input_is_scattered,
                 )
 
+            max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
+            oproj_rs_pipeline_chunks = 0
+            use_fused_oproj_rs = False
+            # MAX_LEN may represent a logical decode shard as EXTEND. Only a
+            # real target prefill may replace this shard's original OProj path.
+            local_forward_mode = (
+                getattr(forward_batch, "_original_forward_mode", None)
+                or forward_batch.forward_mode
+            )
+            if (
+                max_chunks >= 2
+                and plan.role is WelmRunnerRole.TARGET_DP
+                and local_forward_mode.is_extend_without_speculative()
+                and is_non_consumer_attention_layer
+                and batch_plan.attention_finish
+                is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
+                and state.hidden_states.dtype == torch.bfloat16
+                and layer.self_attn.o_proj.weight.dtype == torch.bfloat16
+            ):
+                tp_size = plan.attn_tp_size
+                attention_num_rows = state.hidden_states.shape[0] * (
+                    tp_size if defer_hidden_all_gather else 1
+                )
+                min_chunk_tokens = max(
+                    1,
+                    envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get(),
+                )
+                local_rows = attention_num_rows // tp_size
+                min_local_rows = (min_chunk_tokens + tp_size - 1) // tp_size
+                actual_chunks = min(max_chunks, local_rows // min_local_rows)
+                if actual_chunks >= 2:
+                    oproj_rs_pipeline_chunks = actual_chunks
+                else:
+                    use_fused_oproj_rs = True
+            oproj_output_is_reduce_scattered = (
+                oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
+            )
             attn_output = layer.self_attn(
                 positions=positions,
                 hidden_states=state.hidden_states,
                 forward_batch=forward_batch,
                 skip_o_norm=True,
                 skip_o_proj_all_reduce=plan.o_proj_returns_partial,
+                use_o_proj_matmul_reduce_scatter=use_fused_oproj_rs,
+                o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
+                o_proj_rs_group=(
+                    plan.attn_tp_group if oproj_output_is_reduce_scattered else None
+                ),
                 reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
                 prefill_mxfp8_all_gather_group=(
                     # A nontrivial attention-TP group enters the split
@@ -896,6 +939,7 @@ class WelmDpAttentionExecutor:
                 active_view=active_view,
                 mirror_transition=mirror_transition,
                 mirror_row_indices=mirror_row_indices,
+                input_is_reduce_scattered=oproj_output_is_reduce_scattered,
             )
         else:
             # Eager idle only.  Skip norm/attention entirely and reuse the
@@ -1180,6 +1224,7 @@ class WelmDpAttentionExecutor:
         active_view: "WelmDpRowView",
         mirror_transition: bool,
         mirror_row_indices: Optional[torch.Tensor],
+        input_is_reduce_scattered: bool = False,
     ) -> WelmDpLayerState:
         plan = self.runner_plan
         if (
@@ -1190,11 +1235,29 @@ class WelmDpAttentionExecutor:
                 batch_plan.attention_finish
                 is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
             ):
-                attn_output, residual = reduce_attn_partial_to_scattered(
-                    attn_output,
-                    state.residual,
-                    attn_tp_group=plan.attn_tp_group,
-                )
+                if input_is_reduce_scattered:
+                    residual = state.residual
+                    assert residual is not None
+                    self._assert_fp32_residual(residual)
+                    local_rows = attn_output.shape[0]
+                    if state.residual_layout is WelmDpLayout.DP_LOCAL_TP_ATTN_FULL:
+                        if residual.shape[0] != local_rows * plan.attn_tp_size:
+                            raise RuntimeError(
+                                "WeLMv4 FULL residual does not match OProj RS rows"
+                            )
+                        residual = residual.narrow(
+                            0, plan.attn_tp_rank * local_rows, local_rows
+                        ).contiguous()
+                    elif residual.shape[0] != local_rows:
+                        raise RuntimeError(
+                            "WeLMv4 scattered residual does not match OProj RS rows"
+                        )
+                else:
+                    attn_output, residual = reduce_attn_partial_to_scattered(
+                        attn_output,
+                        state.residual,
+                        attn_tp_group=plan.attn_tp_group,
+                    )
             elif plan.attn_tp_size == 1:
                 residual = state.residual
             else:
@@ -1281,6 +1344,8 @@ class WelmDpAttentionExecutor:
         batch_plan: WelmBatchExecutionPlan,
         active_view: "WelmDpRowView",
     ) -> WelmDpLayerState:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
         plan = self.runner_plan
         transport = batch_plan.moe_transport
         layer.final_mlp_experts_output = None
@@ -1300,9 +1365,31 @@ class WelmDpAttentionExecutor:
                 device=state.hidden_states.device,
             )
             invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
-            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
             assert state.residual is not None
-            state.residual.masked_fill_(invalid_mask[:, None], 0)
+            megamoe = layer.mlp.welm_prefill_megamoe
+            use_megamoe = (
+                megamoe is not None
+                and forward_batch.welm_dp_all_active_ordinary_prefill
+                and megamoe.can_run(active_view.local_slot_rows // plan.attn_tp_size)
+            )
+            megamoe_num_valid_rows = None
+            if use_megamoe:
+                # Use the row view, not generic num_token_non_padded_cpu: the
+                # latter can count fabricated idle tokens as real after sync.
+                megamoe_num_valid_rows = megamoe.local_valid_rows(
+                    state.hidden_states.shape[0],
+                    active_view.local_real_rows,
+                    plan.attn_tp_rank,
+                )
+                if megamoe_num_valid_rows < state.hidden_states.shape[0]:
+                    state.hidden_states[megamoe_num_valid_rows:].zero_()
+                    state.residual[megamoe_num_valid_rows:].zero_()
+            else:
+                state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+                state.residual.masked_fill_(invalid_mask[:, None], 0)
+            original_mode = forward_batch._original_forward_mode
+            if original_mode is None:
+                original_mode = forward_batch.forward_mode
             mlp_output = layer.mlp(
                 state.hidden_states,
                 None,
@@ -1310,13 +1397,23 @@ class WelmDpAttentionExecutor:
                 False,
                 return_components=False,
                 use_welm_prefill_normal_stream_policy=True,
+                use_welm_prefill_megamoe=use_megamoe,
+                megamoe_num_valid_rows=megamoe_num_valid_rows,
+                force_serial_shared_expert=(
+                    megamoe is not None
+                    and (original_mode == ForwardMode.EXTEND or use_megamoe)
+                ),
                 valid_row_mask=valid_mask,
                 invalid_row_mask=invalid_mask,
                 invalid_topk_id=-1,
                 allow_inplace_expert_shared_merge=True,
             )
             state.hidden_states = self._store_final_components(layer, mlp_output)
-            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+            if use_megamoe:
+                if megamoe_num_valid_rows < state.hidden_states.shape[0]:
+                    state.hidden_states[megamoe_num_valid_rows:].zero_()
+            else:
+                state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
             if layer.is_final_layer:
                 # A mirror-disabled ordinary prefill ends while still in the
                 # NORMAL scattered layout. Restore this DP shard before model

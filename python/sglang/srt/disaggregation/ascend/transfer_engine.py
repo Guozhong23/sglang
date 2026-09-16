@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+from contextlib import nullcontext
 from typing import List
 
 import torch
@@ -9,6 +11,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     MooncakeTransferEngine,
 )
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.npu_pd_affinity import get_pd_thread_affinity
 
 try:
     from memfabric_hybrid import TransferEngine
@@ -85,18 +88,26 @@ class AscendTransferEngine(MooncakeTransferEngine):
         """Initialize the ascend transfer instance."""
         # Decode owns the store. Prefill must remain a client so that its first
         # transfer lazily creates a connection to the Decode session.
-        ret_value = self.engine.initialize(
-            self.store_url,
-            self.session_id,
-            self.role,
-            self.npu_id,
-            trans_op_type,
-            "Decode",
-            hcom_url,
+        pd_affinity = (
+            get_pd_thread_affinity() if transfer_protocol == "host_rdma" else None
         )
-        if ret_value != 0:
-            logger.error("Ascend Transfer Engine initialization failed.")
-            raise RuntimeError("Ascend Transfer Engine initialization failed.")
+        with (
+            pd_affinity.bind_initialization_thread()
+            if pd_affinity is not None
+            else nullcontext()
+        ):
+            ret_value = self.engine.initialize(
+                self.store_url,
+                self.session_id,
+                self.role,
+                self.npu_id,
+                trans_op_type,
+                "Decode",
+                hcom_url,
+            )
+            if ret_value != 0:
+                logger.error("Ascend Transfer Engine initialization failed.")
+                raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
@@ -120,14 +131,38 @@ class AscendTransferEngine(MooncakeTransferEngine):
             return None
 
     def _get_worker_hcom_url(self, hcom_url: str, world_rank: int) -> str:
+        """Select a URL by runtime NPU ID, then offset its port by world rank."""
         if not hcom_url:
             return hcom_url
+
+        if hcom_url.lstrip().startswith("{"):
+            try:
+                npu_urls = json.loads(hcom_url)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "Invalid JSON NPU-to-URL mapping in ASCEND_MF_HCOM_URL"
+                ) from exc
+
+            npu_key = str(self.npu_id)
+            if npu_key not in npu_urls:
+                raise ValueError(
+                    "ASCEND_MF_HCOM_URL mapping has no entry for "
+                    f"npu_id={self.npu_id}"
+                )
+            hcom_url = npu_urls[npu_key]
+            if not isinstance(hcom_url, str) or not hcom_url.strip():
+                raise ValueError(
+                    "ASCEND_MF_HCOM_URL mapping requires a non-empty URL string "
+                    f"for npu_id={self.npu_id}"
+                )
+            hcom_url = hcom_url.strip()
 
         address, separator, port_str = hcom_url.rpartition(":")
         if not separator or not address.startswith("tcp://"):
             raise ValueError(
                 "ASCEND_MF_HCOM_URL must use tcp://<IPv4>:<port> or "
-                "tcp://<IPv4>/<mask>:<port>"
+                "tcp://<IPv4>/<mask>:<port>, or a JSON object mapping NPU IDs "
+                "to these URLs"
             )
 
         try:
@@ -152,9 +187,10 @@ class AscendTransferEngine(MooncakeTransferEngine):
 
         worker_hcom_url = f"{address}:{worker_port}"
         logger.info(
-            "Resolved Ascend Host RDMA endpoint: role=%s, world_rank=%d, "
-            "base=%s, endpoint=%s",
+            "Resolved Ascend Host RDMA endpoint: role=%s, npu_id=%d, "
+            "world_rank=%d, base=%s, endpoint=%s",
             self.role,
+            self.npu_id,
             world_rank,
             hcom_url,
             worker_hcom_url,

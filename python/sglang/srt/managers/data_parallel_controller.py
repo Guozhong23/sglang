@@ -191,6 +191,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.npu_affinity_plans = []
         self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
@@ -730,6 +731,12 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
+        # Forward every local scheduler's plan, not just the DP controller PID.
+        self.npu_affinity_plans.extend(
+            info.pop("npu_cpu_affinity_plan")
+            for info in scheduler_info
+            if "npu_cpu_affinity_plan" in info
+        )
         log_npu_affinity_summary(
             scheduler_info,
             base_gpu_id=server_args.base_gpu_id + base_gpu_id,
@@ -852,6 +859,7 @@ def run_data_parallel_controller_process(
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
+                "npu_cpu_affinity_plans": controller.npu_affinity_plans,
             }
         )
         # The primary owns routing for the expanded scheduler set.

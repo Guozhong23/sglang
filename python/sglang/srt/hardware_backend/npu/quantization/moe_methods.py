@@ -736,7 +736,14 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight)
+        # Only opted-in WeLM MegaMoE BF16 experts retain the loader's ND format.
+        # Do not return early: w13 must still configure the dispatcher dtype.
+        keep_nd = (
+            getattr(layer, "welm_megamoe_keep_nd", False)
+            and weight.dtype == torch.bfloat16
+        )
+        if not keep_nd:
+            weight.data = npu_format_cast(weight)
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")

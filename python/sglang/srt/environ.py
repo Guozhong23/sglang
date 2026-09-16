@@ -311,10 +311,16 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
-    # NPU CPU affinity always binds early and reapplies to all threads after init.
+    # NPU CPU affinity is planned early and applied to all threads after warmup.
     # Zero uses the NPU's full, non-overlapping share of local physical cores.
     SGLANG_NPU_AFFINITY_PCORES_PER_PROC = EnvInt(0)
-    SGLANG_NPU_MEMORY_PREFERRED_BIND = EnvBool(False)
+    # Extra local physical cores for HOST_RDMA PD threads; never taken from
+    # the existing compute assignment. Zero preserves the old binding path.
+    SGLANG_NPU_PD_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    # Dump thread names/IDs and read-back CPU masks after final NPU binding.
+    SGLANG_NPU_AFFINITY_DEBUG_THREADS = EnvBool(False)
+    # Optionally migrate existing host pages after final NPU CPU binding.
+    SGLANG_NPU_MIGRATE_PAGES = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -683,6 +689,9 @@ class Envs:
     SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_SKIP_CALLS = EnvInt(0)
     SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_MAX_CALLS = EnvInt(1)
     SGLANG_NPU_WELMV4_MOE_STAGE_DUMP_PREFILL_ONLY = EnvBool(True)
+    # WeLM target prefill, non-consumer EP layers only; shared expert is serial.
+    # Supports BF16 and ModelSlim MXFP8 expert weights.
+    WELM_NPU_USE_MEGAMOE = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
@@ -805,6 +814,10 @@ class Envs:
         EnvInt(None)
     )
     SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = EnvBool(False)
+    SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
+    SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
+    SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)
+    SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

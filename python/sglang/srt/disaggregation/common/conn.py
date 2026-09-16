@@ -953,6 +953,15 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    def _start_transfer_thread(self, target, *, role, args=(), name=None, daemon=None):
+        """Backend hook; default retains the existing thread startup behavior."""
+        thread = threading.Thread(target=target, args=args, name=name, daemon=daemon)
+        thread.start()
+        return thread
+
+    def _get_transfer_pool_initializer(self):
+        return None
+
     def _start_heartbeat_checker_thread(self):
         """Start the heartbeat checker thread for Decode worker."""
 
@@ -997,7 +1006,9 @@ class CommonKVManager(BaseKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
-        threading.Thread(target=heartbeat_checker, daemon=True).start()
+        self._start_transfer_thread(
+            heartbeat_checker, role="heartbeat_checker", daemon=True
+        )
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""

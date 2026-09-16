@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_ENABLE_WELM_MEGAMOE = envs.WELM_NPU_USE_MEGAMOE.get()
 
 
 def _resolve_elastic_world_dp_size(
@@ -99,6 +100,7 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    welm_dp_all_active_ordinary_prefill: bool = False
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -197,6 +199,17 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(cpu_data[:, 2].min().item())
         self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
         self.can_run_prefill_cuda_graph = bool(cpu_data[:, 6].min().item())
+        if _ENABLE_WELM_MEGAMOE:
+            # Reuse the existing CPU payload; OR(is_extend) cannot distinguish
+            # prefill+idle from prefill+decode. No additional collective/D2H.
+            active_modes = [
+                mode
+                for rows, mode in zip(self.global_num_tokens, cpu_data[:, 5].tolist())
+                if rows > 0
+            ]
+            self.welm_dp_all_active_ordinary_prefill = bool(active_modes) and all(
+                mode == ForwardMode.EXTEND.value for mode in active_modes
+            )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 cpu_data[:, 5].tolist()
@@ -209,6 +222,9 @@ def _update_gather_batch(
     require_mlp_tp_gather: bool,
     skip_all_gather=False,
 ):
+    batch.welm_dp_all_active_ordinary_prefill = (
+        not skip_all_gather and mlp_sync_info.welm_dp_all_active_ordinary_prefill
+    )
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]

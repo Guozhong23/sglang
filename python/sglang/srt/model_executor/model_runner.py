@@ -399,6 +399,7 @@ class ModelRunner:
         self.initialize()
         self.finalize_welm_runner_plan()
         self.check_quantized_moe_compatibility()
+        self.maybe_init_welm_prefill_megamoe()
 
         self._initialize_elastic_ep_joiner()
 
@@ -1098,6 +1099,26 @@ class ModelRunner:
             )
         bind(final_plan)
         self.runner_parallel_plan = final_plan
+
+    def maybe_init_welm_prefill_megamoe(self) -> None:
+        self.welm_prefill_megamoe = None
+        if (
+            not envs.WELM_NPU_USE_MEGAMOE.get()
+            or self.device != "npu"
+            or self.is_draft_worker
+            or self.dtype != torch.bfloat16
+            or self.ps.moe_ep_size <= 1
+            or get_parallel().moe_tp_size != 1
+            or "WeLMV4MoeForCausalLM"
+            not in (self.model_config.hf_config.architectures or [])
+        ):
+            return
+        from sglang.srt.hardware_backend.npu.moe.welmv4_megamoe import (
+            init_welm_prefill_megamoe,
+        )
+
+        # Weight postprocessing has finished; KV-cache sizing has not started.
+        self.welm_prefill_megamoe = init_welm_prefill_megamoe(self)
 
     def init_torch_distributed(self):
         result = bootstrap.init_torch_distributed(

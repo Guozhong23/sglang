@@ -835,6 +835,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    welm_dp_all_active_ordinary_prefill: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -1172,6 +1173,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            # Preserve group eligibility on an idle participant, but never
+            # inherit it into a draft/verify forward reusing the ScheduleBatch.
+            welm_dp_all_active_ordinary_prefill=(
+                batch.welm_dp_all_active_ordinary_prefill
+                and not model_runner.is_draft_worker
+                and batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.IDLE)
+            ),
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
