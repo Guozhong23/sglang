@@ -1365,15 +1365,28 @@ class WelmDpAttentionExecutor:
                 device=state.hidden_states.device,
             )
             invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
-            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
             assert state.residual is not None
-            state.residual.masked_fill_(invalid_mask[:, None], 0)
             megamoe = layer.mlp.welm_prefill_megamoe
             use_megamoe = (
                 megamoe is not None
                 and forward_batch.welm_dp_all_active_ordinary_prefill
                 and megamoe.can_run(active_view.local_slot_rows // plan.attn_tp_size)
             )
+            megamoe_num_valid_rows = None
+            if use_megamoe:
+                # Use the row view, not generic num_token_non_padded_cpu: the
+                # latter can count fabricated idle tokens as real after sync.
+                megamoe_num_valid_rows = megamoe.local_valid_rows(
+                    state.hidden_states.shape[0],
+                    active_view.local_real_rows,
+                    plan.attn_tp_rank,
+                )
+                if megamoe_num_valid_rows < state.hidden_states.shape[0]:
+                    state.hidden_states[megamoe_num_valid_rows:].zero_()
+                    state.residual[megamoe_num_valid_rows:].zero_()
+            else:
+                state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+                state.residual.masked_fill_(invalid_mask[:, None], 0)
             original_mode = forward_batch._original_forward_mode
             if original_mode is None:
                 original_mode = forward_batch.forward_mode
@@ -1385,6 +1398,7 @@ class WelmDpAttentionExecutor:
                 return_components=False,
                 use_welm_prefill_normal_stream_policy=True,
                 use_welm_prefill_megamoe=use_megamoe,
+                megamoe_num_valid_rows=megamoe_num_valid_rows,
                 force_serial_shared_expert=(
                     megamoe is not None
                     and (original_mode == ForwardMode.EXTEND or use_megamoe)
@@ -1395,7 +1409,11 @@ class WelmDpAttentionExecutor:
                 allow_inplace_expert_shared_merge=True,
             )
             state.hidden_states = self._store_final_components(layer, mlp_output)
-            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+            if use_megamoe:
+                if megamoe_num_valid_rows < state.hidden_states.shape[0]:
+                    state.hidden_states[megamoe_num_valid_rows:].zero_()
+            else:
+                state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
             if layer.is_final_layer:
                 # A mirror-disabled ordinary prefill ends while still in the
                 # NORMAL scattered layout. Restore this DP shard before model

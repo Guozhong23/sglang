@@ -27,10 +27,6 @@ class WelmPrefillMegaMoE:
         self.max_local_rows = _MAX_LOCAL_ROWS
         self._mega_moe = mega_moe
         self._closed = False
-        self._row_ids = torch.arange(_MAX_LOCAL_ROWS, dtype=torch.int32, device=device)
-        self._dummy_expert_ids = torch.arange(
-            config.top_k, dtype=torch.int32, device=device
-        )
         # SymmBuffer queries the name with init_comm=False. Initialize on every
         # participating rank now, not lazily on the first non-empty request.
         group._get_backend(device).get_hccl_comm_name(
@@ -53,22 +49,31 @@ class WelmPrefillMegaMoE:
         # DP callers pass the common physical slot, not local real-token count.
         return 0 < num_rows <= self.max_local_rows
 
-    def invalid_rows(self, num_rows, num_token_non_padded, invalid_row_mask):
-        if invalid_row_mask is not None:
-            return invalid_row_mask
-        if num_token_non_padded is not None:
-            return self._row_ids[:num_rows] >= num_token_non_padded
-        return None
+    @staticmethod
+    def local_valid_rows(shard_rows: int, real_rows: int, attn_tp_rank: int) -> int:
+        # Ordinary prefill has a valid prefix followed by padding in each DP
+        # slot. ReduceScatter preserves that order inside each attn-TP shard.
+        # Use host metadata only; never read a device scalar to skip padding.
+        return min(max(real_rows - attn_tp_rank * shard_rows, 0), shard_rows)
 
-    def forward_layer(self, experts, hidden_states, topk_output, invalid_rows):
+    def forward_layer(
+        self,
+        experts,
+        hidden_states,
+        topk_output,
+        num_valid_rows: int,
+        *,
+        zero_output_padding: bool = True,
+    ):
+        # The caller skips DeepEP's -1 masking. TopK IDs are already legal and
+        # distinct, including padding rows; only their mixture weights need 0.
         ids = topk_output.topk_ids.to(torch.int32)
         weights = topk_output.topk_weights.to(torch.bfloat16)
-        if invalid_rows is not None:
-            mask = invalid_rows[:, None]
-            # Zero-weight dummy routes still require distinct, legal IDs.
-            # Do not mutate the public TopK result or its DeepEP -1 convention.
-            ids = torch.where(mask, self._dummy_expert_ids[None, :], ids)
-            weights = weights.masked_fill(mask, 0)
+        has_padding = num_valid_rows < hidden_states.shape[0]
+        if has_padding:
+            # TopK returns FP32: the cast above owns a new BF16 tensor. Clear
+            # only its suffix, without another full tensor copy or mask kernel.
+            weights[num_valid_rows:].zero_()
         output, _ = self._mega_moe(
             hidden_states,
             ids,
@@ -80,8 +85,8 @@ class WelmPrefillMegaMoE:
             [experts.w2_weight],
             self.symm_buffer,
         )
-        if invalid_rows is not None:
-            output.masked_fill_(invalid_rows[:, None], 0)
+        if has_padding and zero_output_padding:
+            output[num_valid_rows:].zero_()
         return output
 
     def close(self):

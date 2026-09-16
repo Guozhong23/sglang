@@ -1069,6 +1069,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_welm_decode_like_stream_policy: bool = False,
         use_welm_prefill_normal_stream_policy: bool = False,
         use_welm_prefill_megamoe: bool = False,
+        megamoe_num_valid_rows: Optional[int] = None,
         force_serial_shared_expert: bool = False,
         valid_row_mask: Optional[torch.Tensor] = None,
         invalid_row_mask: Optional[torch.Tensor] = None,
@@ -1176,17 +1177,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # padded suffix. Skip the all-false scalar mask without changing
             # batch metadata or the explicit segmented masks used by DP.
             num_token_non_padded = None
-        megamoe_invalid_rows = None
         if use_welm_prefill_megamoe:
-            megamoe_invalid_rows = self.welm_prefill_megamoe.invalid_rows(
-                num_tokens, num_token_non_padded, invalid_row_mask
-            )
-            if megamoe_invalid_rows is not None:
-                # Sanitize before both shared expert and router, not only at
-                # dispatch: zero weights cannot make NaN dummy inputs safe.
-                hidden_states = hidden_states.masked_fill(
-                    megamoe_invalid_rows[:, None], 0
+            if valid_row_mask is None:
+                # Non-DP scattered prefill. The CPU count is still the full
+                # prompt count, unlike the already-localized device scalar.
+                megamoe_num_valid_rows = self.welm_prefill_megamoe.local_valid_rows(
+                    num_tokens,
+                    forward_batch.num_token_non_padded_cpu,
+                    get_parallel().attn_tp_rank,
                 )
+                if megamoe_num_valid_rows < num_tokens:
+                    # Only unused rows are modified. Clear before shared/router
+                    # computation: zero route weights cannot neutralize NaNs.
+                    hidden_states[megamoe_num_valid_rows:].zero_()
+            # DP already supplies its local count and sanitizes hidden/residual.
+            # Keep legal TopK IDs instead of applying DeepEP's -1 convention.
+            num_token_non_padded = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
@@ -1245,7 +1251,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
                 )
-        if _is_npu and (num_token_non_padded is not None or valid_row_mask is not None):
+        if (
+            _is_npu
+            and not use_welm_prefill_megamoe
+            and (num_token_non_padded is not None or valid_row_mask is not None)
+        ):
             if not isinstance(topk_output, StandardTopKOutput):
                 raise RuntimeError(
                     "WeLMv4 NPU padding requires StandardTopKOutput, got "
@@ -1279,7 +1289,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         if use_welm_prefill_megamoe:
             experts_output = self.welm_prefill_megamoe.forward_layer(
-                self.experts, hidden_states, topk_output, megamoe_invalid_rows
+                self.experts,
+                hidden_states,
+                topk_output,
+                megamoe_num_valid_rows,
+                # DP clears the final expert+shared output at its transport
+                # boundary; do not clear the expert component a second time.
+                zero_output_padding=valid_row_mask is None,
             )
         elif use_welm_local_ep_moe:
             if not self.welm_local_ep_kernel_available:
