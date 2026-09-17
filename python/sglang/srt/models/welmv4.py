@@ -2338,6 +2338,7 @@ class Qwen2MoeAttention(nn.Module):
             reduce_op="sum",
             bias=bias,
             comm_turn=0,
+            comm_mode="ccu",
         )
 
     def _npu_o_proj_chunked_reduce_scatter(
