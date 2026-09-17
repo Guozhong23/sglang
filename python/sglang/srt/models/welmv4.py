@@ -2281,66 +2281,6 @@ class Qwen2MoeAttention(nn.Module):
             comm_mode="ccu",
         )
 
-    def _can_use_npu_decode_o_proj_matmul_all_reduce(
-        self,
-        attn_output: torch.Tensor,
-        forward_batch: ForwardBatch,
-        *,
-        skip_all_reduce: bool,
-    ) -> bool:
-        if (
-            not _is_npu
-            or not envs.SGLANG_NPU_DECODE_OPROJ_MATMUL_ALL_REDUCE.get()
-            or not forward_batch.forward_mode.is_decode()
-            or skip_all_reduce
-            or not self.o_proj.reduce_results
-            or self.o_proj.tp_size <= 1
-        ):
-            return False
-
-        if not hasattr(torch_npu, "npu_mm_all_reduce_base"):
-            logger.warning_once(
-                "SGLANG_NPU_DECODE_OPROJ_MATMUL_ALL_REDUCE is enabled, but "
-                "the installed torch_npu does not provide "
-                "npu_mm_all_reduce_base; falling back to separate OProj "
-                "MatMul and AllReduce."
-            )
-            return False
-
-        # This path implements the BF16 non-quantized MC2 contract. Quantized
-        # variants need additional scale inputs and must keep using the linear
-        # layer's quant_method until those contracts are implemented here.
-        if (
-            self.o_proj.quant_config is not None
-            or attn_output.dtype != torch.bfloat16
-            or self.o_proj.weight.dtype != torch.bfloat16
-        ):
-            logger.warning_once(
-                "SGLANG_NPU_DECODE_OPROJ_MATMUL_ALL_REDUCE currently requires "
-                "an unquantized BF16 OProj; falling back to the standard path."
-            )
-            return False
-        return True
-
-    def _npu_o_proj_matmul_all_reduce(
-        self, attn_output: torch.Tensor, *, group: Optional[Any] = None
-    ) -> torch.Tensor:
-        group = get_tp_group() if group is None else group
-        bias = (
-            self.o_proj.bias
-            if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
-            else None
-        )
-        return torch_npu.npu_mm_all_reduce_base(
-            attn_output.contiguous(),
-            self.o_proj.weight.transpose(0, 1),
-            self._get_welm_npu_o_proj_hcom_name(group),
-            reduce_op="sum",
-            bias=bias,
-            comm_turn=0,
-            comm_mode="ccu",
-        )
-
     def _npu_o_proj_chunked_reduce_scatter(
         self, attn_output: torch.Tensor, chunks: int, *, group: Any
     ) -> torch.Tensor:
@@ -2990,12 +2930,6 @@ class Qwen2MoeAttention(nn.Module):
             output = self._npu_o_proj_matmul_reduce_scatter(
                 attn_output, group=o_proj_rs_group
             )
-        elif self._can_use_npu_decode_o_proj_matmul_all_reduce(
-            attn_output,
-            forward_batch,
-            skip_all_reduce=skip_o_proj_all_reduce,
-        ):
-            output = self._npu_o_proj_matmul_all_reduce(attn_output)
         else:
             output, _ = self.o_proj(
                 attn_output,
