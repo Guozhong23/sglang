@@ -51,6 +51,7 @@ MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 WELMV4_MODEL_ARCHS = (
     "WeLMV4MoeForCausalLM",
     "WeLMV4MoeForCausalLMNextN",
+    "WeLMV4VLMForConditionalGeneration",
 )
 
 
@@ -471,16 +472,16 @@ class ModelConfig:
         # needs the same request-scoped token history table. Normalize both
         # schemas here so the scheduler, eager runner, and CUDA graph runners
         # share one n-gram lifecycle.
-        oe_grams = tuple(getattr(self.hf_config, "oe_grams", ()) or ())
+        oe_grams = tuple(getattr(self.hf_text_config, "oe_grams", ()) or ())
         self.use_ngram_embedding = bool(
-            getattr(self.hf_config, "use_ngram_embedding", False) or oe_grams
+            getattr(self.hf_text_config, "use_ngram_embedding", False) or oe_grams
         )
         self.ngram_embedding_n = (
-            getattr(self.hf_config, "ngram_embedding_n", None)
+            getattr(self.hf_text_config, "ngram_embedding_n", None)
             or max(oe_grams, default=0)
         )
         self.ngram_embedding_k = (
-            getattr(self.hf_config, "ngram_embedding_k", None) or len(oe_grams)
+            getattr(self.hf_text_config, "ngram_embedding_k", None) or len(oe_grams)
         )
         # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
@@ -1818,6 +1819,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 
 multimodal_model_archs = [
+    "WeLMV4VLMForConditionalGeneration",
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",

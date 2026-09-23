@@ -5071,7 +5071,14 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        if model_arch == "WeLMV4MoeForCausalLM":
+        if model_arch == "WeLMV4VLMForConditionalGeneration":
+            self._handle_welm_vlm_basic_mode()
+
+        if model_arch in (
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4VLMForConditionalGeneration",
+        ):
+            welm_text_config = self.get_model_config().hf_text_config
             raw_spec_algorithm = (self.speculative_algorithm or "").upper()
             if (
                 is_npu()
@@ -5092,7 +5099,7 @@ class ServerArgs:
                 )
 
             sink_flags = (
-                getattr(hf_config, "enable_attn_sink_layerwise", []) or []
+                getattr(welm_text_config, "enable_attn_sink_layerwise", []) or []
             )
             explicitly_requested_attn_backends = {
                 backend
@@ -5199,9 +5206,9 @@ class ServerArgs:
                 target_mirror_layers = [
                     int(layer_id)
                     for layer_id in (
-                        getattr(hf_config, "kv_mirror_layers", []) or []
+                        getattr(welm_text_config, "kv_mirror_layers", []) or []
                     )
-                    if 0 <= int(layer_id) < int(hf_config.num_hidden_layers)
+                    if 0 <= int(layer_id) < int(welm_text_config.num_hidden_layers)
                 ]
                 if not target_mirror_layers:
                     logger.warning(
@@ -5217,7 +5224,7 @@ class ServerArgs:
                     expected_target_mirror_layers = set(
                         range(
                             first_target_mirror_layer,
-                            int(hf_config.num_hidden_layers),
+                            int(welm_text_config.num_hidden_layers),
                         )
                     )
                     if set(target_mirror_layers) != expected_target_mirror_layers:
@@ -5227,13 +5234,13 @@ class ServerArgs:
                             "final target layer. Got target consumers "
                             f"{target_mirror_layers}, but expected all layers "
                             f"from {first_target_mirror_layer} through "
-                            f"{int(hf_config.num_hidden_layers) - 1}."
+                            f"{int(welm_text_config.num_hidden_layers) - 1}."
                         )
                     logger.info(
                         "WeLMv4 KV-mirror prefill query pruning is enabled for "
                         "the target-layer suffix %d..%d.",
                         first_target_mirror_layer,
-                        int(hf_config.num_hidden_layers) - 1,
+                        int(welm_text_config.num_hidden_layers) - 1,
                     )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
@@ -5822,6 +5829,46 @@ class ServerArgs:
         return bool(
             {"WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN"}
             & set(getattr(draft_config, "architectures", None) or [])
+        )
+
+    def _handle_welm_vlm_basic_mode(self) -> None:
+        """Keep the initial VL port on the ordinary BF16 TP execution path."""
+        unsupported = []
+        for enabled, option in (
+            (self.speculative_algorithm, "speculative decoding / MTP"),
+            (self.enable_dp_attention, "--enable-dp-attention"),
+            (self.mm_enable_dp_encoder, "--mm-enable-dp-encoder"),
+            (self.encoder_only or self.language_only, "encoder/language-only deployment"),
+            (self.disaggregation_mode != "null", "PD disaggregation"),
+            (self.enable_pdmux, "--enable-pdmux"),
+            (self.pp_size != 1, "pipeline parallelism"),
+            (self.ep_size != 1 or self.moe_a2a_backend != "none", "expert parallelism"),
+            (self.quantization is not None, "quantized weights"),
+            (self.dtype not in ("auto", "bfloat16"), "a dtype other than bfloat16"),
+            (envs.WELM_NPU_USE_MEGAMOE.get(), "WELM_NPU_USE_MEGAMOE"),
+            (envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get(), "SGLANG_VIT_ENABLE_CUDA_GRAPH"),
+        ):
+            if enabled:
+                unsupported.append(option)
+        if unsupported:
+            raise ValueError(
+                "WeLM-VL basic adaptation supports BF16, ordinary tensor parallelism "
+                "and a combined vision/language server. Not yet supported: "
+                + ", ".join(unsupported)
+                + ". Use examples/runtime/welm_vl/run_950pr.sh for the baseline."
+            )
+        if self.enable_multimodal is False:
+            raise ValueError("WeLM-VL requires --enable-multimodal.")
+        self.enable_multimodal = True
+        # These are deliberately not advertised as working until image/OE cache
+        # lifetimes and captured multimodal buffers have separate NPU coverage.
+        self.cuda_graph_config.decode.backend = Backend.DISABLED
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self.chunked_prefill_size = -1
+        self.disable_radix_cache = True
+        logger.info(
+            "WeLM-VL basic mode: graph capture, chunked prefill and radix cache "
+            "are disabled; the model's OE and target-layer KV mirrors remain active."
         )
 
     def _validate_welm_dp_attention_capabilities(self) -> None:

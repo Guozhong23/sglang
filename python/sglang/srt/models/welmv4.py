@@ -96,6 +96,7 @@ from sglang.srt.models.welmv4_dp_attention import (
     WelmRunnerRole,
     get_welm_runner_build_plan_for_init,
 )
+from sglang.srt.models.welmv4_vlm_utils import welmv4_vlm_target_config
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 
@@ -4396,6 +4397,7 @@ class Qwen2MoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         # Construct immutable request-segment metadata once per eager forward.
         # EXTEND/MIXED positions are independently contiguous per request;
@@ -4439,7 +4441,11 @@ class Qwen2MoeModel(nn.Module):
             else:
                 hidden_states = input_embeds
 
-            if len(self.oe_grams) > 0 and forward_batch.ngram_embedding_info is not None:
+            if (
+                not skip_oe_fusion
+                and len(self.oe_grams) > 0
+                and forward_batch.ngram_embedding_info is not None
+            ):
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
                 )
@@ -4569,6 +4575,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = welmv4_vlm_target_config(
+            config, get_global_server_args().speculative_algorithm
+        )
         if quant_config is not None and quant_config.get_name() != "modelslim":
             raise NotImplementedError(
                 "WeLMv4 currently supports only ModelSlim quantized checkpoints; "
@@ -4635,6 +4644,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
     ) -> torch.Tensor:
         # Every supported top-level forward is serial (TBO/PDMux/speculative
         # Clearing here also recovers cleanly if a previous eager forward
@@ -4648,6 +4658,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
+            skip_oe_fusion=skip_oe_fusion,
         )
         aux_hidden_states = None
         if isinstance(model_output, tuple):

@@ -222,6 +222,39 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def test_multimodal_token_id_processor_preserves_prompt_ids(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.mm_prompt_input_type = "token_ids"
+        ids = [1, 154752, 2]
+        with patch.object(self.chat, "_process_messages") as process:
+            process.return_value = MessageProcessingResult(
+                prompt="",
+                prompt_ids=ids,
+                image_data=["image-1"],
+                audio_data=None,
+                video_data=None,
+                modalities=["image"],
+                stop=None,
+            )
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, ids)
+        self.assertIsNone(adapted.text)
+        self.assertEqual(adapted.image_data, ["image-1"])
+
+    def test_multimodal_token_id_template_does_not_decode_prompt(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        self.chat.mm_prompt_input_type = "token_ids"
+        self.chat.chat_encoding_spec = None
+        self.tm.tokenizer.apply_chat_template.return_value = "native rendered prompt"
+        self.tm.tokenizer.encode.return_value = [1, 154752, 2]
+        self.tm.tokenizer.decode.reset_mock()
+        result = self.chat._apply_jinja_template(
+            self.basic_req, tools=None, is_multimodal=True
+        )
+        self.assertEqual(result.prompt_ids, [1, 154752, 2])
+        self.tm.tokenizer.decode.assert_not_called()
+
     def test_convert_to_internal_request_rejects_stream_token_ids(self):
         for field in ("return_prompt_token_ids", "return_token_ids"):
             req = ChatCompletionRequest(

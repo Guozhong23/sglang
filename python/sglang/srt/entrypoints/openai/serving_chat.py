@@ -248,6 +248,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
+        self.mm_prompt_input_type = getattr(
+            getattr(self.tokenizer_manager, "mm_processor", None),
+            "prompt_input_type",
+            "text",
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -937,6 +942,13 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal and self.chat_encoding_spec == "kimi_k3":
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif (
+            is_multimodal
+            and self.mm_prompt_input_type == "token_ids"
+            and isinstance(processed_messages.prompt_ids, list)
+            and processed_messages.prompt_ids
+        ):
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
             # Standard VLMs render a text prompt (with placeholder strings) for the MM
             # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
@@ -1339,7 +1351,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
 
-            if is_multimodal:
+            if is_multimodal and self.mm_prompt_input_type != "token_ids":
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop

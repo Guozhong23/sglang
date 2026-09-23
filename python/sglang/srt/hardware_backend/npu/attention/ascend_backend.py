@@ -390,7 +390,11 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         architectures = model_runner.model_config.hf_config.architectures or []
         self.is_welm_v4 = any(
-            arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
+            arch in (
+                "WeLMV4MoeForCausalLM",
+                "WeLMV4MoeForCausalLMNextN",
+                "WeLMV4VLMForConditionalGeneration",
+            )
             for arch in architectures
         )
         self.use_welm_flash_attn = self.is_welm_v4 and get_bool_env_var(

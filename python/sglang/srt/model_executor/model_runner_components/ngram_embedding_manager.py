@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.models.welmv4_vlm_utils import normalize_welmv4_image_tokens
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 
@@ -25,6 +26,7 @@ class NgramEmbeddingManager:
     table: Optional[torch.Tensor]
     n: int
     k: int
+    image_token_id: Optional[int] = None
 
     def share_table_from(
         self, owner: "NgramEmbeddingManager"
@@ -39,6 +41,8 @@ class NgramEmbeddingManager:
                 "Target/draft ngram configurations differ: "
                 f"target={(owner.n, owner.k)} vs draft={(self.n, self.k)}."
             )
+        if self.image_token_id != owner.image_token_id:
+            raise RuntimeError("Target/draft ngram image token configurations differ.")
         if self.table is not None and self.table.shape != owner.table.shape:
             raise RuntimeError(
                 "Target/draft ngram token-table shapes differ: "
@@ -58,6 +62,7 @@ class NgramEmbeddingManager:
             table=owner.table,
             n=self.n,
             k=self.k,
+            image_token_id=self.image_token_id,
         )
 
     def commit_speculative_accepts(
@@ -113,6 +118,14 @@ class NgramEmbeddingManager:
         ngram_embedding_n = 0
         ngram_embedding_k = 0
         use_ngram_embedding = model_config.use_ngram_embedding
+        image_token_id = None
+        if "WeLMV4VLMForConditionalGeneration" in (
+            getattr(model_config.hf_config, "architectures", None) or []
+        ):
+            image_token_id = getattr(model_config.hf_config, "image_token_id", None)
+            if image_token_id is None:
+                raise ValueError("WeLM-V4.5-VL requires image_token_id for OE history.")
+            image_token_id = int(image_token_id)
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
@@ -143,6 +156,7 @@ class NgramEmbeddingManager:
             table=token_table,
             n=ngram_embedding_n,
             k=ngram_embedding_k,
+            image_token_id=image_token_id,
         )
 
     def update_after_decode(
@@ -184,7 +198,11 @@ class NgramEmbeddingManager:
             for req in batch.reqs:
                 start = len(req.prefix_indices)
                 end = start + req.extend_range.length
-                fill_ids = req.origin_input_ids + req.output_ids
+                fill_ids = normalize_welmv4_image_tokens(
+                    req.origin_input_ids + req.output_ids,
+                    getattr(req, "multimodal_inputs", None),
+                    self.image_token_id,
+                )
                 if start == 0:
                     tokens = fill_ids[start:end]
                     column_starts.append(0)
@@ -272,7 +290,13 @@ class NgramEmbeddingManager:
                     "Cannot initialize a PD-decode ngram row before allocating "
                     f"req_pool_idx for request {req.rid}."
                 )
-            tokens = list(req.origin_input_ids)
+            tokens = list(
+                normalize_welmv4_image_tokens(
+                    req.origin_input_ids,
+                    getattr(req, "multimodal_inputs", None),
+                    self.image_token_id,
+                )
+            )
             tokens.extend(req.output_ids)
             if len(tokens) > table_width:
                 raise RuntimeError(
