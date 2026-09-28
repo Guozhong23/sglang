@@ -23,12 +23,16 @@ _logger = logging.getLogger("sglang.srt.managers.schedule_batch")
 _context = contextvars.ContextVar("pd_transfer_timing", default=None)
 _writer_lock = threading.Lock()
 _writer = None
+_gc_diagnostics = None
 
 
 def _drain_at_exit():
     # Best effort only: abnormal termination can lose the last queued records.
     writer = _writer
     if writer is not None and writer.pid == os.getpid():
+        if _gc_diagnostics is not None:
+            _gc_diagnostics.uninstall()
+            writer.put(None, None)  # Wake the writer to flush GC/status at exit.
         deadline = time.monotonic() + 1.0
         with writer.queue.all_tasks_done:
             while writer.queue.unfinished_tasks:
@@ -46,28 +50,61 @@ class _LogWriter:
         self.pid = os.getpid()
         self.queue = queue.Queue(maxsize=4096)
         self.dropped = 0
+        self.gc_status_time = 0.0
         threading.Thread(
             target=self._run, name="pd-time-stats-log", daemon=True
         ).start()
 
     def _run(self):
         while True:
-            item = self.queue.get()
+            try:
+                item = self.queue.get(timeout=0.25 if _gc_diagnostics else None)
+            except queue.Empty:
+                self._flush_gc()
+                continue
             try:
                 prefix, record = item
-                if isinstance(record, dict):
-                    message = json.dumps(
-                        dict(record, dropped_records_total=self.dropped),
-                        separators=(",", ":"),
-                    )
-                else:
-                    message = record
-                _logger.info("%s%s", prefix, message)
+                if prefix is not None:
+                    # Preserve the ordinary writer path when GC is disabled.
+                    if isinstance(record, dict):
+                        message = json.dumps(
+                            dict(record, dropped_records_total=self.dropped),
+                            separators=(",", ":"),
+                        )
+                    else:
+                        message = record
+                    _logger.info("%s%s", prefix, message)
+                if _gc_diagnostics is not None:
+                    self._flush_gc(force=prefix is None)
             except Exception:
                 # Diagnostics must not terminate model/transfer workers.
                 self.dropped += 1
             finally:
                 self.queue.task_done()
+
+    def _write(self, prefix, record):
+        if isinstance(record, dict):
+            message = json.dumps(
+                dict(record, dropped_records_total=self.dropped),
+                separators=(",", ":"),
+            )
+        else:
+            message = record
+        _logger.info("%s%s", prefix, message)
+
+    def _flush_gc(self, force=False):
+        diag = _gc_diagnostics
+        if diag is None or diag.pid != self.pid:
+            return
+        try:
+            for record in diag.drain(limit=2048 if force else 128):
+                self._write("PDGCStats ", record)
+            now = time.monotonic()
+            if force or now - self.gc_status_time >= 1.0:
+                self._write("PDGCStats ", diag.status())
+                self.gc_status_time = now
+        except Exception:
+            self.dropped += 1
 
     def put(self, prefix, record):
         try:
@@ -76,10 +113,39 @@ class _LogWriter:
             self.dropped += 1
 
 
+def _ensure_writer():
+    global _writer
+    if _writer is None or _writer.pid != os.getpid():
+        with _writer_lock:
+            if _writer is None or _writer.pid != os.getpid():
+                _writer = _LogWriter()
+    return _writer
+
+
+def enable_gc_diagnostics(fields):
+    """Initialize output before registering GC; called once during P startup."""
+    global _gc_diagnostics
+    from sglang.srt.observability.pd_gc_diagnostics import PDGCDiagnostics
+
+    if not _logger.isEnabledFor(logging.INFO):
+        raise ValueError(
+            "PD GC diagnostics requires INFO for sglang.srt.managers.schedule_batch "
+            "in SGLANG_LOGGING_CONFIG_PATH (global INFO is not required)"
+        )
+    writer = _ensure_writer()
+    if _gc_diagnostics is None or _gc_diagnostics.pid != os.getpid():
+        _gc_diagnostics = PDGCDiagnostics(fields)
+    writer.put("PDGCStats ", _gc_diagnostics.status(record="gc_enabled"))
+    _gc_diagnostics.install()
+    return _gc_diagnostics.callback
+
+
 def emit(prefix, record):
     """Bounded asynchronous output; a full diagnostic queue never blocks inference."""
     if not _logger.isEnabledFor(logging.INFO):
         return
+    # Keep the ordinary statistics path inline; enabling GC must not add a
+    # helper call to every record when the diagnostic switch is off.
     global _writer
     if _writer is None or _writer.pid != os.getpid():
         with _writer_lock:
@@ -200,6 +266,12 @@ class ChunkTiming:
             for key, value in values.items():
                 group[key] = group.get(key, 0) + value
 
+    def add_gc_preparation(self, record):
+        with self.lock:
+            if not hasattr(self, "gc_preparations"):
+                self.gc_preparations = []
+            self.gc_preparations.append(record)
+
     def finish(self, error=None):
         self.mark("worker_end")
         with self.lock:
@@ -215,6 +287,9 @@ class ChunkTiming:
                 components=components,
                 error=error,
             )
+            if _gc_diagnostics is not None and hasattr(self, "gc_preparations"):
+                record["gc_preparations"] = self.gc_preparations.copy()
+                record["gc_diagnostic_id"] = _gc_diagnostics.identity["diagnostic_id"]
         events = record["events_ns"]
         record["queue_wait_ms"] = interval_ms(
             events.get("enqueued"), events.get("worker_begin")
@@ -257,7 +332,11 @@ def timed_component(name):
                 return fn(*args, **kwargs)
             timing, _ = active
             token = _context.set((timing, name))
+            diag = _gc_diagnostics if name == "kv" else None
+            scope = diag.enter(timing.fields) if diag is not None else None
             start = time.perf_counter_ns()
+            if scope is not None:
+                scope.start(start)
             failed = 0
             try:
                 result = fn(*args, **kwargs)
@@ -268,6 +347,9 @@ def timed_component(name):
                 raise
             finally:
                 end = time.perf_counter_ns()
+                if scope is not None:
+                    diag.leave(scope)
+                    timing.add_gc_preparation(scope.record())
                 _context.reset(token)
                 timing.add_interval(name, "host", start, end, failures=failed)
 
@@ -286,6 +368,9 @@ def timed_transfer_call(fn):
         # lengths already lives on the CPU. Count outside the measured call.
         nbytes, segments = int(sum(lengths)), len(lengths)
         start = time.perf_counter_ns()
+        scope = _gc_diagnostics.scope() if _gc_diagnostics is not None else None
+        if scope is not None:
+            scope.enter_engine(start)
         failed = 0
         try:
             result = fn(self, session_id, buffers, peer_buffer_addresses, lengths)
@@ -295,11 +380,14 @@ def timed_transfer_call(fn):
             failed = 1
             raise
         finally:
+            end = time.perf_counter_ns()
+            if scope is not None:
+                scope.phase = "post_engine"
             timing.add_interval(
                 component,
                 "engine",
                 start,
-                time.perf_counter_ns(),
+                end,
                 bytes=nbytes,
                 segments=segments,
                 failures=failed,

@@ -1222,7 +1222,19 @@ class Scheduler(
 
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+            pd_diagnostics = None
+            if (
+                get_disagg().disaggregation_mode == "prefill"
+                and self.server_args.enable_request_time_stats_logging
+            ):
+                pd_diagnostics = dict(
+                    role="prefill",
+                    tp_rank=self.ps.attn_tp_rank,
+                    dp_rank=self.ps.attn_dp_rank,
+                    cp_rank=self.ps.attn_cp_rank,
+                    pp_rank=self.ps.pp_rank,
+                )
+            configure_gc_logger(pd_diagnostics=pd_diagnostics)
 
     def init_disaggregation(self):
         self.mm_receiver = None
