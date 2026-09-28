@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{pd_stream, pd_types::api_path};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -54,6 +54,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    early_stream: pd_stream::EarlyStream,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -80,6 +81,12 @@ struct PDRequestContext<'a> {
 /// transport failure can't be misattributed to a healthy prefill.
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
+
+/// The early stream owns per-upstream outcomes (some are still pending).
+/// Neither breaker outcomes nor worker-error counters may be inferred from
+/// the client HTTP status for this path.
+#[derive(Clone, Copy)]
+struct EarlyStreamOutcomesManaged;
 
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
@@ -185,6 +192,9 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            early_stream: pd_stream::EarlyStream::from_env(
+                ctx.router_config.max_concurrent_requests,
+            )?,
         })
     }
 
@@ -442,10 +452,15 @@ impl PDRouter {
                             .await;
 
                         let status = response.status();
-                        let outcomes_already_recorded = response
+                        let early_stream_managed = response
                             .extensions()
-                            .get::<BreakerOutcomesRecorded>()
+                            .get::<EarlyStreamOutcomesManaged>()
                             .is_some();
+                        let outcomes_already_recorded = early_stream_managed
+                            || response
+                                .extensions()
+                                .get::<BreakerOutcomesRecorded>()
+                                .is_some();
                         if !outcomes_already_recorded {
                             let not_error = status.is_success() || status.is_client_error();
                             // Prefill is always non-streaming and fully read before
@@ -462,7 +477,7 @@ impl PDRouter {
                         }
 
                         // Record worker errors for server errors (5xx)
-                        if status.is_server_error() {
+                        if status.is_server_error() && !early_stream_managed {
                             let error_type = error_type_from_status(status);
                             Metrics::record_worker_error(
                                 metrics_labels::WORKER_PREFILL,
@@ -702,6 +717,62 @@ impl PDRouter {
             decode_url: decode.url(),
         }
         .emit();
+
+        if let Some(slot) = self.early_stream.try_acquire(
+            context.route,
+            context.is_stream,
+            context.return_logprob,
+            context.batch_size,
+            &json_request,
+        ) {
+            let result = pd_stream::dispatch(
+                prefill_request,
+                decode_request,
+                context.route,
+                &headers_with_trace,
+                Arc::clone(&prefill),
+                Arc::clone(&decode),
+                slot,
+            )
+            .await;
+            let mut response = match result {
+                Ok(response) => response,
+                Err(pd_stream::DispatchError::Prefill(result)) => {
+                    // dispatch has already dropped the paired D request and
+                    // recorded P's own outcome. Keep the existing error mapping.
+                    match self
+                        .process_prefill_response(result, prefill.url(), false)
+                        .await
+                    {
+                        Err(response) => response,
+                        Ok(_) => error::bad_gateway("prefill_server_error", "Prefill failed"),
+                    }
+                }
+                Err(pd_stream::DispatchError::Decode(Ok(response))) => {
+                    if response.status().is_server_error() {
+                        Metrics::record_worker_error(
+                            metrics_labels::WORKER_DECODE,
+                            metrics_labels::CONNECTION_HTTP,
+                            error_type_from_status(response.status()),
+                        );
+                    }
+                    // This helper's tracked error stream records D exactly once.
+                    self.handle_decode_error_response(response, &context, prefill, decode)
+                        .await
+                }
+                Err(pd_stream::DispatchError::Decode(Err(err))) => {
+                    decode.record_outcome(false);
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_DECODE,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(StatusCode::BAD_GATEWAY),
+                    );
+                    error::bad_gateway("decode_server_error", format!("Decode server error: {err}"))
+                }
+            };
+            response.extensions_mut().insert(EarlyStreamOutcomesManaged);
+            return response;
+        }
 
         let prefill_fut = prefill_request.send();
         let decode_fut = decode_request.send();
@@ -1730,6 +1801,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            early_stream: pd_stream::EarlyStream::default(),
         }
     }
 
