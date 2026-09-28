@@ -29,6 +29,8 @@ class TransferKVChunk:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+    # Optional CPU-only diagnostic record, never serialized on the wire.
+    pd_timing: object = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

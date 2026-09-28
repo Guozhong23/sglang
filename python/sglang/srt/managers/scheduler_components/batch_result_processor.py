@@ -32,11 +32,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.observability.pd_time_stats import emit, request_record
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
     get_observability,
+    get_parallel,
     get_server_args,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -109,6 +111,16 @@ class SchedulerBatchResultProcessor:
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        if get_observability().enable_request_time_stats_logging:
+            for req in batch.reqs:
+                emit(
+                    "PDRequestStats ",
+                    request_record(
+                        req,
+                        "prebuilt_output",
+                        tp_rank=get_parallel().attn_tp_rank,
+                    ),
+                )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 

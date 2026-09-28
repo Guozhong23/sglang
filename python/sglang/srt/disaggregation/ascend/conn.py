@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.observability.pd_time_stats import timed_component
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.npu_pd_affinity import get_pd_thread_affinity
 
@@ -114,6 +115,7 @@ class AscendKVManager(MooncakeKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
+    @timed_component("kv")
     def send_kvcache(
         self,
         mooncake_session_id: str,
