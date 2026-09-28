@@ -1,7 +1,9 @@
 """Check local WeLM-VL artifacts before starting distributed NPU workers."""
 
 import argparse
+import importlib
 import json
+import os
 from pathlib import Path
 
 
@@ -50,8 +52,63 @@ def check_artifacts(model_path: Path) -> dict:
     return config
 
 
+def check_optimization_dependencies(tp: int, profile: str = "baseline") -> None:
+    """Import enabled extensions without allocating distributed runtime buffers."""
+    if profile not in ("baseline", "optimized"):
+        raise ValueError(f"Unknown WeLM-VL profile: {profile}")
+
+    required = []
+    if profile == "optimized":
+        required.append(("deep_ep", ("Buffer", "Config"), "optimized DeepEP profile"))
+    # Match the individual production flag parsers. Fused QKV is enabled only
+    # by the literal value "1" and its specialized projection uses TP=4.
+    if os.getenv("WELM_NPU_USE_MEGAMOE", "0").lower() in ("1", "true", "yes", "y"):
+        required.append(
+            (
+                "npu_ops_transformer.ops.mega_moe",
+                ("mega_moe", "get_symm_buffer_for_mega_moe"),
+                "WELM_NPU_USE_MEGAMOE (npu_ops_transformer/custom_transformer)",
+            )
+        )
+    if os.getenv("WELM_NPU_USE_FLASH_ATTN", "0").lower() in ("1", "true"):
+        required.append(
+            (
+                "cann_ops_transformer",
+                ("flash_attn", "flash_attn_metadata"),
+                "WELM_NPU_USE_FLASH_ATTN",
+            )
+        )
+    if tp == 4 and os.getenv("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1":
+        # Import the real kernel module: importing cannbotdsl alone would miss
+        # incompatible Channel/Dim/memory/register APIs used by its decorators.
+        required.append(
+            (
+                "sglang.srt.layers.fused_qkv_proj_norm_rope_cache",
+                ("compile_aot", "compile_aot_rank_chunk"),
+                "SGLANG_NPU_WELMV4_FUSED_QKV (cannbotdsl)",
+            )
+        )
+    for module_name, symbols, reason in required:
+        try:
+            module = importlib.import_module(module_name)
+            missing = [
+                name for name in symbols if not callable(getattr(module, name, None))
+            ]
+            if missing:
+                raise ValueError("missing callable API: " + ", ".join(missing))
+        except Exception as exc:
+            raise ValueError(
+                f"{reason} requires a compatible {module_name} extension: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+
 def check_runtime(
-    model_path: Path, tp: int, base_device: int, chat_template: str | None
+    model_path: Path,
+    tp: int,
+    base_device: int,
+    chat_template: str | None,
+    profile: str = "baseline",
 ):
     import torch
     import torch_npu  # noqa: F401
@@ -64,6 +121,8 @@ def check_runtime(
             f"Need {tp} visible NPUs starting at {base_device}; "
             f"only {torch.npu.device_count()} are visible."
         )
+    with torch.npu.device(torch.device(f"npu:{base_device}")):
+        check_optimization_dependencies(tp, profile)
     config = get_config(str(model_path), trust_remote_code=True, local_files_only=True)
     processor = get_processor(
         str(model_path), trust_remote_code=True, local_files_only=True
@@ -135,6 +194,9 @@ def main():
     parser.add_argument("--base-device", type=int, default=0)
     parser.add_argument("--chat-template")
     parser.add_argument("--runtime", action="store_true")
+    parser.add_argument(
+        "--profile", choices=("baseline", "optimized"), default="baseline"
+    )
     args = parser.parse_args()
     try:
         config = check_artifacts(args.model_path)
@@ -155,7 +217,11 @@ def main():
             raise ValueError(f"Chat template does not exist: {args.chat_template}")
         if args.runtime:
             check_runtime(
-                args.model_path, args.tp, args.base_device, args.chat_template
+                args.model_path,
+                args.tp,
+                args.base_device,
+                args.chat_template,
+                args.profile,
             )
     except (
         ValueError,

@@ -8,6 +8,7 @@ tests validate adapter contracts, not real checkpoint preprocessing equivalence.
 import ast
 import asyncio
 import concurrent.futures
+import hashlib
 import logging
 import runpy
 import threading
@@ -16,7 +17,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Union
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
@@ -25,6 +26,63 @@ register_cpu_ci = runpy.run_path(
     str(Path(__file__).resolve().parents[4] / "python/sglang/test/ci/ci_register.py")
 )["register_cpu_ci"]
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _cache_hash_helpers():
+    """Use the production SHA-based feature hash and hash-to-pad derivation."""
+    srt = Path(__file__).resolve().parents[4] / "python/sglang/srt"
+    namespace = dict(
+        torch=torch,
+        hashlib=hashlib,
+        flatten_nested_list=lambda items: items,
+        ShmPointerMMData=type("ShmPointerMMData", (), {}),
+    )
+    tree = ast.parse((srt / "managers/mm_utils.py").read_text())
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"data_hash", "tensor_hash", "hash_feature"}
+    ]
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), "<MM hash>", "exec"), namespace
+    )
+    tree = ast.parse((srt / "managers/schedule_batch.py").read_text())
+    nodes = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "MM_PAD_SHIFT_VALUE"
+            for target in node.targets
+        ):
+            nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name == "_compute_pad_value":
+            nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "MultimodalDataItem":
+            nodes.extend(
+                method
+                for method in node.body
+                if isinstance(method, ast.FunctionDef) and method.name == "set_hash"
+            )
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), "<MM pad>", "exec"), namespace
+    )
+    return namespace
+
+
+HASH_HELPERS = _cache_hash_helpers()
+
+
+def _image_item(grid, pixels=None):
+    item = SimpleNamespace(
+        feature=torch.zeros(8, 3) if pixels is None else pixels,
+        image_grid_thw=torch.tensor([grid]),
+        modality="image",
+        hash=None,
+        pad_value=None,
+        offsets=None,
+    )
+    item.set_hash = lambda value: HASH_HELPERS["set_hash"](item, value)
+    return item
 
 
 def _processor_class():
@@ -45,6 +103,10 @@ def _processor_class():
         BaseMultimodalProcessor=object,
         WeLMV4VLMForConditionalGeneration=object,
         logger=logging.getLogger(__name__),
+        envs=SimpleNamespace(
+            SGLANG_MM_SKIP_COMPUTE_HASH=SimpleNamespace(get=lambda: False)
+        ),
+        hash_feature=HASH_HELPERS["hash_feature"],
     )
     exec(
         compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"),
@@ -131,6 +193,17 @@ class TestWeLMV4VLMProcessor(unittest.IsolatedAsyncioTestCase):
         finally:
             released.set()
         self.assertEqual(await task, {"input_ids": [1]})
+
+    async def test_output_hashing_runs_off_event_loop(self):
+        processor = self.make_processor()
+        loop_thread = threading.get_ident()
+
+        def build_output(ret):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return ret
+
+        processor._build_output_from_processor_result = build_output
+        await processor.process_mm_data_async([], None, [1], SimpleNamespace())
 
     async def test_shared_native_processor_is_serialized(self):
         processor = self.make_processor()
@@ -221,8 +294,84 @@ class TestWeLMV4VLMProcessor(unittest.IsolatedAsyncioTestCase):
         if second is not None:
             self.assertEqual(await second, {"input_ids": [2]})
 
+    def test_same_pixels_different_grids_get_distinct_cache_keys(self):
+        wide = _image_item([1, 2, 4])
+        tall = _image_item([1, 4, 2])
+        self.assertEqual(
+            HASH_HELPERS["hash_feature"]([wide.feature]),
+            HASH_HELPERS["hash_feature"]([tall.feature]),
+        )
+        WeLMV4VLMImageProcessor._set_image_cache_hashes([wide, tall])
+        self.assertNotEqual(wide.hash, tall.hash)
+        self.assertNotEqual(wide.pad_value, tall.pad_value)
+        for item in (wide, tall):
+            self.assertEqual(
+                item.pad_value, HASH_HELPERS["_compute_pad_value"](item.hash)
+            )
+
+    def test_identical_pixels_and_grid_reuse_cache_key(self):
+        first = _image_item([1, 2, 4])
+        repeated = _image_item([1, 2, 4], first.feature.clone())
+        repeated.image_grid_thw = repeated.image_grid_thw.to(torch.int32)
+        WeLMV4VLMImageProcessor._set_image_cache_hashes([first, repeated])
+        self.assertEqual(first.hash, repeated.hash)
+        self.assertEqual(first.pad_value, repeated.pad_value)
+        repeated.feature[0, 0] = 1
+        WeLMV4VLMImageProcessor._set_image_cache_hashes([repeated])
+        self.assertNotEqual(first.hash, repeated.hash)
+
+    def test_hash_opt_out_preserves_scheduler_uuid_path(self):
+        item = _image_item([1, 2, 4])
+        item.hash, item.pad_value = 1, 2
+        namespace = WeLMV4VLMImageProcessor._set_image_cache_hashes.__globals__
+        flag = namespace["envs"].SGLANG_MM_SKIP_COMPUTE_HASH
+        with patch.object(flag, "get", return_value=True):
+            WeLMV4VLMImageProcessor._set_image_cache_hashes([item])
+        self.assertIsNone(item.hash)
+        self.assertIsNone(item.pad_value)
+
+    def test_output_hashes_each_expanded_image(self):
+        processor = object.__new__(WeLMV4VLMImageProcessor)
+        processor.FEATURE_NAMES = ["pixel_values"]
+        processor.image_token_id = 154752
+        processor.vision_start_token_id = 7
+        processor.vision_end_token_id = 8
+        bundled = _image_item([1, 2, 4])
+        expanded = [_image_item([1, 2, 4]), _image_item([1, 4, 2])]
+        processor.collect_mm_items_from_processor_output = Mock(return_value=[bundled])
+        processor.get_mm_items_offset = Mock(return_value=[(1, 2), (4, 5)])
+        expand = Mock(return_value=expanded)
+        namespace = processor._build_output_from_processor_result.__globals__
+        with patch.dict(
+            namespace,
+            {
+                "Modality": SimpleNamespace(IMAGE="image"),
+                "get_new_expanded_mm_items": expand,
+                "MultimodalProcessorOutput": SimpleNamespace,
+            },
+        ):
+            result = processor._build_output_from_processor_result(
+                {
+                    "input_ids": torch.tensor([[1, 154752, 154752, 2, 154752, 154752]]),
+                    "pixel_values": torch.zeros(16, 3),
+                }
+            )
+        expand.assert_called_once_with([bundled])
+        self.assertIsNone(bundled.hash)
+        self.assertIs(result.mm_items, expanded)
+        self.assertNotEqual(expanded[0].hash, expanded[1].hash)
+        self.assertNotEqual(expanded[0].pad_value, expanded[1].pad_value)
+
+    async def test_text_without_images_does_not_reject_external_hash_field(self):
+        processor = self.make_processor()
+        await processor.process_mm_data_async(
+            [], None, [1], SimpleNamespace(mm_hashes=["unused"])
+        )
+        processor._processor.resolve_tokenized_multimodal_inputs.assert_called_once()
+
     async def test_unsupported_media_fail_before_native_processing(self):
         cases = (
+            (["image"], None, SimpleNamespace(mm_hashes=["00"]), "mm_hashes"),
             ([], None, SimpleNamespace(video_data=["video.mp4"]), "video and audio"),
             ([], ["audio.wav"], SimpleNamespace(), "video and audio"),
             (

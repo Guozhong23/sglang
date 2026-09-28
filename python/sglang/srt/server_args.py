@@ -5072,7 +5072,7 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         if model_arch == "WeLMV4VLMForConditionalGeneration":
-            self._handle_welm_vlm_basic_mode()
+            self._handle_welm_vlm_adjustments()
 
         if model_arch in (
             "WeLMV4MoeForCausalLM",
@@ -5831,45 +5831,72 @@ class ServerArgs:
             & set(getattr(draft_config, "architectures", None) or [])
         )
 
-    def _handle_welm_vlm_basic_mode(self) -> None:
-        """Keep the initial VL port on the ordinary BF16 TP execution path."""
+    def _handle_welm_vlm_adjustments(self) -> None:
+        """Use WeLM's BF16 text optimizations after eager image embedding."""
         unsupported = []
         for enabled, option in (
             (self.speculative_algorithm, "speculative decoding / MTP"),
             (self.enable_dp_attention, "--enable-dp-attention"),
             (self.mm_enable_dp_encoder, "--mm-enable-dp-encoder"),
-            (self.encoder_only or self.language_only, "encoder/language-only deployment"),
+            (
+                self.encoder_only or self.language_only,
+                "encoder/language-only deployment",
+            ),
             (self.disaggregation_mode != "null", "PD disaggregation"),
             (self.enable_pdmux, "--enable-pdmux"),
             (self.pp_size != 1, "pipeline parallelism"),
-            (self.ep_size != 1 or self.moe_a2a_backend != "none", "expert parallelism"),
-            (self.quantization is not None, "quantized weights"),
+            (
+                self.moe_a2a_backend not in ("none", "deepep"),
+                "MoE backends other than none/deepep",
+            ),
+            (self.quantization is not None, "quantized VL weights"),
             (self.dtype not in ("auto", "bfloat16"), "a dtype other than bfloat16"),
-            (envs.WELM_NPU_USE_MEGAMOE.get(), "WELM_NPU_USE_MEGAMOE"),
             (envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get(), "SGLANG_VIT_ENABLE_CUDA_GRAPH"),
         ):
             if enabled:
                 unsupported.append(option)
         if unsupported:
             raise ValueError(
-                "WeLM-VL basic adaptation supports BF16, ordinary tensor parallelism "
-                "and a combined vision/language server. Not yet supported: "
-                + ", ".join(unsupported)
-                + ". Use examples/runtime/welm_vl/run_950pr.sh for the baseline."
+                "WeLM-VL supports BF16 combined vision/language serving with "
+                "ordinary attention TP, optional DeepEP and WeLM prefill MegaMoE. "
+                "Not yet supported: " + ", ".join(unsupported) + "."
             )
         if self.enable_multimodal is False:
             raise ValueError("WeLM-VL requires --enable-multimodal.")
         self.enable_multimodal = True
-        # These are deliberately not advertised as working until image/OE cache
-        # lifetimes and captured multimodal buffers have separate NPU coverage.
-        self.cuda_graph_config.decode.backend = Backend.DISABLED
+        # Only the text decode forward is captured. Vision encoding and image/OE
+        # embedding assembly remain eager; cached/chunked requests retain their
+        # image hashes while NgramEmbeddingManager stores logical image IDs.
         self.cuda_graph_config.prefill.backend = Backend.DISABLED
-        self.chunked_prefill_size = -1
-        self.disable_radix_cache = True
         logger.info(
-            "WeLM-VL basic mode: graph capture, chunked prefill and radix cache "
-            "are disabled; the model's OE and target-layer KV mirrors remain active."
+            "WeLM-VL: eager vision/prefill, with text decode graph, chunked "
+            "prefill and radix cache following the requested server settings."
         )
+
+    def _validate_welm_vlm_parallel_config(self) -> None:
+        """Validate after DeepEP has resolved its EP size to the TP size."""
+        view = resolved_view(self)
+        if view.moe_a2a_backend not in ("none", "deepep"):
+            raise ValueError(
+                "WeLM-VL requires the resolved MoE backend to be none or deepep; "
+                f"got {view.moe_a2a_backend!r}."
+            )
+        if view.moe_a2a_backend == "none" and view.ep_size != 1:
+            raise ValueError("WeLM-VL with moe-a2a-backend=none requires EP=1.")
+        if view.moe_a2a_backend == "deepep" and (
+            view.ep_size != view.tp_size or self.moe_dp_size != 1
+        ):
+            raise ValueError("WeLM-VL DeepEP requires EP=TP and moe-dp-size=1.")
+        if envs.WELM_NPU_USE_MEGAMOE.get() and (
+            view.moe_a2a_backend != "deepep"
+            or view.ep_size <= 1
+            or view.ep_size != view.tp_size
+        ):
+            raise ValueError(
+                "WeLM-VL WELM_NPU_USE_MEGAMOE requires --moe-a2a-backend deepep "
+                "and EP=TP>1. MegaMoE accelerates eligible prefill layers; "
+                "decode and mirror consumers keep the DeepEP path."
+            )
 
     def _validate_welm_dp_attention_capabilities(self) -> None:
         """Validate only startup facts needed by the WeLM NPU DP executor.
@@ -5886,6 +5913,9 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         architectures = getattr(hf_config, "architectures", None) or []
+        if architectures and architectures[0] == "WeLMV4VLMForConditionalGeneration":
+            self._validate_welm_vlm_parallel_config()
+            return
         if not architectures or architectures[0] != "WeLMV4MoeForCausalLM":
             return
 

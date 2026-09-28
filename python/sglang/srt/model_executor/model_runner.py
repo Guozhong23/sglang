@@ -1109,8 +1109,10 @@ class ModelRunner:
             or self.dtype != torch.bfloat16
             or self.ps.moe_ep_size <= 1
             or get_parallel().moe_tp_size != 1
-            or "WeLMV4MoeForCausalLM"
-            not in (self.model_config.hf_config.architectures or [])
+            or not any(
+                arch in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration")
+                for arch in (self.model_config.hf_config.architectures or [])
+            )
         ):
             return
         from sglang.srt.hardware_backend.npu.moe.welmv4_megamoe import (

@@ -1,4 +1,4 @@
-"""BF16/MXFP8 MegaMoE for WeLM ordinary-prefill EP shards.
+"""BF16/MXFP8 MegaMoE for WeLM ordinary-prefill EP shards, not a global backend.
 
 The target runner creates one registered buffer before KV-cache sizing. All
 eligible layers share it; decode, mirror consumers and NextN keep their backend.
@@ -64,6 +64,14 @@ def _weight_mode(experts) -> Optional[str]:
         experts.w13_weight.dtype == torch.float8_e4m3fn
         and experts.w2_weight.dtype == torch.float8_e4m3fn
         and getattr(experts, "_npu_megamoe_weights_processed", False)
+        and all(
+            getattr(
+                getattr(experts, f"{prefix}_kernel", None),
+                "use_megamoe_canonical_layout",
+                False,
+            )
+            for prefix in ("w13", "w2")
+        )
         and getattr(experts, "w13_weight_scale", None) is not None
         and getattr(experts, "w2_weight_scale", None) is not None
     ):
@@ -97,7 +105,7 @@ def _validate_nd_tensors(experts, mode: str) -> None:
 
 
 class WelmPrefillMegaMoE:
-    def __init__(self, group, *, config, device, weight_mode: str):
+    def __init__(self, group, *, config, device, weight_mode: str = _MODE_BF16):
         from npu_ops_transformer.ops.mega_moe import (
             get_symm_buffer_for_mega_moe,
             mega_moe,
@@ -109,6 +117,9 @@ class WelmPrefillMegaMoE:
             configured_rows if configured_rows > 0 else _MAX_LOCAL_ROWS
         )
         self.weight_mode = weight_mode
+        self.prefill_token_threshold = (
+            envs.WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD.get()
+        )
         self._mega_moe = mega_moe
         self._closed = False
         # SymmBuffer queries the name with init_comm=False. Initialize on every
@@ -144,6 +155,15 @@ class WelmPrefillMegaMoE:
             "Initialized WeLM prefill MegaMoE sidecar: mode=%s max_local_rows=%d",
             weight_mode,
             self.max_local_rows,
+        )
+
+    def meets_prefill_threshold(self, num_tokens: int) -> bool:
+        # Use padded OProj rows before attention-TP ReduceScatter, not local
+        # MoE rows or a sequence length including cached prefixes. All ranks
+        # must make the same collective/backend choice, including empty shards.
+        return (
+            self.prefill_token_threshold <= 0
+            or num_tokens > self.prefill_token_threshold
         )
 
     def can_run(self, num_rows: int, layer_id: Optional[int] = None) -> bool:
@@ -190,9 +210,10 @@ class WelmPrefillMegaMoE:
             weights[num_valid_rows:].zero_()
         operator_args = {}
         if self.weight_mode == _MODE_MXFP8:
-            if not getattr(experts, "_npu_megamoe_weights_processed", False):
+            if _weight_mode(experts) != _MODE_MXFP8:
                 raise RuntimeError(
-                    "WeLM MXFP8 MegaMoE weights were not prepared in ND layout."
+                    "WeLM MXFP8 MegaMoE weights/scales were not prepared in "
+                    "canonical ND layout for both expert projections."
                 )
             operator_args.update(
                 scales=None,

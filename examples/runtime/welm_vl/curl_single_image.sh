@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${IMAGE_PATH:?Set IMAGE_PATH to a small local JPEG or PNG image}"
+IMAGE_PATH=${IMAGE_PATH:-/data2/hw_sgz/welm/01_scripts/dog.png}
 PYTHON_BIN=${PYTHON_BIN:-python3}
-SGLANG_URL=${SGLANG_URL:-http://127.0.0.1:6677}
+SGLANG_URL=${SGLANG_URL:-http://127.0.0.1:7788}
 request_file=$(mktemp)
 response_file=$(mktemp)
 trap 'rm -f -- "$request_file" "$response_file"' EXIT

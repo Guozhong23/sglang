@@ -7,11 +7,16 @@ real PyTorch arithmetic; the text model is replaced only for wrapper contracts.
 
 import ast
 import copy
+import dataclasses
+import logging
 import importlib.util
 import os
 import runpy
+import sys
+import types
+import weakref
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -332,6 +337,329 @@ def test_images_with_external_embeddings_fail_instead_of_skipping_vision():
             batch,
             input_embeds=torch.zeros(1, 4),
         )
+
+
+_MM_CHUNK_DEFINITIONS = {
+    "get_embedding_chunk", "_get_precomputed_embedding", "_flatten_embedding_result",
+    "_can_skip_pre_embed_feature_move", "_move_items_to_device",
+    "_acknowledge_deferred_cuda_ipc_cache_hits", "_get_chunked_embedding_full",
+    "PerImageRequestInfo", "_batch_encode_per_image_misses",
+    "_get_chunked_embedding_by_item", "_assemble_per_image_chunk",
+    "_get_chunked_prefill_embedding", "_get_multimodal_mask",
+    "_adjust_embedding_length", "get_embedding_and_mask",
+}
+
+
+def _load_real_mm_chunk_cache(cache_bytes):
+    """Keep production slicing/LRU code; isolate serving imports and NPU I/O."""
+    cache_path = ROOT / "python/sglang/srt/mem_cache/multimodal_cache.py"
+    cache_tree = ast.parse(cache_path.read_text())
+    cache_tree.body = [
+        node for node in cache_tree.body
+        if not (isinstance(node, ast.ImportFrom) and node.module.startswith("sglang."))
+    ]
+    future = ast.parse("from __future__ import annotations").body[0]
+    cache_tree.body.insert(0, future)
+    cache_module = types.ModuleType("_welm_vlm_test_real_cache")
+    sys.modules[cache_module.__name__] = cache_module
+    exec(compile(cache_tree, str(cache_path), "exec"), cache_module.__dict__)
+    cache = cache_module.MultiModalStaticCache(cache_bytes)
+
+    mm_path = ROOT / "python/sglang/srt/managers/mm_utils.py"
+    mm_tree = ast.parse(mm_path.read_text())
+    mm_tree.body = [future] + [
+        node for node in mm_tree.body
+        if getattr(node, "name", None) in _MM_CHUNK_DEFINITIONS
+    ]
+    mm_module = types.ModuleType("_welm_vlm_test_real_mm_utils")
+    sys.modules[mm_module.__name__] = mm_module
+    # Select the actual per-image NPU branch; only stream synchronization and
+    # pixel transfer are stand-ins, so all tests still use real CPU tensors.
+    torch_proxy = SimpleNamespace(
+        **{key: value for key, value in vars(torch).items() if key != "npu"},
+        npu=SimpleNamespace(
+            current_stream=lambda: SimpleNamespace(synchronize=lambda: None)
+        ),
+    )
+    mm_module.__dict__.update(
+        torch=torch_proxy,
+        dataclass=dataclasses.dataclass,
+        field=dataclasses.field,
+        embedding_cache=cache,
+        EmbeddingResult=cache_module.EmbeddingResult,
+        MultiModalStaticCache=cache_module.MultiModalStaticCache,
+        EVSEmbeddingResult=type("UnsupportedEVS", (), {}),
+        _is_npu=True,
+        _is_hip=False,
+        logger=logging.getLogger(__name__),
+        get_parallel=lambda: SimpleNamespace(attn_tp_rank=0, tp_size=4),
+        get_schedule=lambda: SimpleNamespace(chunked_prefill_size=4),
+    )
+    exec(compile(mm_tree, str(mm_path), "exec"), mm_module.__dict__)
+    moved_storage = []
+
+    def move_pixels(items, device):
+        # Match _move_items_to_device's mutation and new-storage contract on
+        # CPU. Weak refs prove the temporary storage is not retained by Req.
+        for item in items:
+            item.feature = item.feature.clone()
+            moved_storage.append(weakref.ref(item.feature))
+
+    mm_module._move_items_to_device = move_pixels
+    return mm_module, cache, moved_storage
+
+
+class _CacheTestEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+        self.fail = False
+
+    def forward(self, pixels, grid):
+        self.calls.append((pixels.clone(), grid.clone()))
+        if self.fail:
+            raise RuntimeError("injected vision encoding failure")
+        # The real ViT's numerical operations have separate tests above. Here
+        # each pixel row represents one output embedding with a unique value.
+        return pixels
+
+
+def _make_chunk_cache_wrapper(cache_bytes=4096):
+    wrapper, _ = _make_wrapper()
+    encoder = _CacheTestEncoder()
+    wrapper.vision_encoder = encoder
+    wrapper.vision_projector = nn.Identity()
+    embedding = nn.Embedding(100, 4)
+    embedding.weight.data.fill_(2)
+    oe = Mock(side_effect=lambda ids, batch, base: base + 10)
+    wrapper.model = SimpleNamespace(
+        embed_tokens=embedding, oe_grams=[2, 2, 3, 3], _compute_oe_embedding=oe
+    )
+    mm_module, cache, moved = _load_real_mm_chunk_cache(cache_bytes)
+    wrapper._get_image_embedding_and_mask.__func__.__globals__[
+        "get_embedding_and_mask"
+    ] = mm_module.get_embedding_and_mask
+    return wrapper, encoder, oe, cache, moved
+
+
+def _cache_test_image(pad, start, rows, value):
+    pixels = (
+        torch.arange(value, value + rows).float().unsqueeze(1).expand(-1, 4).clone()
+    )
+    return SimpleNamespace(
+        pad_value=pad,
+        hash=pad,
+        offsets=[(start, start + rows - 1)],
+        feature=pixels,
+        original_cpu_feature=pixels,
+        image_grid_thw=torch.tensor([[1, 2, rows * 2]]),
+        precomputed_embeddings=None,
+        is_image=lambda: True,
+        acknowledge_deferred_cuda_ipc_feature=lambda count: None,
+    )
+
+
+def _chunk_forward(
+    wrapper, tokens, items, prefix, *, decode=False, ngram_table=None
+):
+    mm = SimpleNamespace(mm_items=items)
+    batch = SimpleNamespace(
+        mm_inputs=[mm], input_embeds=None,
+        ngram_embedding_info=(
+            object() if ngram_table is None else SimpleNamespace(
+                token_table=ngram_table,
+                req_lens=torch.tensor([len(tokens)], dtype=torch.int32),
+                column_starts=torch.tensor([prefix], dtype=torch.int32),
+            )
+        ),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0]),
+        num_token_non_padded_cpu=len(tokens),
+        extend_start_loc=torch.tensor([0]),
+        extend_prefix_lens_cpu=[prefix], extend_seq_lens_cpu=[len(tokens)],
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: decode, is_target_verify=lambda: False
+        ),
+        contains_image_inputs=lambda: bool(items),
+    )
+    result = wrapper.forward(
+        torch.tensor(tokens), torch.arange(prefix, prefix + len(tokens)), batch
+    )
+    return result, batch
+
+
+def _assert_retained_cpu_pixels(*items):
+    for item in items:
+        assert item.feature is item.original_cpu_feature
+        assert item.feature.device.type == "cpu"
+
+
+def test_real_cache_chunks_cross_image_boundaries_and_decode_keeps_cpu_pixels():
+    wrapper, encoder, oe, cache, moved = _make_chunk_cache_wrapper()
+    first = _cache_test_image(100001, 1, 3, 100)
+    second = _cache_test_image(100002, 5, 3, 200)
+    prompt = [1, first.pad_value, first.pad_value, first.pad_value, 2,
+              second.pad_value, second.pad_value, second.pad_value, 3]
+    expected = [12, 100, 101, 102, 12, 200, 201, 202, 12]
+    for prefix, length in ((0, 2), (2, 4), (6, 3)):
+        result, batch = _chunk_forward(
+            wrapper, prompt[prefix:prefix + length], [first, second], prefix
+        )
+        assert result["skip_oe_fusion"] is True
+        torch.testing.assert_close(
+            result["input_embeds"][:, 0],
+            torch.tensor(expected[prefix:prefix + length]).float(),
+        )
+        assert batch.mm_inputs is None
+        _assert_retained_cpu_pixels(first, second)
+        assert all(ref() is None for ref in moved)
+    assert oe.call_count == 3
+    assert len(encoder.calls) == 2
+    assert cache.has(first.hash) and cache.has(second.hash)
+    decoded, _ = _chunk_forward(wrapper, [9], [first, second], len(prompt), decode=True)
+    assert decoded["input_embeds"] is None
+    assert "skip_oe_fusion" not in decoded
+    assert oe.call_count == 3 and len(encoder.calls) == 2
+    _assert_retained_cpu_pixels(first, second)
+
+
+@pytest.mark.parametrize("prefix", [2, 4])
+@pytest.mark.parametrize("warm_embedding_cache", [False, True])
+def test_real_cache_prefix_hit_inside_or_after_image(prefix, warm_embedding_cache):
+    wrapper, encoder, oe, _, _ = _make_chunk_cache_wrapper()
+    image = _cache_test_image(100001, 1, 3, 100)
+    prompt = [1, image.pad_value, image.pad_value, image.pad_value, 2, 3]
+    expected = [12, 100, 101, 102, 12, 12]
+    if warm_embedding_cache:
+        _chunk_forward(wrapper, prompt, [image], 0)
+    before = len(encoder.calls)
+    result, _ = _chunk_forward(wrapper, prompt[prefix:], [image], prefix)
+    assert result["skip_oe_fusion"] is True
+    torch.testing.assert_close(
+        result["input_embeds"][:, 0], torch.tensor(expected[prefix:]).float()
+    )
+    expected_extra = int(prefix == 2 and not warm_embedding_cache)
+    assert len(encoder.calls) == before + expected_extra
+    assert oe.call_count == 1 + int(warm_embedding_cache)
+    _assert_retained_cpu_pixels(image)
+
+
+def test_real_lru_eviction_reencodes_next_chunk_from_original_cpu_pixels():
+    # One image embedding fits; the intervening request must evict it.
+    wrapper, encoder, oe, cache, moved = _make_chunk_cache_wrapper(cache_bytes=48)
+    first = _cache_test_image(100001, 1, 3, 100)
+    other = _cache_test_image(100002, 0, 3, 200)
+    _chunk_forward(wrapper, [1, first.pad_value], [first], 0)
+    assert cache.has(first.hash)
+    _chunk_forward(wrapper, [other.pad_value] * 3, [other], 0)
+    assert cache.has(other.hash) and not cache.has(first.hash)
+    result, _ = _chunk_forward(wrapper, [first.pad_value] * 2, [first], 2)
+    torch.testing.assert_close(result["input_embeds"][:, 0], torch.tensor([101., 102.]))
+    assert len(encoder.calls) == 3 and oe.call_count == 3
+    torch.testing.assert_close(encoder.calls[0][0], encoder.calls[2][0])
+    assert cache.has(first.hash) and not cache.has(other.hash)
+    _assert_retained_cpu_pixels(first, other)
+    assert all(ref() is None for ref in moved)
+
+
+def test_real_mm_utils_mixed_text_images_and_nonoverlapping_image_request():
+    wrapper, encoder, oe, _, _ = _make_chunk_cache_wrapper()
+    first = _cache_test_image(100001, 1, 3, 100)
+    second = _cache_test_image(100002, 1, 3, 200)
+    requests = [None, SimpleNamespace(mm_items=[first]),
+                SimpleNamespace(mm_items=[second]), SimpleNamespace(mm_items=[second])]
+    batch = SimpleNamespace(
+        mm_inputs=requests, input_embeds=None, ngram_embedding_info=object(),
+        extend_prefix_lens_cpu=[3, 2, 0, 1], extend_seq_lens_cpu=[2, 2, 1, 2],
+        forward_mode=SimpleNamespace(is_decode=lambda: False),
+        contains_image_inputs=lambda: True,
+    )
+    ids = torch.tensor([11, 12, first.pad_value, first.pad_value, 21,
+                        second.pad_value, second.pad_value])
+    result = wrapper.forward(ids, torch.tensor([3, 4, 2, 3, 0, 1, 2]), batch)
+    torch.testing.assert_close(
+        result["input_embeds"][:, 0],
+        torch.tensor([12.0, 12.0, 101.0, 102.0, 12.0, 200.0, 201.0]),
+    )
+    assert oe.call_count == 1 and result["skip_oe_fusion"] is True
+    assert len(encoder.calls) == 2
+    _assert_retained_cpu_pixels(first, second)
+
+
+def test_vision_failure_restores_pixels_and_next_attempt_can_recompute():
+    wrapper, encoder, _, cache, moved = _make_chunk_cache_wrapper()
+    image = _cache_test_image(100001, 0, 3, 100)
+    encoder.fail = True
+    with pytest.raises(RuntimeError, match="injected vision"):
+        _chunk_forward(wrapper, [image.pad_value], [image], 0)
+    _assert_retained_cpu_pixels(image)
+    assert not cache.has(image.hash)
+    encoder.fail = False
+    result, _ = _chunk_forward(wrapper, [image.pad_value], [image], 0)
+    torch.testing.assert_close(result["input_embeds"][:, 0], torch.tensor([100.]))
+    assert cache.has(image.hash)
+    _assert_retained_cpu_pixels(image)
+
+
+def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
+    backbone_path = ROOT / "python/sglang/srt/models/welmv4.py"
+    tree = ast.parse(backbone_path.read_text())
+    model_class = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Qwen2MoeModel"
+    )
+    oe_method = next(
+        node for node in model_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_compute_oe_embedding"
+    )
+    hash_method = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "hash_input_ids_vectorized"
+    )
+    extracted = ast.Module(
+        body=[ast.parse("from __future__ import annotations").body[0],
+              hash_method, oe_method],
+        type_ignores=[],
+    )
+    namespace = {"torch": torch, "_is_npu": False}
+    exec(compile(extracted, str(backbone_path), "exec"), namespace)
+    wrapper, _, _, _, _ = _make_chunk_cache_wrapper()
+    model = wrapper.model
+    model.vocab_size = 100
+    model.oe_vocab_sizes = [17, 19, 23, 29]
+    # Small deterministic OE tables exercise the production 2/3-gram hash
+    # without allocating the checkpoint's multi-million-row tables.
+    model.oe_embed = [nn.Embedding(size, 1) for size in model.oe_vocab_sizes]
+    for table in model.oe_embed:
+        table.weight.data.copy_(torch.arange(table.num_embeddings).reshape(-1, 1))
+    model.oe_gate_up_proj = lambda values: (values, None)
+    model._compute_oe_embedding = Mock(
+        side_effect=MethodType(namespace["_compute_oe_embedding"], model)
+    )
+    first = _cache_test_image(100001, 1, 3, 100)
+    second = _cache_test_image(100002, 5, 3, 200)
+    prompt = [1, first.pad_value, first.pad_value, first.pad_value, 2,
+              second.pad_value, second.pad_value, second.pad_value, 3]
+    table = torch.tensor([[1, 77, 77, 77, 2, 77, 77, 77, 3]], dtype=torch.int32)
+    full, _ = _chunk_forward(wrapper, prompt, [first, second], 0, ngram_table=table)
+    chunks = []
+    for prefix, length in ((0, 2), (2, 4), (6, 3)):
+        chunk, _ = _chunk_forward(
+            wrapper, prompt[prefix:prefix + length], [first, second], prefix,
+            ngram_table=table,
+        )
+        chunks.append(chunk["input_embeds"])
+        assert chunk["skip_oe_fusion"] is True
+    torch.testing.assert_close(torch.cat(chunks), full["input_embeds"], atol=0, rtol=0)
+    prefix_hit, _ = _chunk_forward(
+        wrapper, prompt[3:], [first, second], 3, ngram_table=table
+    )
+    torch.testing.assert_close(
+        prefix_hit["input_embeds"], full["input_embeds"][3:], atol=0, rtol=0
+    )
+    assert model._compute_oe_embedding.call_count == 5
+    _assert_retained_cpu_pixels(first, second)
 
 
 if __name__ == "__main__":

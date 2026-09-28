@@ -8,7 +8,9 @@ import time
 from typing import Any, List, Union
 
 import torch
-from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items, hash_feature
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.welmv4_vlm import WeLMV4VLMForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -184,6 +186,19 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
         with self._processor_lock:
             return function(*args)
 
+    @staticmethod
+    def _set_image_cache_hashes(mm_items):
+        for item in mm_items:
+            if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+                # Leave UUID generation to the scheduler's existing opt-out.
+                item.hash = item.pad_value = None
+                continue
+            grid = torch.as_tensor(item.image_grid_thw, dtype=torch.int64, device="cpu")
+            # Identical patch pixels can have different spatial layouts. Both
+            # learned positions and vision RoPE depend on the grid, so it must
+            # participate in the embedding-cache and RadixAttention keys.
+            item.set_hash(hash_feature([grid, item.feature]))
+
     def _build_output_from_processor_result(self, ret):
         # CPU patchification and CPU feature transport are shared by the NPU
         # path and the standard MM path; do not use the deprecated device flag.
@@ -199,9 +214,11 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
         token_type_ids = ret.get("mm_token_type_ids")
         if token_type_ids is None:
             token_type_ids = ret.get("token_type_ids")
+        mm_items = get_new_expanded_mm_items(mm_items)
+        self._set_image_cache_hashes(mm_items)
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
-            mm_items=get_new_expanded_mm_items(mm_items),
+            mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
             im_token_id=self.image_token_id,
@@ -217,6 +234,13 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
+        if image_data and getattr(request_obj, "mm_hashes", None):
+            raise ValueError(
+                "WeLM-v4.5-VL does not support caller-supplied mm_hashes yet: "
+                "external image hashes have not been validated to include the "
+                "image grid. Omit mm_hashes so the server computes a key from "
+                "the processed pixels and grid."
+            )
         if (
             getattr(request_obj, "video_data", None)
             or audio_data
@@ -248,4 +272,6 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
             "token_ids" if use_token_ids else "text",
             (time.perf_counter() - entry_time) * 1000,
         )
-        return self._build_output_from_processor_result(ret)
+        # Hashing full-resolution CPU pixels can be expensive; keep it off the
+        # event loop just like the checkpoint's patchification above.
+        return await asyncio.to_thread(self._build_output_from_processor_result, ret)

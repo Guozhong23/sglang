@@ -88,23 +88,29 @@ def welmv4_graph_uses_device_attention_metadata(model_runner: ModelRunner) -> bo
     attribute for ``NPUGraph.update``. AscendAttnBackend refreshes their fixed
     input buffers; FlashAttn also regenerates its schedule inside the graph.
     """
+
     hf_config = model_runner.model_config.hf_config
     architectures = hf_config.architectures or []
     is_nextn = "WeLMV4MoeForCausalLMNextN" in architectures
-    if not (is_nextn or "WeLMV4MoeForCausalLM" in architectures):
+    if not any(
+        arch
+        in (
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4MoeForCausalLMNextN",
+            "WeLMV4VLMForConditionalGeneration",
+        )
+        for arch in architectures
+    ):
         return False
+    hf_config = getattr(model_runner.model_config, "hf_text_config", hf_config)
     if get_bool_env_var("WELM_NPU_USE_FLASH_ATTN", "False"):
         return True
 
     num_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
     layer_offset = (
-        int(getattr(hf_config, "num_target_hidden_layers", 0) or 0)
-        if is_nextn
-        else 0
+        int(getattr(hf_config, "num_target_hidden_layers", 0) or 0) if is_nextn else 0
     )
-    sink_flags = list(
-        getattr(hf_config, "enable_attn_sink_layerwise", []) or []
-    )
+    sink_flags = list(getattr(hf_config, "enable_attn_sink_layerwise", []) or [])
     layer_end = layer_offset + num_layers
     return (
         num_layers > 0
@@ -167,6 +173,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 "Step3p5ForCausalLM",
                 "WeLMV4MoeForCausalLM",
                 "WeLMV4MoeForCausalLMNextN",
+                "WeLMV4VLMForConditionalGeneration",
             )
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )

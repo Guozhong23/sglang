@@ -800,16 +800,33 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         )
         # Third return value is the (possibly pruned) input_ids for EVS.
         # WeLMV4 VLM does not use EVS, so it is safe to discard.
-        embedding, mask, _pruned_ids = get_embedding_and_mask(
-            data_embedding_func=self.get_image_feature,
-            embedding_items=image_items,
-            placeholder_tensor=placeholder_tensor,
-            input_ids=input_ids,
-            items_size=torch.cumsum(items_size, dim=0).tolist(),
-            prefix_length=prefix_lens,
-            extend_length=extend_lens,
-            items_offset_list=items_offsets,
-        )
+        # mm_utils moves cache-miss pixels onto the accelerator by replacing
+        # item.feature *before* calling get_image_feature. Keep the original CPU
+        # storage here: requests survive chunked prefill and decode, while the
+        # embedding cache is best-effort and can evict an image between chunks.
+        # Restoring pixels also on failure avoids retaining request-sized device
+        # allocations without discarding the data needed to recompute a miss.
+        cpu_features = []
+        for item in image_items:
+            feature = getattr(item, "feature", None)
+            if isinstance(feature, torch.Tensor):
+                cpu_features.append(
+                    (item, feature if feature.device.type == "cpu" else feature.cpu())
+                )
+        try:
+            embedding, mask, _pruned_ids = get_embedding_and_mask(
+                data_embedding_func=self.get_image_feature,
+                embedding_items=image_items,
+                placeholder_tensor=placeholder_tensor,
+                input_ids=input_ids,
+                items_size=torch.cumsum(items_size, dim=0).tolist(),
+                prefix_length=prefix_lens,
+                extend_length=extend_lens,
+                items_offset_list=items_offsets,
+            )
+        finally:
+            for item, feature in cpu_features:
+                item.feature = feature
         return embedding, mask
 
     def _build_multimodal_input_embeds(

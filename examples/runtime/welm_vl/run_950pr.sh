@@ -7,27 +7,77 @@ REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python3}
 export PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Start with the ordinary TP path; custom text-model performance switches from
-# an existing shell must not silently change this first VL validation.
-export WELM_NPU_USE_MEGAMOE=0
-export WELM_NPU_USE_FLASH_ATTN=0
-export SGLANG_NPU_WELMV4_USE_FUSED_TOPK=0
-export SGLANG_NPU_WELMV4_FUSED_QKV=0
+TP_SIZE=${TP_SIZE:-4}
+BASE_DEVICE=${BASE_DEVICE:-0}
+WELM_VL_PROFILE=${WELM_VL_PROFILE:-optimized}
+case "${TP_SIZE}" in
+    1|2|4|8) ;;
+    *) echo "WeLM-VL requires TP_SIZE=1, 2, 4 or 8." >&2; exit 2 ;;
+esac
+profile_args=()
+case "${WELM_VL_PROFILE}" in
+    optimized)
+        if [[ ${TP_SIZE} == 1 ]]; then
+            echo "The optimized DeepEP profile requires TP_SIZE=2, 4 or 8; use baseline for TP=1." >&2
+            exit 2
+        fi
+        export WELM_NPU_USE_MEGAMOE=${WELM_NPU_USE_MEGAMOE:-1}
+        export WELM_NPU_USE_FLASH_ATTN=${WELM_NPU_USE_FLASH_ATTN:-1}
+        fused_qkv_default=0
+        if [[ ${TP_SIZE} == 4 ]]; then fused_qkv_default=1; fi
+        export SGLANG_NPU_WELMV4_FUSED_QKV=${SGLANG_NPU_WELMV4_FUSED_QKV:-${fused_qkv_default}}
+        export SGLANG_NPU_USE_MULTI_STREAM=${SGLANG_NPU_USE_MULTI_STREAM:-1}
+        export SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=${SGLANG_DEEPEP_NORMAL_USE_ALLGATHER:-1}
+        export SGLANG_DEEPEP_NORMAL_USE_ALLTOALL=${SGLANG_DEEPEP_NORMAL_USE_ALLTOALL:-0}
+        export SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER=${SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER:-1}
+        export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS=${SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS:-1024}
+        export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS=${SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS:-2}
+        export SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS=${SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS:-1024}
+        export SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS=${SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS:-4}
+        export WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD=${WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD:-0}
+        # Enable only with a custom TopK build supporting unnormalized sigmoid.
+        export SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM=${SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM:-0}
+        CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}
+        MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-16384}
+        MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-32}
+        profile_args+=(--ep-size "${TP_SIZE}" --moe-a2a-backend deepep --deepep-mode auto
+            --enable-kv-mirror --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-16384}"
+            --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-${MAX_RUNNING_REQUESTS}}")
+        ;;
+    baseline)
+        # A reproducible comparison path even when the shell has text tuning set.
+        export WELM_NPU_USE_MEGAMOE=0
+        export WELM_NPU_USE_FLASH_ATTN=0
+        export SGLANG_NPU_WELMV4_FUSED_QKV=0
+        export SGLANG_NPU_USE_MULTI_STREAM=0
+        export SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM=0
+        export SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER=0
+        export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS=0
+        export SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS=0
+        CONTEXT_LENGTH=${CONTEXT_LENGTH:-8192}
+        MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
+        MAX_RUNNING_REQUESTS=1
+        profile_args+=(--ep-size 1 --moe-a2a-backend none
+            --disable-cuda-graph --disable-radix-cache --chunked-prefill-size -1
+            --disable-overlap-schedule)
+        ;;
+    *) echo "Unknown WELM_VL_PROFILE=${WELM_VL_PROFILE}; choose optimized or baseline." >&2; exit 2 ;;
+esac
+
+# Vision/prefill remain eager. The optimized profile permits text decode graphs.
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=0
-export SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER=0
 export ASCEND_USE_FIA=1
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-3000}
 export ACL_DEVICE_SYNC_TIMEOUT=${ACL_DEVICE_SYNC_TIMEOUT:-3000}
 
-TP_SIZE=${TP_SIZE:-4}
-BASE_DEVICE=${BASE_DEVICE:-0}
-preflight=("${SCRIPT_DIR}/check_model.py" "${MODEL_PATH}" --runtime --tp "${TP_SIZE}" --base-device "${BASE_DEVICE}")
+preflight=("${SCRIPT_DIR}/check_model.py" "${MODEL_PATH}" --runtime --tp "${TP_SIZE}" --base-device "${BASE_DEVICE}" --profile "${WELM_VL_PROFILE}")
 extra_args=()
 if [[ -n ${CHAT_TEMPLATE:-} ]]; then
     preflight+=(--chat-template "${CHAT_TEMPLATE}")
     extra_args+=(--chat-template "${CHAT_TEMPLATE}")
 fi
+echo "WeLM-VL profile=${WELM_VL_PROFILE} TP=${TP_SIZE} MegaMoE=${WELM_NPU_USE_MEGAMOE} FlashAttn=${WELM_NPU_USE_FLASH_ATTN} fusedQKV=${SGLANG_NPU_WELMV4_FUSED_QKV}"
 "${PYTHON_BIN}" "${preflight[@]}"
 
 exec "${PYTHON_BIN}" -m sglang.launch_server \
@@ -39,21 +89,15 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
     --device npu \
     --dtype bfloat16 \
     --tp-size "${TP_SIZE}" \
-    --ep-size 1 \
     --base-gpu-id "${BASE_DEVICE}" \
     --attention-backend ascend \
     --mm-attention-backend ascend_attn \
-    --moe-a2a-backend none \
     --enable-multimodal \
     --enable-over-encoding \
-    --context-length "${CONTEXT_LENGTH:-8192}" \
-    --max-prefill-tokens "${MAX_PREFILL_TOKENS:-8192}" \
-    --max-running-requests 1 \
+    --context-length "${CONTEXT_LENGTH}" \
+    --max-prefill-tokens "${MAX_PREFILL_TOKENS}" \
+    --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     --mem-fraction-static "${MEM_FRACTION_STATIC:-0.80}" \
     --page-size 64 \
-    --disable-cuda-graph \
     --disable-prefill-cuda-graph \
-    --disable-radix-cache \
-    --chunked-prefill-size -1 \
-    --disable-overlap-schedule \
-    "${extra_args[@]}" "$@"
+    "${profile_args[@]}" "${extra_args[@]}" "$@"

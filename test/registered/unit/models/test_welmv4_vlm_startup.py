@@ -122,6 +122,8 @@ def _server_args(**changes):
         enable_pdmux=False,
         pp_size=1,
         ep_size=1,
+        tp_size=4,
+        moe_dp_size=1,
         moe_a2a_backend="none",
         quantization=None,
         dtype="bfloat16",
@@ -140,7 +142,7 @@ def _server_args(**changes):
 def _startup_policy(megamoe=False, vit_graph=False):
     return _definitions(
         SRT / "server_args.py",
-        {"_handle_welm_vlm_basic_mode"},
+        {"_handle_welm_vlm_adjustments"},
         {
             "Backend": SimpleNamespace(DISABLED="disabled"),
             "envs": SimpleNamespace(
@@ -149,15 +151,15 @@ def _startup_policy(megamoe=False, vit_graph=False):
             ),
             "logger": logging.getLogger(__name__),
         },
-    )["_handle_welm_vlm_basic_mode"]
+    )["_handle_welm_vlm_adjustments"]
 
 
-def test_basic_startup_keeps_multimodal_and_disables_unvalidated_paths():
+def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings():
     args = _server_args()
     _startup_policy()(args)
     assert args.enable_multimodal
-    assert args.disable_radix_cache and args.chunked_prefill_size == -1
-    assert args.cuda_graph_config.decode.backend == "disabled"
+    assert not args.disable_radix_cache and args.chunked_prefill_size == 4096
+    assert args.cuda_graph_config.decode.backend == "full"
     assert args.cuda_graph_config.prefill.backend == "disabled"
 
 
@@ -172,8 +174,7 @@ def test_basic_startup_keeps_multimodal_and_disables_unvalidated_paths():
         {"disaggregation_mode": "prefill"},
         {"enable_pdmux": True},
         {"pp_size": 2},
-        {"ep_size": 4},
-        {"moe_a2a_backend": "deepep"},
+        {"moe_a2a_backend": "megamoe"},
         {"quantization": "modelslim"},
         {"dtype": "float16"},
         {"enable_multimodal": False},
@@ -184,9 +185,73 @@ def test_basic_startup_rejects_unsupported_combinations(changes):
         _startup_policy()(_server_args(**changes))
 
 
-def test_basic_startup_rejects_inherited_megamoe():
-    with pytest.raises(ValueError, match="WELM_NPU_USE_MEGAMOE"):
-        _startup_policy(megamoe=True)(_server_args())
+def test_startup_defers_ep_validation_until_deepep_resolution():
+    # DeepEP changes EP=1 to EP=TP later in ServerArgs initialization.
+    args = _server_args(moe_a2a_backend="deepep")
+    _startup_policy(megamoe=True)(args)
+    assert args.moe_a2a_backend == "deepep"
+
+
+def _parallel_policy(megamoe=False):
+    return _definitions(
+        SRT / "server_args.py",
+        {"_validate_welm_vlm_parallel_config"},
+        {
+            "resolved_view": lambda args: args,
+            "envs": SimpleNamespace(
+                WELM_NPU_USE_MEGAMOE=SimpleNamespace(get=lambda: megamoe)
+            ),
+        },
+    )["_validate_welm_vlm_parallel_config"]
+
+
+@pytest.mark.parametrize("megamoe", [False, True])
+def test_resolved_deepep_ep_tp_is_accepted(megamoe):
+    _parallel_policy(megamoe)(_server_args(moe_a2a_backend="deepep", ep_size=4))
+
+
+@pytest.mark.parametrize(
+    "changes,megamoe",
+    [
+        ({"ep_size": 4}, False),
+        # An environment override can change the backend after the early policy.
+        ({"moe_a2a_backend": "megamoe"}, False),
+        ({"moe_a2a_backend": "deepep", "ep_size": 2}, False),
+        ({"moe_a2a_backend": "deepep", "ep_size": 4, "moe_dp_size": 2}, False),
+        ({}, True),
+        ({"moe_a2a_backend": "deepep", "ep_size": 1, "tp_size": 1}, True),
+    ],
+)
+def test_resolved_parallel_config_rejects_incompatible_layouts(changes, megamoe):
+    with pytest.raises(ValueError, match="WeLM-VL"):
+        _parallel_policy(megamoe)(_server_args(**changes))
+
+
+def test_explicit_baseline_options_remain_disabled():
+    args = _server_args(chunked_prefill_size=-1, disable_radix_cache=True)
+    args.cuda_graph_config.decode.backend = "disabled"
+    _startup_policy()(args)
+    _parallel_policy()(args)
+    assert args.chunked_prefill_size == -1 and args.disable_radix_cache
+    assert args.cuda_graph_config.decode.backend == "disabled"
+
+
+@pytest.mark.parametrize("native_flash", [False, True])
+def test_decode_graph_uses_nested_vl_text_metadata(native_flash):
+    raw = json.loads(FIXTURE.read_text())
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(**raw),
+        hf_text_config=SimpleNamespace(**raw["text_config"]),
+    )
+    helper = _definitions(
+        SRT / "hardware_backend/npu/graph_runner/npu_graph_runner.py",
+        {"welmv4_graph_uses_device_attention_metadata"},
+        {"ModelRunner": object, "get_bool_env_var": lambda *_: native_flash},
+    )["welmv4_graph_uses_device_attention_metadata"]
+    runner = SimpleNamespace(model_config=model_config)
+    assert helper(runner)
+    model_config.hf_text_config.enable_attn_sink_layerwise[0] = False
+    assert helper(runner) == native_flash
 
 
 def test_basic_startup_rejects_inherited_vision_graphs():

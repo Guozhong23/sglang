@@ -795,6 +795,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
     def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
+        # This describes the logical layout, not just the NPU storage format.
+        # Legacy GMM weights can also be ND while already carrying a transpose.
         self.use_megamoe_canonical_layout = False
         if weight_prefix == "w13":
             self.matmul = GroupedMatmulSwigluQuant()
@@ -862,9 +864,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         if getattr(layer, "_npu_megamoe_weights_processed", False):
             return True
 
-        # MegaMoE''s public tensor contract needs the real torch dtype. Do not
+        # MegaMoE's public tensor contract needs the real torch dtype. Do not
         # use _require_e8m0_dtype() here: on NPU that helper intentionally
-        # returns torch_npu''s integer operator enum for GMM dtype attributes.
+        # returns torch_npu's integer operator enum for GMM dtype attributes.
         e8m0_tensor_dtype = _get_float8_e8m0fnu_dtype()
         if e8m0_tensor_dtype is None:
             raise RuntimeError(
