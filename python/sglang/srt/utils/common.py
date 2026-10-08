@@ -3838,7 +3838,21 @@ def freeze_gc(context: str):
     )
 
 
-def configure_gc_logger():
+_gc_logger_callback = None
+
+
+def configure_gc_logger(*, pd_diagnostics=None):
+    global _gc_logger_callback
+    if pd_diagnostics is not None:
+        from sglang.srt.observability.pd_time_stats import enable_gc_diagnostics
+
+        # Replace only our own callback, never callbacks owned by other libraries.
+        if _gc_logger_callback in gc.callbacks:
+            gc.callbacks.remove(_gc_logger_callback)
+        _gc_logger_callback = enable_gc_diagnostics(pd_diagnostics)
+        return
+    if _gc_logger_callback in gc.callbacks:
+        return
     logger.info("Enable GC Logger")
 
     gc_start_time = {}
@@ -3858,6 +3872,7 @@ def configure_gc_logger():
                 f'{"(LONG GC)" if duration > 0.1 else ""}'
             )
 
+    _gc_logger_callback = gc_callback
     gc.callbacks.append(gc_callback)
 
 

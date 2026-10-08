@@ -465,6 +465,7 @@ def _chunk_forward(
     mm = SimpleNamespace(mm_items=items)
     batch = SimpleNamespace(
         mm_inputs=[mm], input_embeds=None,
+        welm_prefill_oe_ids=None,
         ngram_embedding_info=(
             object() if ngram_table is None else SimpleNamespace(
                 token_table=ngram_table,
@@ -496,6 +497,12 @@ def _assert_retained_cpu_pixels(*items):
 
 def test_real_cache_chunks_cross_image_boundaries_and_decode_keeps_cpu_pixels():
     wrapper, encoder, oe, cache, moved = _make_chunk_cache_wrapper()
+
+
+def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
+    wrapper, _, _, _, _ = _make_chunk_cache_wrapper()
+    _install_real_oe(wrapper.model)
+    model = wrapper.model
     first = _cache_test_image(100001, 1, 3, 100)
     second = _cache_test_image(100002, 5, 3, 200)
     prompt = [1, first.pad_value, first.pad_value, first.pad_value, 2,
@@ -601,17 +608,18 @@ def test_vision_failure_restores_pixels_and_next_attempt_can_recompute():
     _assert_retained_cpu_pixels(image)
 
 
-def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
+def _install_real_oe(model):
     backbone_path = ROOT / "python/sglang/srt/models/welmv4.py"
     tree = ast.parse(backbone_path.read_text())
     model_class = next(
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "Qwen2MoeModel"
     )
-    oe_method = next(
+    oe_methods = [
         node for node in model_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_compute_oe_embedding"
-    )
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("_compute_oe_embedding", "_compute_oe_hashed_ids")
+    ]
     hash_method = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
@@ -619,13 +627,14 @@ def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
     )
     extracted = ast.Module(
         body=[ast.parse("from __future__ import annotations").body[0],
-              hash_method, oe_method],
+              hash_method, *oe_methods],
         type_ignores=[],
     )
     namespace = {"torch": torch, "_is_npu": False}
     exec(compile(extracted, str(backbone_path), "exec"), namespace)
-    wrapper, _, _, _, _ = _make_chunk_cache_wrapper()
-    model = wrapper.model
+    model._compute_oe_hashed_ids = MethodType(
+        namespace["_compute_oe_hashed_ids"], model
+    )
     model.vocab_size = 100
     model.oe_vocab_sizes = [17, 19, 23, 29]
     # Small deterministic OE tables exercise the production 2/3-gram hash
@@ -637,6 +646,12 @@ def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
     model._compute_oe_embedding = Mock(
         side_effect=MethodType(namespace["_compute_oe_embedding"], model)
     )
+
+
+def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
+    wrapper, _, _, _, _ = _make_chunk_cache_wrapper()
+    _install_real_oe(wrapper.model)
+    model = wrapper.model
     first = _cache_test_image(100001, 1, 3, 100)
     second = _cache_test_image(100002, 5, 3, 200)
     prompt = [1, first.pad_value, first.pad_value, first.pad_value, 2,

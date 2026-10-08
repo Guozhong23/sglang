@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.observability.pd_time_stats import timed_send_prepare
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_npu
@@ -1103,6 +1104,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
+    @timed_send_prepare
     def send_kv_chunk(
         self: Scheduler,
         req: Req,

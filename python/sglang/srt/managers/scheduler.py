@@ -1222,7 +1222,19 @@ class Scheduler(
 
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+            pd_diagnostics = None
+            if (
+                get_disagg().disaggregation_mode == "prefill"
+                and self.server_args.enable_request_time_stats_logging
+            ):
+                pd_diagnostics = dict(
+                    role="prefill",
+                    tp_rank=self.ps.attn_tp_rank,
+                    dp_rank=self.ps.attn_dp_rank,
+                    cp_rank=self.ps.attn_cp_rank,
+                    pp_rank=self.ps.pp_rank,
+                )
+            configure_gc_logger(pd_diagnostics=pd_diagnostics)
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -3124,6 +3136,21 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _welm_mixed_decode_kv_tokens(self, running_batch: ScheduleBatch) -> Optional[int]:
+        if not (
+            self.is_mixed_chunk
+            and self.model_config.hf_config.architectures[0]
+            in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration")
+        ):
+            return None
+        live_indices = [
+            i for i, req in enumerate(running_batch.reqs) if not req.finished()
+        ]
+        # Empty scheduler placeholder batches do not own an allocator.
+        if not live_indices:
+            return 0
+        return running_batch.new_tokens_required_next_decode(live_indices)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3206,6 +3233,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            mixed_decode_kv_tokens=self._welm_mixed_decode_kv_tokens(running_batch),
         )
 
         if self.chunked_req is not None:

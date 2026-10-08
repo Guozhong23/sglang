@@ -1279,11 +1279,33 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and is_kv_mirror_prefill
             and forward_batch.welmv4_npu_deepep_full_mirror
         ):
-            # FULL mirror prefill has exactly B valid request rows, with no
-            # padded suffix. Skip the all-false scalar mask without changing
-            # batch metadata or the explicit segmented masks used by DP.
+            # Preserve the original FULL mirror routing policy. Padded graph
+            # Mirror below additionally covers MoE TP; its dummy rows also
+            # use legal routes rather than NORMAL's negative expert IDs.
             num_token_non_padded = None
+        if (
+            _is_npu
+            and forward_batch is not None
+            and forward_batch.welm_prefill_graph is not None
+            and forward_batch.welm_prefill_graph.pad_mirror
+            and forward_batch.welm_prefill_graph_phase == "mirror"
+        ):
+            # Both MoE TP and local EP process all physical Bcap rows with
+            # legal routes. Prompt's TP-local token count is not a request
+            # mask (Bcap can even exceed Tcap). Dummy outputs are trimmed
+            # before the eager LM head; Flash has its own request mask.
+            num_token_non_padded = None
+            valid_row_mask = None
         if use_welm_prefill_megamoe:
+            if forward_batch.welm_prefill_graph is not None:
+                # The CPU real-row count belongs to the capture dummy. Use
+                # the refreshed device scalar for every replay in this bucket.
+                valid_row_mask = (
+                    torch.arange(num_tokens, device=hidden_states.device)
+                    < forward_batch.num_token_non_padded
+                )
+                hidden_states = torch.where(valid_row_mask[:, None], hidden_states, 0)
+                megamoe_num_valid_rows = num_tokens
             if valid_row_mask is None:
                 # Non-DP scattered prefill. The CPU count is still the full
                 # prompt count, unlike the already-localized device scalar.
@@ -1430,7 +1452,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 megamoe_num_valid_rows,
                 # DP clears the final expert+shared output at its transport
                 # boundary; do not clear the expert component a second time.
-                zero_output_padding=valid_row_mask is None,
+                zero_output_padding=(
+                    valid_row_mask is None
+                    or forward_batch.welm_prefill_graph is not None
+                ),
+                valid_row_mask=(
+                    valid_row_mask
+                    if forward_batch.welm_prefill_graph is not None
+                    else None
+                ),
             )
         elif use_welm_local_ep_moe:
             if not self.welm_local_ep_kernel_available:
@@ -2023,6 +2053,21 @@ class Qwen2MoeAttention(nn.Module):
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
 
+    def prepare_graph_mirror_key(self, positions, key, batch):
+        """Prepare the consumer's K in the T graph; Q belongs to the B graph."""
+        if self.k_norm is not None:
+            normalized = mmq_style_k_rms_norm(
+                key.view(key.shape[0], -1, self.head_dim).contiguous(),
+                self.k_norm.weight,
+                self.k_norm.eps,
+            )
+            key.copy_(normalized.view_as(key))
+        self.rotary_emb.forward_npu_single(
+            positions,
+            key,
+            segment_tile_starts=batch.welmv4_rope_segment_tile_starts,
+        )
+
     def _try_npu_fused_qkv(
         self,
         positions: torch.Tensor,
@@ -2043,8 +2088,12 @@ class Qwen2MoeAttention(nn.Module):
             return None
         mode = forward_batch.forward_mode
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        if mode == ForwardMode.EXTEND:
-            if forward_batch.batch_size == 1:
+        if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            if (
+                mode == ForwardMode.EXTEND
+                and forward_batch.batch_size == 1
+                and forward_batch.welm_prefill_graph is None
+            ):
                 # EP's suffix padding need not have the same RoPE as position 0:
                 # its outputs are ignored and its KV writes use the dummy slot.
                 # Only use per-row positions when extrapolating that suffix could
@@ -2080,9 +2129,17 @@ class Qwen2MoeAttention(nn.Module):
         k_cache = k_cache.view(-1, self.head_dim)
         v_cache = v_cache.view(-1, self.head_dim)
         slot_mapping = (
-            backend.forward_metadata.swa_out_cache_loc
-            if backend._is_swa_layer(self.attn)
-            else forward_batch.out_cache_loc
+            (
+                forward_batch.welm_prefill_swa_write_locs
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.welm_prefill_full_write_locs
+            )
+            if forward_batch.welm_prefill_graph is not None
+            else (
+                backend.forward_metadata.swa_out_cache_loc
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.out_cache_loc
+            )
         )
 
         program = _get_welm_fused_qkv_program(
@@ -2161,9 +2218,17 @@ class Qwen2MoeAttention(nn.Module):
         # These are physical slots in this layer's pool, not token positions.
         # The backend has already translated Full -> SWA when needed.
         slots = (
-            backend.forward_metadata.swa_out_cache_loc
-            if backend._is_swa_layer(self.attn)
-            else forward_batch.out_cache_loc
+            (
+                forward_batch.welm_prefill_swa_write_locs
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.welm_prefill_full_write_locs
+            )
+            if forward_batch.welm_prefill_graph is not None
+            else (
+                backend.forward_metadata.swa_out_cache_loc
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.out_cache_loc
+            )
         )
         full_positions = positions.to(torch.int64)
         full_slots = slots.to(torch.int64)
@@ -2173,7 +2238,9 @@ class Qwen2MoeAttention(nn.Module):
         # even though adjacent rank segments need not be globally contiguous.
         # Keep the original FULL padded extent for the table-tail safety check.
         bulk_rope_safe = (
-            forward_batch.batch_size == 1
+            forward_batch.welm_prefill_graph is None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.batch_size == 1
             and forward_batch.extend_prefix_lens_cpu[0] + num_tokens
             <= cos_sin_cache.shape[0]
         )
@@ -2762,9 +2829,14 @@ class Qwen2MoeAttention(nn.Module):
                 mirror_layer_number = self.kv_mirror_imitated_layers[
                     self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
                 ]
-                k, v = KVMirrorManager.get_kv_activation(
-                    mirror_layer_number, clear=self.need_clear_kv_cache
-                )
+                if forward_batch.welm_prefill_graph_phase == "mirror":
+                    # T-row K norm/RoPE and consumer cache writes ran in
+                    # Prompt[T]. Mirror[B] reads only the paged cache.
+                    k = v = None
+                else:
+                    k, v = KVMirrorManager.get_kv_activation(
+                        mirror_layer_number, clear=self.need_clear_kv_cache
+                    )
                 if hasattr(self, "kv_mirror_query_proj"):
                     q, _ = self.kv_mirror_query_proj(hidden_states)
                 elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
@@ -2806,6 +2878,9 @@ class Qwen2MoeAttention(nn.Module):
         )
         enable_npu_gate_alt_stream = (
             _is_npu
+            # Keep the phase-one graph policy: Gate stays on the main stream
+            # after Flash, including when native Flash itself is captured.
+            and forward_batch.welm_prefill_graph is None
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_stream is not None
             and self.gated_self_attention_headwise
@@ -2851,7 +2926,8 @@ class Qwen2MoeAttention(nn.Module):
             # segment metadata.  Speculative, decode, and mirror-consumer paths
             # retain the generic kernel.
             positions_are_contiguous = (
-                forward_batch.batch_size == 1
+                forward_batch.welm_prefill_graph is None
+                and forward_batch.batch_size == 1
                 and forward_batch.forward_mode.is_extend_without_speculative()
             )
             segment_tile_starts = getattr(
@@ -2859,7 +2935,9 @@ class Qwen2MoeAttention(nn.Module):
             )
 
             qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-            if k is None:
+            if forward_batch.welm_prefill_graph_phase == "mirror":
+                q = self.rotary_emb.forward_npu_single(positions, q)
+            elif k is None:
                 # WeLM RoPE updates Q and K in place. They must not alias: passing
                 # Q as both operands would rotate the same storage twice on NPU.
                 unused_key = q.clone()
@@ -2929,14 +3007,25 @@ class Qwen2MoeAttention(nn.Module):
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
-            save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
-            **attn_kwargs,
-        )
+        if forward_batch.welm_prefill_graph is not None:
+            attn_output = forward_batch.welm_prefill_graph.flash(
+                self.attn,
+                q,
+                k,
+                v,
+                mirror=is_kv_mirror_prefill,
+                save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
+                **attn_kwargs,
+            )
+        else:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
+                **attn_kwargs,
+            )
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             if gate is None:
@@ -3478,6 +3567,43 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual=residual,
         )
 
+    def prepare_graph_mirror_input(self, hidden_states, residual, batch, indices):
+        """Run first-consumer norm/AG in T space, select a fixed Bmax handoff."""
+        after_norm = self.ppln and self.layer_id not in self.prenorm_layer_idx
+        scattered = self._use_npu_prefill_deepep_scattered(hidden_states, batch)
+        if scattered:
+            hidden_states, residual = self._npu_prefill_deepep_prepare_attention(
+                hidden_states, residual, residual_after_layernorm=after_norm
+            )
+        elif after_norm:
+            hidden_states, _, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+                residual_after_layernorm=after_norm,
+                clone_fp32_out=True,
+                output_dtype=self.input_layernorm.weight.dtype
+                if hidden_states.dtype == torch.float32
+                else hidden_states.dtype,
+            )
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, residual_after_layernorm=after_norm
+            )
+        if scattered:
+            residual = self._build_kv_mirror_residual_partial(
+                residual,
+                indices,
+                prompt_local_rows=(
+                    hidden_states.shape[0] // get_tensor_model_parallel_world_size()
+                ),
+                mirror_num_real_rows=indices.numel(),
+                mirror_num_padded_rows=indices.numel(),
+                tp_rank=get_parallel().tp_rank,
+            )
+        else:
+            residual = residual.index_select(0, indices)
+        return hidden_states.index_select(0, indices), residual, scattered
+
     def _forward_non_dp(
         self,
         positions: torch.Tensor,
@@ -3506,6 +3632,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         is_first_kv_mirror_consumer = (
             is_kv_mirror_prefill
             and self.layer_id == self.first_target_kv_mirror_layer
+        )
+        split_first = (
+            is_first_kv_mirror_consumer
+            and forward_batch.welm_prefill_graph_phase == "mirror"
         )
         already_full_mirror = (
             is_kv_mirror_prefill
@@ -3543,7 +3673,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (
             input_hidden_is_scattered
             and self.self_attn.use_npu_fused_qkv
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and is_non_consumer_attention_layer
             and not reuse_prefill_mxfp8_input
         ):
@@ -3587,6 +3717,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         enable_npu_weight_prefetch = (
             _is_npu
+            # Phase-one graph prefill does not capture CMO side-stream work.
+            # Leave the existing eager/decode prefetch policy unchanged.
+            and forward_batch.welm_prefill_graph is None
             and hidden_states.shape[0] > 0
             and not is_ordinary_prefill_non_consumer_layer
         )
@@ -3597,7 +3730,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
             prepare_weight_cache(hidden_states, qkv_prefetch_weight)
             qkv_prefetch_started = True
-        if input_hidden_is_scattered:
+        if split_first:
+            # Prompt[T] already performed this norm and any input AllGather.
+            pass
+        elif input_hidden_is_scattered:
             hidden_states, residual = self._npu_prefill_deepep_prepare_attention(
                 hidden_states,
                 residual,
@@ -3638,7 +3774,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
 
         prompt_num_padded_rows = None
-        if is_first_kv_mirror_consumer:
+        if is_first_kv_mirror_consumer and not split_first:
             custom_last_index = getattr(forward_batch, "custom_last_index", None)
             if custom_last_index is None:
                 custom_last_index = (
@@ -3703,7 +3839,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 ),
                 prefill_ag_qkv_slices=prefill_ag_qkv_slices,
             )
-        if is_first_kv_mirror_consumer:
+        if split_first:
+            if forward_batch.welm_prefill_graph.mirror_residual_is_partial:
+                # Keep the exact B-row AR in its original post-OProj position.
+                residual = get_tp_group().all_reduce(residual.contiguous())
+        elif is_first_kv_mirror_consumer:
             mirror_num_real_rows = int(forward_batch.batch_size)
             if forward_batch.custom_last_index.numel() != mirror_num_real_rows:
                 raise RuntimeError(
@@ -3832,7 +3972,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         megamoe = self.mlp.welm_prefill_megamoe
         use_megamoe_prefill = (
             megamoe is not None
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and output_hidden_is_scattered
             # MoE input is already scattered; recover OProj's padded MM rows.
             and megamoe.meets_prefill_threshold(hidden_states.shape[0] * tp_size)
@@ -4090,21 +4230,8 @@ class Qwen2MoeModel(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
-    def _compute_oe_embedding(
-        self,
-        input_ids,
-        forward_batch,
-        base_hidden_states,
-        oe_embed_modules=None,
-        oe_up_proj_module=None,
-    ):
-        """Compute over-encoding embedding and combine with base hidden states.
-        If oe_embed_modules/oe_up_proj_module are None, use the main OE modules."""
-        if oe_embed_modules is None:
-            oe_embed_modules = self.oe_embed
-        if oe_up_proj_module is None:
-            oe_up_proj_module = self.oe_gate_up_proj
-
+    def _compute_oe_hashed_ids(self, input_ids, forward_batch):
+        """Prepare request-dependent OE IDs without embedding/communication."""
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             raise RuntimeError(
@@ -4119,7 +4246,7 @@ class Qwen2MoeModel(nn.Module):
         # belong to a request and therefore must not index the request token
         # table (whose metadata is intentionally empty on that rank).
         if getattr(forward_batch, "_original_batch_size", None) == 0:
-            return base_hidden_states
+            return None
 
         is_nextn_model = bool(getattr(self, "is_nextn_model", False))
         is_frozen_mtp_decode = (
@@ -4153,7 +4280,7 @@ class Qwen2MoeModel(nn.Module):
             else int(num_token_non_padded),
         )
         if history_num_tokens == 0:
-            return base_hidden_states
+            return None
         oe_input_ids = input_ids[:history_num_tokens]
         req_lens = ngram_embedding_info.req_lens
         # Decode CUDA graphs round the batch size up and leave initialized
@@ -4325,13 +4452,44 @@ class Qwen2MoeModel(nn.Module):
                     hash_input_ids_vectorized(input_ids_ngram_tmp)
                 )
 
+        if npu_hashed_ids is not None:
+            return npu_hashed_ids
+        return torch.stack(
+            [
+                input_ids_ngram[self.oe_grams[i] - 2] % vs
+                for i, vs in enumerate(self.oe_vocab_sizes)
+            ]
+        )
+
+    def _compute_oe_embedding(
+        self,
+        input_ids,
+        forward_batch,
+        base_hidden_states,
+        oe_embed_modules=None,
+        oe_up_proj_module=None,
+    ):
+        """Compute over-encoding embedding and combine with base hidden states.
+        If oe_embed_modules/oe_up_proj_module are None, use the main OE modules."""
+        if oe_embed_modules is None:
+            oe_embed_modules = self.oe_embed
+        if oe_up_proj_module is None:
+            oe_up_proj_module = self.oe_gate_up_proj
+
+        prepared_ids = forward_batch.welm_prefill_oe_ids
+        hashed_ids = (
+            prepared_ids
+            if prepared_ids is not None
+            else self._compute_oe_hashed_ids(input_ids, forward_batch)
+        )
+        if hashed_ids is None:
+            return base_hidden_states
+        history_num_tokens = hashed_ids.shape[1]
+        num_tokens = input_ids.numel()
+
         emb_ngram = []
         for i, vs in enumerate(self.oe_vocab_sizes):
-            input_ids_ngram_hashed_tmp = (
-                npu_hashed_ids[i]
-                if npu_hashed_ids is not None
-                else input_ids_ngram[self.oe_grams[i] - 2] % vs
-            )
+            input_ids_ngram_hashed_tmp = hashed_ids[i]
             emb_ngram_tmp = (
                 oe_embed_modules[i].forward_local(input_ids_ngram_hashed_tmp)
                 if _is_npu
@@ -4351,6 +4509,12 @@ class Qwen2MoeModel(nn.Module):
         if history_num_tokens < num_tokens:
             hidden_states = torch.cat(
                 (hidden_states, base_hidden_states[history_num_tokens:]), dim=0
+            )
+        if prepared_ids is not None:
+            # Process fixed Tcap rows. Real T is a device input, not a Python
+            # slice frozen from the dummy request during capture.
+            hidden_states = torch.where(
+                forward_batch.welm_prefill_token_mask[:, None], hidden_states, 0
             )
         return hidden_states
 
@@ -4460,36 +4624,45 @@ class Qwen2MoeModel(nn.Module):
         # must describe only the original request rows: the suffix is ignored
         # by attention and rotating it is both unnecessary and, because its
         # positions are zero-filled, incompatible with contiguous 64-token
-        # tiles.  Prefill NPU Graph is disabled for WeLMv4, so no captured
-        # buffer needs to own this tensor.
-        forward_batch.welmv4_rope_segment_tile_starts = None
-        if _is_npu:
-            rope_num_position_tokens = positions.numel()
-            original_num_tokens = getattr(
-                forward_batch, "_original_num_tokens", None
-            )
-            if (
-                original_num_tokens is not None
-                and 0 <= int(original_num_tokens) <= rope_num_position_tokens
-            ):
-                rope_num_position_tokens = int(original_num_tokens)
-            tile_starts = build_welmv4_rope_segment_tile_starts(
-                forward_batch.extend_seq_lens_cpu,
-                batch_size=forward_batch.batch_size,
-                num_position_tokens=rope_num_position_tokens,
-                ordinary_prefill=(
-                    forward_batch.spec_info is None
-                    and forward_batch.forward_mode
-                    in (ForwardMode.EXTEND, ForwardMode.MIXED)
-                ),
-            )
-            if tile_starts is not None:
-                forward_batch.welmv4_rope_segment_tile_starts = torch.tensor(
-                    tile_starts,
-                    dtype=torch.int32,
-                    device=positions.device,
+        # tiles. Breakable prefill instead receives a runner-owned fixed
+        # tile array refreshed before replay.
+        if forward_batch.welm_prefill_graph is None:
+            forward_batch.welmv4_rope_segment_tile_starts = None
+            if _is_npu:
+                rope_num_position_tokens = positions.numel()
+                original_num_tokens = getattr(
+                    forward_batch, "_original_num_tokens", None
                 )
-        if self.pp_group.is_first_rank:
+                if (
+                    original_num_tokens is not None
+                    and 0 <= int(original_num_tokens) <= rope_num_position_tokens
+                ):
+                    rope_num_position_tokens = int(original_num_tokens)
+                tile_starts = build_welmv4_rope_segment_tile_starts(
+                    forward_batch.extend_seq_lens_cpu,
+                    batch_size=forward_batch.batch_size,
+                    num_position_tokens=rope_num_position_tokens,
+                    ordinary_prefill=(
+                        forward_batch.spec_info is None
+                        and forward_batch.forward_mode
+                        in (ForwardMode.EXTEND, ForwardMode.MIXED)
+                    ),
+                )
+                if tile_starts is not None:
+                    forward_batch.welmv4_rope_segment_tile_starts = torch.tensor(
+                        tile_starts,
+                        dtype=torch.int32,
+                        device=positions.device,
+                    )
+        graph = forward_batch.welm_prefill_graph
+        split_mirror = (
+            graph is not None
+            and graph.prune
+            and forward_batch.welm_prefill_graph_phase == "mirror"
+        )
+        if split_mirror:
+            hidden_states, residual, positions = graph.begin_mirror(forward_batch)
+        elif self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
@@ -4498,10 +4671,21 @@ class Qwen2MoeModel(nn.Module):
             if (
                 not skip_oe_fusion
                 and len(self.oe_grams) > 0
-                and forward_batch.ngram_embedding_info is not None
+                and (
+                    forward_batch.ngram_embedding_info is not None
+                    or forward_batch.welm_prefill_oe_ids is not None
+                )
             ):
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
+                )
+
+            if graph is not None and skip_oe_fusion:
+                # VL composes text/OE/vision before replay. Its body must still
+                # mask every physical padding row, including stale NaNs left
+                # in the shared embedding slot by a previous larger request.
+                hidden_states = torch.where(
+                    forward_batch.welm_prefill_token_mask[:, None], hidden_states, 0
                 )
 
             if self.scale_seq_times > 0:
@@ -4538,7 +4722,17 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
-            for i in range(self.start_layer, self.end_layer):
+            start_layer = graph.first_mirror if split_mirror else self.start_layer
+            for i in range(start_layer, self.end_layer):
+                if (
+                    graph is not None
+                    and graph.prune
+                    and not split_mirror
+                    and i == graph.first_mirror
+                ):
+                    return graph.finish_prompt(
+                        hidden_states, residual, positions, forward_batch
+                    )
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
                         hidden_states + residual

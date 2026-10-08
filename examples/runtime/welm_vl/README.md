@@ -1,10 +1,12 @@
 # WeLM-v4.5-VL：950PR 推理与优化对照
 
-本分支将 [LinyuanLi0046/sglang 的 welmv4 分支](https://github.com/LinyuanLi0046/sglang/tree/welmv4)
-合并至 `728b4b63b6f19c26b0f52c966b45c3c4483cc432`，在其文本主干上适配 VL。
-同步了 MegaMoE 共享专家 gate/up 与 TopK 重叠、小 token 数的执行路径、MXFP8 文本权重处理、工具调用和频率惩罚修复。
-VL 当前使用 BF16：普通 attention TP，可选 DeepEP EP=TP、prefill MegaMoE、原生 FlashAttn、TP4 fused QKV、decode 执行图、分块预填充和 radix cache。
-模型原有 OE 与 48 层主干的 KV mirror 保留；图像 embedding 在 OE 融合后替换，图像缓存键同时包含像素和网格形状。
+本分支在此前 `welmv4@728b4b63b` 的 VL 适配基础上，完整合并了
+[LinyuanLi0046/sglang 的 welmv4-exp 分支](https://github.com/LinyuanLi0046/sglang/tree/welmv4-exp)
+至 `94dc9c8ed1b26af858d2ddb9e2e354f3c10d1564`。
+新增文本 prefill 的 breakable 图、图内原生 FlashAttn、prefill/decode 混合分块，以及未覆盖捕获 bucket 时的完整 eager 回退；既有 MegaMoE、TP4 fused QKV、decode 图和缓存优化保留。
+VL 当前使用 BF16、普通 attention TP，可选 DeepEP EP=TP。48 层主干的 KV mirror 与 OE 语义保留。
+视觉编码、base/OE embedding 融合及图像行替换在图外完成，捕获的文本主干不会再次融合 OE；纯文本和图文请求使用一致的图输入边界。
+图像缓存键同时包含像素和网格形状。
 
 ## 环境与制品
 
@@ -46,7 +48,9 @@ bash examples/runtime/welm_vl/run_950pr.sh 2>&1 | tee welmv45-vl-optimized.log
 | decode 执行图 / radix cache | 开启 | 关闭 |
 | 分块预填充 | 16384 tokens | 关闭 |
 | 最大并发 / context length | 32 / 32768 | 1 / 8192 |
-| 视觉 / prefill 执行图 | 关闭 | 关闭 |
+| 文本 prefill 图 | breakable，需原生 FlashAttn | 关闭 |
+| prefill/decode 混合分块 | 开启，需原生 FlashAttn | 关闭 |
+| 视觉执行图 | 关闭，视觉/OE 在图外执行 | 关闭 |
 
 优化配置尊重显式设置的开关。例如在 DeepEP 配置中逐项关闭自定义优化定位差异：
 
@@ -58,13 +62,62 @@ bash examples/runtime/welm_vl/run_950pr.sh --disable-cuda-graph
 ```
 
 `CONTEXT_LENGTH`、`MAX_PREFILL_TOKENS`、`MAX_RUNNING_REQUESTS`、`CHUNKED_PREFILL_SIZE`、`CUDA_GRAPH_MAX_BS` 和 `MEM_FRACTION_STATIC` 可调整容量。
+`WELM_VL_PREFILL_GRAPH=0` 和 `WELM_VL_MIXED_CHUNK=0` 可独立关闭本次新增优化，用于与此前的优化路径对照。
+显式设置 `WELM_NPU_USE_FLASH_ATTN=0` 时，两者默认也关闭；在 Flash 关闭时显式要求开启它们会提前报错。
 `WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD` 默认 0；设为正数时，仅 padded pre-scatter token 数严格大于该值的 prefill 使用 MegaMoE，其余走已有回退路径。
 共享专家只允许 gate/up 与 TopK 重叠，后续计算在进入 MegaMoE 前完成，保留上游最新执行顺序。
-DeepEP normal 默认 AllGather；若改为 AllToAll，需同时设置 `SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=0`，二者不能同时开启。
+DeepEP normal 默认 AllGather；EP prefill 图要求 AllGather=1、AllToAll=0。
+若在 eager prefill 模式改为 AllToAll，需同时设置 `WELM_VL_PREFILL_GRAPH=0` 和 `SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=0`，两种通信策略不能同时开启。
 
 自定义 TopK 的实际开关是 `SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM`，默认 0；只有确认算子支持模型所需的未归一化 sigmoid 权重时才设置为 1。
 旧的 `SGLANG_NPU_WELMV4_USE_FUSED_TOPK` 没有代码消费者。
 首次图文验证无需 reasoning/tool parser。`../welm_env.sh` 的频率惩罚排除列表来自文本模型部署，需核对 VL tokenizer 的 token ID 后再使用。
+
+## 新增 prefill 优化与已有服务脚本
+
+新图分为按 token 容量捕获的 Prompt[T] 和按请求数捕获的 Mirror[B]，捕获数量是 T bucket 数加 B bucket 数。
+默认 `WELM_VL_PREFILL_TOKEN_BUCKETS="256 512 1024 2048 4096 8192 16384"`（空格分隔），
+`SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES="1,2,4,8"`（逗号分隔）。
+混合分块开启时，请求数可以向上补齐到 B bucket，dummy 行通过 mask 排除；关闭混合分块时保持上游 exact-B 规则。
+任一 token/request bucket 不覆盖当前请求，整段文本主干回退 eager，避免只回放部分图造成 mirror 状态错误。
+默认最大并发为 32，但 B bucket 最大为 8；超过 8 个请求的 batch 回退 eager。可按显存容量将 B 集合扩为 `1,2,4,8,16,32`，代价是增加捕获时间和图内存。
+若旧脚本使用 `CHUNKED_PREFILL_SIZE=16512`，超过默认最大 T bucket `16384` 的实际 forward 同样回退。可先将 chunk 调为 `16384`，或扩大 T bucket；mixed batch 还需考虑 decode token 加入后的总 token 数。
+
+若沿用已有 `runbf16-vlm-mix.sh`，启用本次优化需要在启动服务前设置：
+
+```bash
+export WELM_NPU_USE_FLASH_ATTN=1
+export SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES=1,2,4,8
+```
+
+删除原先的 `--disable-prefill-cuda-graph`，在 `python -m sglang.launch_server` 参数中加入：
+
+```bash
+--cuda-graph-backend-prefill breakable \
+--cuda-graph-bs-prefill 256 512 1024 2048 4096 8192 16384 \
+--enable-mixed-chunk
+```
+
+原先 `WELM_NPU_USE_FLASH_ATTN=0` 的配置不满足 prefill 图条件。
+EP=1 和 DeepEP EP=TP 均有支持路径；EP 图还要求 NORMAL AllGather 及 mirror local-sort/AllReduce。
+保留 `--enable-kv-mirror`、BF16 模型/KV，并使用 PP=CP=DCP=1；attention DP、LoRA、VL 量化和 MTP 不在此次 VL 适配范围。
+使用本仓 `run_950pr.sh` 时，调试可设 `WELM_VL_PREFILL_GRAPH=0`；直接调用 `python -m sglang.launch_server` 的旧脚本应移除新增 prefill 图参数并恢复 `--disable-prefill-cuda-graph`。
+`WELM_VL_PREFILL_GRAPH` / `WELM_VL_MIXED_CHUNK` 仅由本仓 launcher 读取；旧脚本关闭 mixed chunk 时需移除 `--enable-mixed-chunk`。不要将同步式 MegaMoE debug 或 MoE tensor dump 与图捕获混用。
+
+上游 PD 地址组装减少临时对象、GC 诊断和网关改动也保留了原提交历史。
+详细 GC 诊断需要对应开关，网关 early-decode stream 默认关闭；这些改动没有开放 VL 的 PD 分离部署。
+
+使用本仓 launcher 验收时，先用同一图片和相同采样参数比较 `WELM_VL_PREFILL_GRAPH=0 WELM_VL_MIXED_CHUNK=0` 与默认优化配置，
+再覆盖图文/纯文本混合、图片跨 chunk、prefix 命中、不同 T/B bucket，以及超出 bucket 的 eager 回退。
+图捕获成功与性能提升必须在 950PR 实测；单请求不会形成 prefill/decode 混合 batch，验证 mixed chunk 需要并发请求。
+新增底层算子的实机检查入口：
+
+```bash
+python -m pytest -q test/manual/ascend/test_welmv4_prefill_graph_npu.py \
+  test/manual/ascend/test_welmv4_prefill_flash_graph_npu.py
+```
+
+这些小张量 NPU 测试用于检查负 slot KV 写入、Flash 动态长度和 padding，不代替真实 checkpoint 的图文精度验收。
 
 ## 单图验证与对照
 
@@ -145,6 +198,10 @@ NPU 的活动参数在本分支中仍写 `CPU,GPU`，代码会将 GPU 映射到 
 CPU 回归覆盖共享专家执行顺序、MegaMoE 选择与绑定、VL 图元数据、视觉数学、OE 历史、实际 chunk/cache 切片与逐出重算、网格缓存键及启动脚本契约。
 这些测试不能替代完整权重加载、950PR 算子/图捕获、Host 映射、输出精度和吞吐验收。实机失败时保留从首次异常开始的完整日志、实际启动参数、TorchNPU/CANN/算子版本及模型路径。
 
-本次本地验证结果：VL/优化/启动相关 193 项、工具调用与频率惩罚 213 项、RoPE 与 mirror 数学 10 项，共 **416 passed，另 10 个子用例通过**。
+本次 `welmv4-exp@94dc9c8ed` 合入的本地验证结果：18 个 VL/模型/启动/图与 mixed-chunk 测试文件联合 **308 passed、34 subtests passed**；另行执行 4 个 PD/GC/传输地址测试文件 **43 passed、37 subtests passed**，共 **351 passed、71 个子用例通过**。
+这些 CPU 测试执行真实 wrapper/OE/cache/runner 方法及小张量计算，以 mock 替代设备图捕获和大型 transformer；没有验证 NPU kernel 数值。Python 语法、shell 语法及差异空白检查通过。
+完整 SGLang 包导入仍受本地依赖缺失限制，通用 runner 测试未通过收集；本机缺少 `cargo`，随上游合入的 Rust 网关测试未执行。
+
+此前 `welmv4@728b4b63b` 适配的本地验证结果：VL/优化/启动相关 193 项、工具调用与频率惩罚 213 项、RoPE 与 mirror 数学 10 项，共 **416 passed，另 10 个子用例通过**。
 工具测试中 15 项依赖未提供的 DeepSeek tokenizer，已明确排除；完整包的 DeepEP layout/ngram manager/serving chat 测试因缺少 `sentencepiece` 阻断，fused TopK 的 4 项在缺少 `sgl_kernel_npu` 时导入失败，不能算通过或数值回归结论。
 本地只有 VL 配置文件，没有完整 checkpoint 或可用 NPU，因此尚未进行实机服务、curl、精度或性能验收。

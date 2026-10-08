@@ -992,6 +992,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the default full-query path is mathematically equivalent.
     enable_kv_mirror: bool = False
 
+    # Target BF16 breakable prefill only. Tensor storage, including native
+    # Flash metadata, is runner-owned; request history is prepared before replay.
+    welm_prefill_graph: Optional[Any] = None
+    # Capture-only phase selects T-only prompt or B-only mirror model entry.
+    # Prompt and Mirror keep separate Q metadata and share this batch's KV inputs.
+    welm_prefill_graph_phase: Optional[str] = None
+    welm_prefill_oe_ids: Optional[torch.Tensor] = None
+    welm_prefill_token_mask: Optional[torch.Tensor] = None
+    welm_prefill_full_write_locs: Optional[torch.Tensor] = None
+    welm_prefill_swa_write_locs: Optional[torch.Tensor] = None
+
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None

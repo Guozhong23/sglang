@@ -6,6 +6,7 @@ these tests verify admission, buffer arguments and tensor layout without an NPU.
 
 import ast
 import logging
+import runpy
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,10 @@ import torch
 from torch.nn import Parameter
 
 ROOT = Path(__file__).resolve().parents[4]
+register_cpu_ci = runpy.run_path(
+    str(ROOT / "python/sglang/test/ci/ci_register.py")
+)["register_cpu_ci"]
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 SIDECAR = ROOT / "python/sglang/srt/hardware_backend/npu/moe/welmv4_megamoe.py"
 METHODS = ROOT / "python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py"
 
@@ -252,3 +257,68 @@ def test_mxfp8_postprocess_rejects_unsafe_layouts(monkeypatch, malformation):
         layer.w13_weight_scale = layer.w13_weight_scale.float()
     with pytest.raises(RuntimeError):
         cls.maybe_process_megamoe_weights(layer)
+
+
+@pytest.mark.parametrize("mode", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("zero_padding", [False, True])
+def test_graph_mask_tracks_live_rows_across_replays(monkeypatch, mode, zero_padding):
+    _, runtime, vendor = _runtime(monkeypatch, mode=mode)
+    hidden = torch.zeros(4, 4, dtype=torch.bfloat16)
+    experts = _experts(torch.float8_e4m3fn if mode == "mxfp8" else torch.bfloat16)
+    routing = SimpleNamespace(
+        topk_ids=torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]]),
+        topk_weights=torch.full((4, 2), 0.5),
+    )
+    mask = torch.ones(4, dtype=torch.bool)
+    for live in ([True] * 4, [True, False, True, False], [False] * 4, [True] * 4):
+        mask.copy_(torch.tensor(live))
+        raw_output = torch.ones_like(hidden)
+        raw_output[~mask] = float("nan")
+        vendor.mega_moe.return_value = (raw_output, None)
+        output = runtime.forward_layer(
+            experts,
+            hidden,
+            routing,
+            # A capture-time host count must not override the live tensor mask.
+            0,
+            zero_output_padding=zero_padding,
+            valid_row_mask=mask,
+        )
+        args = vendor.mega_moe.call_args
+        ids, weights = args.args[1:3]
+        torch.testing.assert_close(ids, routing.topk_ids.to(torch.int32))
+        torch.testing.assert_close(
+            weights, mask[:, None].expand(4, 2).to(torch.bfloat16) * 0.5
+        )
+        assert torch.all(routing.topk_weights == 0.5)
+        assert torch.all(output[mask] == 1)
+        if zero_padding:
+            assert torch.all(output[~mask] == 0)
+        else:
+            assert torch.all(torch.isnan(output[~mask]))
+        if mode == "mxfp8":
+            assert args.kwargs["l1_weights_sf"][0] is experts.w13_weight_scale
+            assert args.kwargs["l2_weights_sf"][0] is experts.w2_weight_scale
+
+
+def test_graph_mask_preserves_optional_vendor_completion_sync(monkeypatch):
+    _, runtime, vendor = _runtime(
+        monkeypatch, env=_env(SGLANG_NPU_MEGAMOE_SYNC_AFTER_OP=True)
+    )
+    synchronize = Mock()
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=synchronize), raising=False)
+    hidden = torch.ones(2, 4, dtype=torch.bfloat16)
+    routing = SimpleNamespace(
+        topk_ids=torch.tensor([[0, 1], [1, 0]]),
+        topk_weights=torch.full((2, 2), 0.5),
+    )
+    vendor.mega_moe.return_value = (torch.ones_like(hidden), None)
+    output = runtime.forward_layer(
+        _experts(), hidden, routing, 2, valid_row_mask=torch.tensor([True, False])
+    )
+    synchronize.assert_called_once_with()
+    assert not output[1].any()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

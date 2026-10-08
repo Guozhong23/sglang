@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.observability.pd_time_stats import timed_transfer_call
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
 if TYPE_CHECKING:
@@ -233,6 +234,7 @@ class MooncakeTransferEngine:
 
         return ret
 
+    @timed_transfer_call
     def batch_transfer_sync(
         self,
         session_id: str,

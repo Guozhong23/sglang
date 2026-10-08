@@ -111,6 +111,7 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.observability.pd_time_stats import emit, identity
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -2318,6 +2319,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                if (
+                    self.server_args.enable_request_time_stats_logging
+                    and self.server_args.disaggregation_mode in ("prefill", "decode")
+                ):
+                    emit(
+                        "PDRequestStats ",
+                        identity(
+                            self.server_args.disaggregation_mode,
+                            getattr(state.obj, "bootstrap_room", None),
+                            event="tokenizer_first_output",
+                            rid=rid,
+                            api_received_ns=(
+                                int(state.time_stats.created_time * 1e9) or None
+                            ),
+                            first_output_ns=int(state.time_stats.first_token_time * 1e9),
+                            api_first_output_ms=(
+                                state.time_stats.get_first_token_latency() * 1000
+                            ),
+                            completion_tokens=meta_info.get("completion_tokens", 0),
+                        ),
+                    )
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:

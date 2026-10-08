@@ -840,7 +840,9 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         mm_input_indices = [i for i, _ in mm_inputs_with_indices]
         mm_inputs_list = [mm_input for _, mm_input in mm_inputs_with_indices]
         image_items = self._collect_image_items(mm_inputs_list)
-        logical_input_ids = self._logical_input_ids(input_ids, image_items)
+        logical_input_ids = (
+            self._logical_input_ids(input_ids, image_items) if image_items else input_ids
+        )
         input_embeds = self.model.embed_tokens(logical_input_ids)
         # NgramEmbeddingManager stores logical image token IDs in the history
         # table. Compute OE exactly once, then replace only the image rows.
@@ -849,18 +851,19 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
                 logical_input_ids, forward_batch, input_embeds
             )
 
-        image_embedding, image_mask = self._get_image_embedding_and_mask(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            mm_inputs_list=mm_inputs_list,
-            mm_input_indices=mm_input_indices,
-            image_items=image_items,
-        )
-        if image_embedding is not None and image_mask is not None:
-            indices = torch.where(image_mask.squeeze(dim=-1))[0]
-            input_embeds[indices] = image_embedding.to(
-                device=input_embeds.device, dtype=input_embeds.dtype
+        if image_items:
+            image_embedding, image_mask = self._get_image_embedding_and_mask(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                mm_inputs_list=mm_inputs_list,
+                mm_input_indices=mm_input_indices,
+                image_items=image_items,
             )
+            if image_embedding is not None and image_mask is not None:
+                indices = torch.where(image_mask.squeeze(dim=-1))[0]
+                input_embeds[indices] = image_embedding.to(
+                    device=input_embeds.device, dtype=input_embeds.dtype
+                )
 
         if forward_batch.input_embeds is not None:
             forward_batch.input_embeds.copy_(input_embeds)
@@ -881,12 +884,17 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             not forward_batch.forward_mode.is_decode()
             and forward_batch.contains_image_inputs()
         )
-        if has_image_inputs and input_embeds is not None:
+        graph = getattr(forward_batch, "welm_prefill_graph", None)
+        graph_eager_embeddings = graph is not None and graph.eager_input_embeddings
+        if (has_image_inputs or graph_eager_embeddings) and input_embeds is not None:
             raise NotImplementedError(
-                "WeLMV4 VLM cannot combine images with externally supplied "
+                "WeLMV4 VLM cannot combine images or graph prefill with externally supplied "
                 "input embeddings"
             )
-        if has_image_inputs:
+        if has_image_inputs or graph_eager_embeddings:
+            # VL graph capture consumes already fused embeddings. Keep this
+            # boundary fixed for text-only and mixed-chunk requests as well;
+            # replay cannot change the OE branch recorded during capture.
             input_embeds, logical_input_ids = self._build_multimodal_input_embeds(
                 input_ids, forward_batch
             )

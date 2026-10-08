@@ -43,6 +43,41 @@ case "${WELM_VL_PROFILE}" in
         profile_args+=(--ep-size "${TP_SIZE}" --moe-a2a-backend deepep --deepep-mode auto
             --enable-kv-mirror --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-16384}"
             --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-${MAX_RUNNING_REQUESTS}}")
+        # The text prefill graph/mixed layout requires native Flash. Explicit
+        # Flash=0 keeps the previous eager prefill path unless requested otherwise.
+        prefill_default=0
+        if [[ ${WELM_NPU_USE_FLASH_ATTN} == 1 ]]; then prefill_default=1; fi
+        WELM_VL_PREFILL_GRAPH=${WELM_VL_PREFILL_GRAPH:-${prefill_default}}
+        WELM_VL_MIXED_CHUNK=${WELM_VL_MIXED_CHUNK:-${prefill_default}}
+        for flag in WELM_VL_PREFILL_GRAPH WELM_VL_MIXED_CHUNK; do
+            case "${!flag}" in 0|1) ;; *) echo "${flag} must be 0 or 1." >&2; exit 2 ;; esac
+        done
+        if [[ ${WELM_NPU_USE_FLASH_ATTN} != 1 && ( ${WELM_VL_PREFILL_GRAPH} == 1 || ${WELM_VL_MIXED_CHUNK} == 1 ) ]]; then
+            echo "WeLM-VL prefill graph/mixed chunk requires WELM_NPU_USE_FLASH_ATTN=1." >&2
+            exit 2
+        fi
+        if [[ ${WELM_VL_PREFILL_GRAPH} == 1 ]]; then
+            if [[ ${SGLANG_DEEPEP_NORMAL_USE_ALLGATHER} != 1 || ${SGLANG_DEEPEP_NORMAL_USE_ALLTOALL} != 0 ]]; then
+                echo "WeLM-VL DeepEP prefill graph requires NORMAL AllGather=1 and AllToAll=0." >&2
+                exit 2
+            fi
+            read -r -a prefill_tokens <<< "${WELM_VL_PREFILL_TOKEN_BUCKETS:-256 512 1024 2048 4096 8192 16384}"
+            if [[ ${#prefill_tokens[@]} == 0 ]]; then
+                echo "WELM_VL_PREFILL_TOKEN_BUCKETS must contain positive token counts." >&2
+                exit 2
+            fi
+            for size in "${prefill_tokens[@]}"; do
+                if [[ ! ${size} =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Invalid prefill token bucket: ${size}; use space-separated positive integers." >&2
+                    exit 2
+                fi
+            done
+            export SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES=${SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES:-1,2,4,8}
+            profile_args+=(--cuda-graph-backend-prefill breakable --cuda-graph-bs-prefill "${prefill_tokens[@]}")
+        else
+            profile_args+=(--disable-prefill-cuda-graph)
+        fi
+        if [[ ${WELM_VL_MIXED_CHUNK} == 1 ]]; then profile_args+=(--enable-mixed-chunk); fi
         ;;
     baseline)
         # A reproducible comparison path even when the shell has text tuning set.
@@ -57,14 +92,16 @@ case "${WELM_VL_PROFILE}" in
         CONTEXT_LENGTH=${CONTEXT_LENGTH:-8192}
         MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
         MAX_RUNNING_REQUESTS=1
-        profile_args+=(--ep-size 1 --moe-a2a-backend none
+        WELM_VL_PREFILL_GRAPH=0
+        WELM_VL_MIXED_CHUNK=0
+        profile_args+=(--ep-size 1 --moe-a2a-backend none --disable-prefill-cuda-graph
             --disable-cuda-graph --disable-radix-cache --chunked-prefill-size -1
             --disable-overlap-schedule)
         ;;
     *) echo "Unknown WELM_VL_PROFILE=${WELM_VL_PROFILE}; choose optimized or baseline." >&2; exit 2 ;;
 esac
 
-# Vision/prefill remain eager. The optimized profile permits text decode graphs.
+# Vision/base/OE embedding stay eager; supported text bodies use prefill/decode graphs.
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=0
 export ASCEND_USE_FIA=1
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
@@ -77,7 +114,7 @@ if [[ -n ${CHAT_TEMPLATE:-} ]]; then
     preflight+=(--chat-template "${CHAT_TEMPLATE}")
     extra_args+=(--chat-template "${CHAT_TEMPLATE}")
 fi
-echo "WeLM-VL profile=${WELM_VL_PROFILE} TP=${TP_SIZE} MegaMoE=${WELM_NPU_USE_MEGAMOE} FlashAttn=${WELM_NPU_USE_FLASH_ATTN} fusedQKV=${SGLANG_NPU_WELMV4_FUSED_QKV}"
+echo "WeLM-VL profile=${WELM_VL_PROFILE} TP=${TP_SIZE} MegaMoE=${WELM_NPU_USE_MEGAMOE} FlashAttn=${WELM_NPU_USE_FLASH_ATTN} fusedQKV=${SGLANG_NPU_WELMV4_FUSED_QKV} prefillGraph=${WELM_VL_PREFILL_GRAPH} mixedChunk=${WELM_VL_MIXED_CHUNK}"
 "${PYTHON_BIN}" "${preflight[@]}"
 
 exec "${PYTHON_BIN}" -m sglang.launch_server \
@@ -99,5 +136,4 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     --mem-fraction-static "${MEM_FRACTION_STATIC:-0.80}" \
     --page-size 64 \
-    --disable-prefill-cuda-graph \
     "${profile_args[@]}" "${extra_args[@]}" "$@"

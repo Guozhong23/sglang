@@ -185,6 +185,7 @@ def _run_sparse_moe(*, sidecar, multi_stream):
     batch = SimpleNamespace(
         forward_mode=Mode(),
         enable_kv_mirror=False,
+        welm_prefill_graph=None,
         welmv4_npu_deepep_scattered=True,
         welmv4_npu_deepep_full_mirror=False,
         num_token_non_padded=None,

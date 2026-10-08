@@ -106,6 +106,7 @@ from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
 )
+from sglang.srt.observability.pd_time_stats import emit, request_record
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     DPControllerReqTimeStats,
@@ -1738,7 +1739,12 @@ class Req(ReqDllmMixin):
             f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
         )
-        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+        message = f"{prefix}: {self.time_stats.convert_to_duration()}"
+        if self.bootstrap_room is not None:
+            emit("", message)
+            emit("PDRequestStats ", request_record(self, "request_finished"))
+        else:
+            logger.info(message)
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):

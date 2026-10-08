@@ -5078,6 +5078,8 @@ class ServerArgs:
             "WeLMV4MoeForCausalLM",
             "WeLMV4VLMForConditionalGeneration",
         ):
+            import torch
+
             welm_text_config = self.get_model_config().hf_text_config
             raw_spec_algorithm = (self.speculative_algorithm or "").upper()
             if (
@@ -5117,10 +5119,30 @@ class ServerArgs:
                     "TRT-LLM MHA, or Ascend as appropriate for the device."
                 )
 
-            # The model keeps imitated-layer KV activations in process-local
-            # forward state, so mixed chunks and two-batch overlap would
-            # interleave two independent requests through the same state.
-            self.enable_mixed_chunk = False
+            # Mixed chunk is one ragged forward, not two interleaved forwards.
+            # Only the native BF16 Flash path has unified prefill/decode Q/KV
+            # lengths, positions and OE history handling.
+            if self.enable_mixed_chunk and not (
+                is_npu()
+                and os.environ.get("WELM_NPU_USE_FLASH_ATTN", "0") == "1"
+                and not self.enable_dp_attention
+                and self.pp_size == 1
+                and self._resolved().attn_cp_size == 1
+                and self.dcp_size == 1
+                and self.get_model_config().dtype == torch.bfloat16
+                and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+                and self.quantization is None
+                and not self.enable_lora
+                and not raw_spec_algorithm
+            ):
+                logger.warning(
+                    "WeLMv4 mixed chunk requires native NPU Flash, BF16 model/KV, "
+                    "DP attention off, PP=CP=DCP=1, no quantization/LoRA or "
+                    "speculative decoding. Disabling --enable-mixed-chunk."
+                )
+                self.enable_mixed_chunk = False
+            # KV activations are process-local: independent forward passes
+            # still cannot interleave through TBO or PDMux.
             self.enable_two_batch_overlap = False
             if self.enable_pdmux:
                 raise ValueError(
@@ -5148,18 +5170,34 @@ class ServerArgs:
                     "CUDA implementation."
                 )
                 self.cuda_graph_config.decode.backend = Backend.FULL
-            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            welm_bf16_breakable = (
+                is_npu()
+                and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+                and not self.enable_dp_attention
+                and self._resolved().attn_cp_size == 1
+                and self.dcp_size == 1
+                and self.dtype in ("auto", "bfloat16")
+                and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+                and self.quantization is None
+                and not self.enable_lora
+                and os.environ.get("WELM_NPU_USE_FLASH_ATTN", "0") == "1"
+            )
+            if (
+                self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and not welm_bf16_breakable
+            ):
                 logger.warning(
-                    "Prefill CUDA Graph is disabled for WeLMv4 because the "
-                    "latest prefill graph buffers do not yet carry its request "
-                    "ngram token-table metadata. Decode CUDA Graph remains enabled."
+                    "WeLMv4 prefill graph requires NPU breakable, BF16 model/KV, "
+                    "DP attention off, CP=DCP=1, no LoRA/quantization and "
+                    "WELM_NPU_USE_FLASH_ATTN=1. Disabling this unsupported "
+                    "prefill profile; decode graph settings are unchanged."
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             if is_npu() and self.cuda_graph_config.decode.backend != Backend.DISABLED:
                 logger.info(
                     "Decode NPU Graph is enabled for WeLMv4. Spec V2 MTP "
-                    "uses the WeLM Triton attention path. Torch Compile and "
-                    "Prefill NPU Graph remain disabled."
+                    "uses the WeLM Triton attention path. Torch Compile "
+                    "remains disabled; prefill follows its configured backend."
                 )
             if self.enable_over_encoding:
                 if is_npu() and self.load_format == "dummy":
@@ -5864,13 +5902,12 @@ class ServerArgs:
         if self.enable_multimodal is False:
             raise ValueError("WeLM-VL requires --enable-multimodal.")
         self.enable_multimodal = True
-        # Only the text decode forward is captured. Vision encoding and image/OE
-        # embedding assembly remain eager; cached/chunked requests retain their
-        # image hashes while NgramEmbeddingManager stores logical image IDs.
-        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        # The WeLM graph policy below validates the requested text prefill
+        # backend. VL prepares vision/base/OE embeddings eagerly before replay;
+        # neither image hashes nor a second OE fusion enter the captured body.
         logger.info(
-            "WeLM-VL: eager vision/prefill, with text decode graph, chunked "
-            "prefill and radix cache following the requested server settings."
+            "WeLM-VL: eager vision/OE embeddings; text prefill/decode graphs, "
+            "mixed chunk and radix cache follow the supported server settings."
         )
 
     def _validate_welm_vlm_parallel_config(self) -> None:

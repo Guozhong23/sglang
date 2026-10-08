@@ -4,12 +4,14 @@ import ast
 import importlib.util
 import json
 import logging
+import os
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
+import torch
 
 # Load the CPU-only CI marker without importing sglang's serving dependencies.
 register_cpu_ci = runpy.run_path(
@@ -53,6 +55,8 @@ def _model_helpers():
             "MIMO_V2_MODEL_ARCHS",
             "MIMO_V2_MULTIMODAL_ARCHS",
             "multimodal_model_archs",
+            "multimodal_breakable_cuda_graph_supported_model_archs",
+            "is_multimodal_breakable_cuda_graph_supported",
             "is_multimodal_model",
             "is_hybrid_swa_model",
             "_detect_attention_sinks",
@@ -69,6 +73,7 @@ def test_real_checkpoint_multimodal_sinks_and_48_layer_windows():
     text = SimpleNamespace(**raw["text_config"])
     helpers = _model_helpers()
     assert helpers["is_multimodal_model"]([ARCH])
+    assert helpers["is_multimodal_breakable_cuda_graph_supported"]([ARCH])
     assert helpers["is_hybrid_swa_model"]([ARCH], text)
     model = SimpleNamespace(hf_config=SimpleNamespace(**raw), hf_text_config=text)
     assert helpers["_detect_attention_sinks"](model)
@@ -128,15 +133,23 @@ def _server_args(**changes):
         quantization=None,
         dtype="bfloat16",
         enable_multimodal=None,
+        enable_mixed_chunk=True,
+        dcp_size=1,
+        attn_cp_size=1,
+        kv_cache_dtype="auto",
+        enable_lora=False,
         chunked_prefill_size=4096,
         disable_radix_cache=False,
         cuda_graph_config=SimpleNamespace(
             decode=SimpleNamespace(backend="full"),
-            prefill=SimpleNamespace(backend="full"),
+            prefill=SimpleNamespace(backend="breakable"),
         ),
     )
     values.update(changes)
-    return SimpleNamespace(**values)
+    args = SimpleNamespace(**values)
+    args._resolved = lambda: args
+    args.get_model_config = lambda: SimpleNamespace(dtype=torch.bfloat16)
+    return args
 
 
 def _startup_policy(megamoe=False, vit_graph=False):
@@ -160,7 +173,7 @@ def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings():
     assert args.enable_multimodal
     assert not args.disable_radix_cache and args.chunked_prefill_size == 4096
     assert args.cuda_graph_config.decode.backend == "full"
-    assert args.cuda_graph_config.prefill.backend == "disabled"
+    assert args.cuda_graph_config.prefill.backend == "breakable"
 
 
 @pytest.mark.parametrize(
@@ -230,6 +243,7 @@ def test_resolved_parallel_config_rejects_incompatible_layouts(changes, megamoe)
 def test_explicit_baseline_options_remain_disabled():
     args = _server_args(chunked_prefill_size=-1, disable_radix_cache=True)
     args.cuda_graph_config.decode.backend = "disabled"
+    args.cuda_graph_config.prefill.backend = "disabled"
     _startup_policy()(args)
     _parallel_policy()(args)
     assert args.chunked_prefill_size == -1 and args.disable_radix_cache
@@ -295,3 +309,79 @@ def test_artifact_checker_catches_missing_indexed_shard(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def _apply_shared_welm_prefill_policy(args, monkeypatch, native_flash=True, npu=True):
+    """Execute the production policy nodes shared by text and VL architectures."""
+    monkeypatch.setenv("WELM_NPU_USE_FLASH_ATTN", "1" if native_flash else "0")
+    tree = ast.parse((SRT / "server_args.py").read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_handle_model_specific_adjustments"
+    )
+    nodes = []
+    for node in ast.walk(method):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "welm_bf16_breakable"
+            for t in node.targets
+        ):
+            nodes.append(node)
+        elif isinstance(node, ast.If):
+            test = ast.unparse(node.test)
+            if (
+                test.startswith("self.enable_mixed_chunk and")
+                or "not welm_bf16_breakable" in test
+            ):
+                nodes.append(node)
+    assert len(nodes) == 3
+    nodes.sort(key=lambda node: node.lineno)
+    exec(
+        compile(
+            ast.Module(body=nodes, type_ignores=[]), "<WeLM prefill policy>", "exec"
+        ),
+        {
+            "self": args,
+            "os": os,
+            "torch": torch,
+            "is_npu": lambda: npu,
+            "raw_spec_algorithm": args.speculative_algorithm or "",
+            "Backend": SimpleNamespace(BREAKABLE="breakable", DISABLED="disabled"),
+            "logger": logging.getLogger(__name__),
+        },
+    )
+
+
+def test_vl_preserves_supported_prefill_graph_and_mixed_chunk(monkeypatch):
+    args = _server_args()
+    _startup_policy()(args)
+    _apply_shared_welm_prefill_policy(args, monkeypatch)
+    assert args.cuda_graph_config.prefill.backend == "breakable"
+    assert args.enable_mixed_chunk
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"enable_dp_attention": True},
+        {"attn_cp_size": 2},
+        {"dcp_size": 2},
+        {"quantization": "modelslim"},
+        {"kv_cache_dtype": "fp8_e4m3"},
+        {"enable_lora": True},
+    ],
+)
+def test_unsupported_shared_prefill_layout_falls_back_to_eager(monkeypatch, changes):
+    args = _server_args(**changes)
+    _apply_shared_welm_prefill_policy(args, monkeypatch)
+    assert args.cuda_graph_config.prefill.backend == "disabled"
+    assert not args.enable_mixed_chunk
+
+
+@pytest.mark.parametrize("native_flash,npu", [(False, True), (True, False)])
+def test_graph_and_mixed_require_native_npu_flash(monkeypatch, native_flash, npu):
+    args = _server_args()
+    _apply_shared_welm_prefill_policy(args, monkeypatch, native_flash, npu)
+    assert args.cuda_graph_config.prefill.backend == "disabled"
+    assert not args.enable_mixed_chunk

@@ -12,8 +12,10 @@ import sys
 import types
 import unittest
 from array import array
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -60,7 +62,7 @@ def _load_manager():
     module = types.ModuleType("_welm_vlm_ngram_history_test_manager")
     module.__dict__.update(
         is_npu=lambda: False,
-        ForwardMode=SimpleNamespace(EXTEND="extend", DECODE="decode"),
+        ForwardMode=SimpleNamespace(EXTEND="extend", DECODE="decode", MIXED="mixed"),
         normalize_welmv4_image_tokens=helpers.normalize_welmv4_image_tokens,
         update_token_table=_scatter_reference,
     )
@@ -99,11 +101,12 @@ class TestWeLMVLMNgramHistory(unittest.TestCase):
             enabled=True, table=self.table, n=3, k=4, image_token_id=154752
         )
 
-    def _batch(self, *reqs, mode="extend"):
+    def _batch(self, *reqs, mode="extend", decoding_reqs=()):
         return SimpleNamespace(
             reqs=list(reqs),
             req_pool_indices=torch.tensor([req.req_pool_idx for req in reqs]),
             forward_mode=mode,
+            decoding_reqs=list(decoding_reqs),
         )
 
     def test_chunked_prefill_and_decode_keep_logical_history(self):
@@ -155,6 +158,95 @@ class TestWeLMVLMNgramHistory(unittest.TestCase):
         self.assertEqual(self.table[1, :3].tolist(), [11, 154752, 999002])
         self.assertEqual(self.table[2, :3].tolist(), [21, 154752, 22])
 
+    def test_mixed_chunk_normalizes_prefill_without_overwriting_decode_history(self):
+        manager = replace(self.manager, welm_mixed_chunk=True)
+        original = [11, 999001, 999001, 12, 999002, 999002, 13]
+        image_req = _request(original, row=1, pads=[999001, 999002], prefix=3, length=2)
+        text_req = _request([31, 32], row=3)
+        decode_req = _request([21, 999003, 22], row=2, pads=[999003])
+        # Under overlap the newest decode history is already on device while
+        # the scheduler's CPU output_ids are one token behind.
+        decode_req.output_ids = array("q", [81])
+        self.table[2, :5] = torch.tensor([21, 154752, 22, 81, 82])
+        device_history = self.table[2].clone()
+        batch = self._batch(
+            image_req, text_req, decode_req, mode="mixed", decoding_reqs=[decode_req]
+        )
+        manager.prepare_for_forward(batch, chunked_req=image_req)
+        self.assertEqual(self.table[1, :5].tolist(), [-1, 154752, 154752, 12, 154752])
+        self.assertEqual(self.table[3, :2].tolist(), [31, 32])
+        self.assertTrue(torch.equal(self.table[2], device_history))
+        self.assertEqual(
+            batch.ne_skip_token_table_update.tolist(), [True, False, False]
+        )
+        self.assertEqual(list(image_req.origin_input_ids), original)
+        self.assertEqual(list(decode_req.origin_input_ids), [21, 999003, 22])
+
+        manager.update_after_decode(
+            torch.tensor([901, 902, 903]),
+            SimpleNamespace(
+                ngram_embedding_info=SimpleNamespace(
+                    token_table=self.table,
+                    skip_token_table_update=batch.ne_skip_token_table_update,
+                ),
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=torch.tensor([5, 2, 5]),
+                batch_size=3,
+            ),
+        )
+        self.assertEqual(self.table[1, 5].item(), -1)
+        self.assertEqual(self.table[3, :3].tolist(), [31, 32, 902])
+        self.assertEqual(self.table[2, :6].tolist(), [21, 154752, 22, 81, 82, 903])
+
+        image_req.prefix_indices = list(range(5))
+        image_req.extend_range.length = 2
+        batch = self._batch(
+            image_req, decode_req, mode="mixed", decoding_reqs=[decode_req]
+        )
+        manager.prepare_for_forward(batch, chunked_req=None)
+        self.assertIsNone(batch.ne_skip_token_table_update)
+        self.assertEqual(
+            self.table[1, :7].tolist(), [-1, 154752, 154752, 12, 154752, 154752, 13]
+        )
+        self.assertEqual(self.table[2, :6].tolist(), [21, 154752, 22, 81, 82, 903])
+        self.assertTrue(torch.all(self.table[0] == -1))
+
+    def test_mixed_chunk_capability_covers_text_and_vl_only_on_enabled_npu(self):
+        for architecture in (
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4VLMForConditionalGeneration",
+            "OtherForCausalLM",
+        ):
+            for npu, mixed in ((True, True), (False, True), (True, False)):
+                with self.subTest(architecture=architecture, npu=npu, mixed=mixed):
+                    # No model allocation is needed to exercise the capability
+                    # gate and checkpoint image-token identity in the factory.
+                    config = SimpleNamespace(
+                        use_ngram_embedding=False,
+                        hf_config=SimpleNamespace(
+                            architectures=[architecture], image_token_id=154752
+                        ),
+                    )
+                    with patch.object(manager_module, "is_npu", return_value=npu):
+                        manager = manager_module.NgramEmbeddingManager.from_model(
+                            model=None,
+                            model_config=config,
+                            req_to_token_pool=None,
+                            server_args=SimpleNamespace(enable_mixed_chunk=mixed),
+                            max_running_requests=4,
+                            device="cpu",
+                        )
+                    self.assertEqual(
+                        manager.welm_mixed_chunk,
+                        npu and mixed and architecture != "OtherForCausalLM",
+                    )
+                    self.assertEqual(
+                        manager.image_token_id,
+                        154752
+                        if architecture == "WeLMV4VLMForConditionalGeneration"
+                        else None,
+                    )
+
     def test_disaggregated_history_rebuild_preserves_output_tokens(self):
         req = _request([11, 999001, 999001], pads=[999001])
         req.output_ids = array("q", [31, 32])
@@ -175,7 +267,9 @@ class TestWeLMVLMNgramHistory(unittest.TestCase):
         self.assertEqual(self.table[1, :3].tolist(), [11, 999001, 12])
 
     def test_shared_history_retains_and_validates_image_token_identity(self):
-        shared = self.manager.share_table_from(self.manager)
+        mixed_manager = replace(self.manager, welm_mixed_chunk=True)
+        shared = mixed_manager.share_table_from(mixed_manager)
+        self.assertTrue(shared.welm_mixed_chunk)
         self.assertIs(shared.table, self.table)
         self.assertEqual(shared.image_token_id, 154752)
         text_manager = manager_module.NgramEmbeddingManager(

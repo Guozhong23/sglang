@@ -1798,6 +1798,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue.extend(decode_reqs)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        timing = getattr(decode_req.kv_receiver, "pd_timing", None)
+        if timing is not None:
+            timing.mark("commit_begin")
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1946,6 +1949,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        if timing is not None:
+            timing.mark("commit_metadata_done")
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()

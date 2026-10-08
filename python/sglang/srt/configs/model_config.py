@@ -1911,11 +1911,13 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
     "MiniMaxM3SparseForConditionalGeneration",
 ]
 
-# Multimodal archs whose LM prefill is validated under breakable CUDA graph;
-# embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+# Multimodal archs with a supported LM breakable-graph boundary. Generic
+# embed-carrying batches run eager; WeLM uses its explicit eager-embedding adapter.
 multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # BF16 NPU text-body capture; vision and OE embeddings stay eager.
+    "WeLMV4VLMForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():

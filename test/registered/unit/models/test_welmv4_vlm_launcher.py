@@ -24,6 +24,7 @@ PERFORMANCE_FLAGS = (
 )
 RECORDED_ENV = PERFORMANCE_FLAGS + (
     "SGLANG_VIT_ENABLE_CUDA_GRAPH",
+    "SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES",
     "PYTHONPATH",
 )
 
@@ -94,7 +95,6 @@ def _successful_calls(result, calls):
     assert _option(launch["argv"], "--dtype") == "bfloat16"
     assert "--enable-multimodal" in launch["argv"]
     assert "--trust-remote-code" in launch["argv"]
-    assert "--disable-prefill-cuda-graph" in launch["argv"]
     expected_profile = (
         "optimized"
         if _option(launch["argv"], "--moe-a2a-backend") == "deepep"
@@ -122,6 +122,20 @@ def test_default_profile_uses_optimized_tp4(invoke_launcher):
     result, calls = invoke_launcher()
     preflight, launch = _successful_calls(result, calls)
     _assert_optimized(launch, 4)
+    assert _option(launch["argv"], "--cuda-graph-backend-prefill") == "breakable"
+    assert "--disable-prefill-cuda-graph" not in launch["argv"]
+    assert "--enable-mixed-chunk" in launch["argv"]
+    index = launch["argv"].index("--cuda-graph-bs-prefill") + 1
+    assert launch["argv"][index : index + 7] == [
+        "256",
+        "512",
+        "1024",
+        "2048",
+        "4096",
+        "8192",
+        "16384",
+    ]
+    assert launch["env"]["SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES"] == "1,2,4,8"
     assert _option(preflight["argv"], "--tp") == "4"
     for call in calls:
         for flag in PERFORMANCE_FLAGS[:3]:
@@ -146,6 +160,8 @@ def test_optimized_respects_explicit_zero_performance_flags(invoke_launcher):
     result, calls = invoke_launcher(**dict.fromkeys(PERFORMANCE_FLAGS, "0"))
     _, launch = _successful_calls(result, calls)
     _assert_optimized(launch, 4)
+    assert "--disable-prefill-cuda-graph" in launch["argv"]
+    assert "--enable-mixed-chunk" not in launch["argv"]
     for call in calls:
         assert all(call["env"][flag] == "0" for flag in PERFORMANCE_FLAGS)
 
@@ -159,6 +175,8 @@ def test_baseline_disables_optimizations_and_inherited_flags(invoke_launcher, tp
         MAX_RUNNING_REQUESTS="99",
         CHUNKED_PREFILL_SIZE="2048",
         CUDA_GRAPH_MAX_BS="64",
+        WELM_VL_PREFILL_GRAPH="1",
+        WELM_VL_MIXED_CHUNK="1",
         **dict.fromkeys(PERFORMANCE_FLAGS, "1"),
     )
     preflight, launch = _successful_calls(result, calls)
@@ -171,6 +189,8 @@ def test_baseline_disables_optimizations_and_inherited_flags(invoke_launcher, tp
     assert _option(argv, "--max-running-requests") == "1"
     assert "--disable-cuda-graph" in argv
     assert "--disable-radix-cache" in argv
+    assert "--disable-prefill-cuda-graph" in argv
+    assert "--enable-mixed-chunk" not in argv
     for call in calls:
         assert all(call["env"][flag] == "0" for flag in PERFORMANCE_FLAGS)
 
@@ -236,3 +256,45 @@ def test_unknown_profile_fails_with_diagnostic_before_preflight(invoke_launcher)
     assert result.returncode != 0
     assert calls == []
     assert "unknown-profile" in result.stdout + result.stderr
+
+
+def test_prefill_graph_and_mixed_chunk_can_be_disabled_independently(invoke_launcher):
+    for graph, mixed in (("0", "0"), ("0", "1"), ("1", "0")):
+        result, calls = invoke_launcher(
+            WELM_VL_PREFILL_GRAPH=graph, WELM_VL_MIXED_CHUNK=mixed
+        )
+        _, launch = _successful_calls(result, calls)
+        assert ("--cuda-graph-backend-prefill" in launch["argv"]) == (graph == "1")
+        assert ("--disable-prefill-cuda-graph" in launch["argv"]) == (graph == "0")
+        assert ("--enable-mixed-chunk" in launch["argv"]) == (mixed == "1")
+
+
+def test_custom_prefill_capture_buckets_reach_server(invoke_launcher):
+    result, calls = invoke_launcher(
+        WELM_VL_PREFILL_TOKEN_BUCKETS="512 1024 2048",
+        SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES="1,2,4,8,16",
+    )
+    _, launch = _successful_calls(result, calls)
+    i = launch["argv"].index("--cuda-graph-bs-prefill") + 1
+    assert launch["argv"][i : i + 3] == ["512", "1024", "2048"]
+    assert launch["env"]["SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES"] == "1,2,4,8,16"
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"WELM_NPU_USE_FLASH_ATTN": "0", "WELM_VL_PREFILL_GRAPH": "1"},
+        {"WELM_NPU_USE_FLASH_ATTN": "0", "WELM_VL_MIXED_CHUNK": "1"},
+        {"SGLANG_DEEPEP_NORMAL_USE_ALLGATHER": "0"},
+        {"SGLANG_DEEPEP_NORMAL_USE_ALLTOALL": "1"},
+        {"WELM_VL_PREFILL_GRAPH": "yes"},
+        {"WELM_VL_MIXED_CHUNK": "yes"},
+        {"WELM_VL_PREFILL_TOKEN_BUCKETS": "512 -1"},
+    ],
+)
+def test_unsupported_prefill_options_fail_before_loading_model(
+    invoke_launcher, environment
+):
+    result, calls = invoke_launcher(**environment)
+    assert result.returncode != 0
+    assert calls == []

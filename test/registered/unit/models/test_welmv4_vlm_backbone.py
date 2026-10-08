@@ -178,6 +178,8 @@ class TestWeLMVLMOverEncodingFusion(unittest.TestCase):
         )
         batch = SimpleNamespace(
             ngram_embedding_info=object(),
+            welm_prefill_graph=None,
+            welm_prefill_oe_ids=None,
             can_run_tbo=False,
             capture_hidden_mode=SimpleNamespace(need_capture=lambda: False),
         )

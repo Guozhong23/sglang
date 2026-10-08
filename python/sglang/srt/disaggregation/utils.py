@@ -23,6 +23,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.observability.pd_time_stats import mark_poll
 from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -156,6 +157,11 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            timing = getattr(decode_req.kv_receiver, "pd_timing", None)
+            if timing is not None:
+                timing.mark(
+                    "metadata_wait_observed" if actual_room == 0 else "metadata_gate_pass"
+                )
 
 
 def poll_and_all_reduce(
@@ -167,6 +173,9 @@ def poll_and_all_reduce(
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
+    timing_enabled = bool(pollers) and getattr(pollers[0], "pd_timing", None) is not None
+    if timing_enabled:
+        mark_poll(pollers, polls, "local_transfer_success_observed", int(KVPoll.Success))
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if (
@@ -176,8 +185,13 @@ def poll_and_all_reduce(
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    if timing_enabled:
+        mark_poll(pollers, polls, "local_ready", int(KVPoll.Success))
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    result = tensor_to_reduce.tolist()
+    if timing_enabled:
+        mark_poll(pollers, result, "tp_consensus_ready", int(KVPoll.Success))
+    return result
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -217,6 +231,11 @@ def poll_and_all_reduce_with_staging(
     # allow test injection of failure probability at runtime
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
+    timing_enabled = bool(receivers) and getattr(receivers[0], "pd_timing", None) is not None
+    if timing_enabled:
+        mark_poll(
+            receivers, raw_polls, "local_transfer_success_observed", int(KVPoll.Success)
+        )
     for i, decode_req in enumerate(decode_reqs):
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
@@ -227,8 +246,13 @@ def poll_and_all_reduce_with_staging(
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
     poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
+    if timing_enabled:
+        mark_poll(receivers, raw_polls, "local_ready", int(KVPoll.Success))
     dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    result = poll_tensor.tolist()
+    if timing_enabled:
+        mark_poll(receivers, result, "tp_consensus_ready", int(KVPoll.Success))
+    return result
 
 
 #########################

@@ -2,7 +2,42 @@
 
 High-performance model routing control and data plane for large-scale LLM deployments. The gateway orchestrates fleets of workers, balances traffic across HTTP and gRPC backends, and exposes OpenAI-compatible APIs with pluggable history storage and tool integrations—while remaining deeply optimized for the SGLang serving runtime.
 
+## Opt-in HTTP PD early decode streaming
+
+Set `SMG_PD_EARLY_DECODE_STREAM=1` in the **router process** before startup to
+forward a real decode result without waiting for the prefill HTTP response.
+The default is `0`; unset or disabled keeps the existing dispatch. Invalid
+values fail startup. This applies to single-input, single-choice streaming
+`/generate`, `/v1/completions`, and `/v1/chat/completions` requests without
+logprobs or nonempty tool definitions. Other requests use the existing path.
+
+An HTTP 200 or a role-only SSE event does not prove KV handoff. Until prefill
+finishes or decode emits a recognised generation result, prefill failure still
+cancels the paired decode request. After that handoff, a late prefill HTTP
+failure is recorded against prefill and does not cancel decode. Neither the
+last token nor `[DONE]` waits for a pending prefill response.
+
+The first-result probe is bounded (256 KiB / 64 nonempty HTTP chunks); an
+unrecognised or oversized preamble waits for prefill and then passes through
+unchanged. It never resends a request. After handoff there is no JSON parsing on
+the decode token path. One bounded relay task also drains the prefill body
+under its original HTTP timeout. Active relays plus post-decode drains are
+capped at the configured positive `max_concurrent_requests`, or 1024 when
+router admission is unlimited. A full cap falls back to the existing dispatch.
+Prefill load remains counted until its response is drained/cancelled; decode
+load follows the client response lifetime. No worker/model/KV code is changed.
+
+Build the Rust Python extension in `bindings/python` in release mode; changing
+`PYTHONPATH` alone cannot activate this change. Test with
+`cargo test --lib routers::http::pd_stream::tests` from this directory, then
+compare the same release wheel with the flag off/on on an isolated router port.
+Check output, cancellations, connection/task counts, CPU, TTFT, ITL and
+throughput before rollout. Roll back by disabling the flag and restarting only
+the router. This opt-in implementation is not a claim of measured performance
+or failure-injection validation on your deployment.
+
 ## Overview
+
 - Unified control plane for registering, monitoring, and orchestrating prefill, decode, and regular workers across heterogeneous model fleets.
 - Data plane that routes requests across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability features.
 - Industry-first gRPC pipeline with native Rust tokenization, reasoning, and tool-call execution for high-throughput OpenAI-compatible serving.

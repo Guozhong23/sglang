@@ -1083,13 +1083,27 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
+            # Host-observed final result, including inter-chunk scheduling.
+            prefill_result_duration = self.duration_between(
+                self.forward_entry_time, self.prefill_finished_time
+            )
+            post_prefill_duration = self.duration_between(
+                self.prefill_finished_time, self.completion_time
+            )
+            last_transfer_wait_duration = self.duration_between(
+                self.prefill_transfer_queue_entry_time,
+                self.prefill_kv_transfer_finish_time,
+            )
             return (
                 f"{bootstrap_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f} MB"
+                f"transfer_total={self.transfer_total_mb:.2f} MB, "
+                f"prefill_result_duration={self.format_duration(prefill_result_duration)}, "
+                f"post_prefill_duration={self.format_duration(post_prefill_duration)}, "
+                f"last_transfer_wait_duration={self.format_duration(last_transfer_wait_duration)}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = self.duration_between(
@@ -1137,12 +1151,16 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 prealloc_fields = f"prealloc_queue_duration={self.format_duration(prealloc_duration)}, "
 
+            prebuilt_duration = self.duration_between(
+                self.forward_entry_time, self.decode_prebuilt_finish_time
+            )
             return (
                 f"{prealloc_fields}"
                 f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
-                f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}"
+                f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}, "
+                f"prebuilt_duration={self.format_duration(prebuilt_duration)}"
             )
         else:
             return "Unknown Time Stats"

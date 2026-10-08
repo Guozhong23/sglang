@@ -55,6 +55,13 @@ from sglang.srt.observability.mooncake_trace import (
     mooncake_trace_func,
     mooncake_trace_slice,
 )
+from sglang.srt.observability.pd_time_stats import (
+    RequestTiming,
+    TimingExecutor,
+    begin_chunk,
+    end_chunk,
+    timed_component,
+)
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -199,6 +206,7 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.pd_timings = {} if server_args.enable_request_time_stats_logging else None
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -513,6 +521,7 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx.prefetch_sockets,
         )
 
+    @timed_component("kv")
     def send_kvcache_staged(
         self,
         mooncake_session_id: str,
@@ -716,10 +725,14 @@ class MooncakeKVManager(CommonKVManager):
             ]
         assert layers_params is not None
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
+        def append_transfer_addresses(
+            src_ptr: int,
+            dst_ptr: int,
+            item_len: int,
+            src_addrs: List[int],
+            dst_addrs: List[int],
+            lengths: List[int],
+        ) -> None:
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
                     device_prefill_kv_blocks is not None
@@ -731,24 +744,40 @@ class MooncakeKVManager(CommonKVManager):
                 )
             else:
                 src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
+            # Build the final engine arguments directly. In particular, SWA
+            # state transfers must not recreate per-segment tuples and the
+            # _transfer_data zip(*) transpose that trigger GC in preparation.
             for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+                src_addrs.append(src_ptr + int(prefill_index[0]) * item_len)
+                dst_addrs.append(dst_ptr + int(decode_index[0]) * item_len)
+                lengths.append(item_len * len(prefill_index))
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            # Each concurrent worker owns its lists until its sync call returns.
+            src_addrs, dst_addrs, lengths = [], [], []
+            append_transfer_addresses(
+                src_ptr, dst_ptr, item_len, src_addrs, dst_addrs, lengths
+            )
+            if not src_addrs:
+                return 0
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
+            src_addrs, dst_addrs, lengths = [], [], []
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+                append_transfer_addresses(
+                    src_ptr, dst_ptr, item_len, src_addrs, dst_addrs, lengths
+                )
+            if not src_addrs:
+                return 0
+            # Retain the engine wrapper's timing and error handling.
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
 
         if self.enable_custom_mem_pool:
             futures = [
@@ -772,6 +801,7 @@ class MooncakeKVManager(CommonKVManager):
             # compared to using multiple threads
             return process_layers(layers_params)
 
+    @timed_component("kv")
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -807,6 +837,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
+    @timed_component("kv")
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -907,6 +938,7 @@ class MooncakeKVManager(CommonKVManager):
             )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
 
+    @timed_component("kv")
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
@@ -1035,6 +1067,7 @@ class MooncakeKVManager(CommonKVManager):
 
         return 0
 
+    @timed_component("aux")
     def send_aux(
         self,
         req: TransferInfo,
@@ -1175,6 +1208,7 @@ class MooncakeKVManager(CommonKVManager):
         """State types whose page lists are positional and must not be truncated."""
         return st in (StateType.SWA_RING, StateType.C128_STATE)
 
+    @timed_component("state")
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -1501,6 +1535,7 @@ class MooncakeKVManager(CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    @timed_component("notify")
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
@@ -1520,6 +1555,8 @@ class MooncakeKVManager(CommonKVManager):
         staging_buffer=None,
         worker_index=0,
     ):
+        if self.pd_timings is not None:
+            executor = TimingExecutor(executor)
         staging_strategy = None
         if self.enable_trace:
             trace_set_thread_info(
@@ -1529,8 +1566,13 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            timing = token = None
+            timing_error = None
+            staging_deferred = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                timing = kv_chunk.pd_timing
+                token = begin_chunk(timing)
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1542,6 +1584,7 @@ class MooncakeKVManager(CommonKVManager):
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
                 ):
+                    timing_error = "skipped_failed_or_cleared"
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
@@ -1808,10 +1851,13 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                timing_error = type(e).__name__
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                end_chunk(token, timing, timing_error, deferred=staging_deferred)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1977,7 +2023,16 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
+                        timing = (
+                            self.pd_timings.get(bootstrap_room)
+                            if self.pd_timings is not None
+                            else None
+                        )
+                        if timing is not None:
+                            timing.notice(prefill_rank, expected_response_num)
                         if arrived_response_num == expected_response_num:
+                            if timing is not None:
+                                timing.mark("all_notices_received")
                             if self.enable_staging:
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
@@ -2033,6 +2088,25 @@ class MooncakeKVManager(CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        request_timing = (
+            self.pd_timings.get(bootstrap_room)
+            if self.pd_timings is not None
+            else None
+        )
+        chunk_timing = (
+            request_timing.new_chunk(
+                queue_id=shard_idx,
+                peers=list(dst_infos),
+                page_start=index_slice.start,
+                page_end=index_slice.stop,
+                num_pages=len(kv_indices),
+                num_kv_tokens=num_kv_tokens,
+                is_last_chunk=is_last_chunk,
+                state_types=[str(st) for st in (self.kv_args.state_types or [])],
+            )
+            if request_timing is not None
+            else None
+        )
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2043,11 +2117,38 @@ class MooncakeKVManager(CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                pd_timing=chunk_timing,
             )
         )
 
     def get_session_id(self):
         return self.engine.get_session_id()
+
+    def new_request_timing(self, room):
+        if getattr(self, "pd_timings", None) is None:
+            return None
+        timing = RequestTiming(
+            self.disaggregation_mode.value,
+            room,
+            tp_rank=self.attn_tp_rank,
+            dp_rank=self.attn_dp_rank,
+            cp_rank=self.attn_cp_rank,
+            pp_rank=self.pp_rank,
+        )
+        self.pd_timings[room] = timing
+        return timing
+
+    def finish_request_timing(self, room, timing):
+        if timing is not None and self.pd_timings.get(room) is timing:
+            status = self.request_status.get(room)
+            timing.finish(
+                "success"
+                if status == KVPoll.Success
+                else "failed"
+                if status == KVPoll.Failed
+                else f"cleared_at_status_{status}"
+            )
+            self.pd_timings.pop(room, None)
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         current_rooms = self.addr_to_rooms_tracker[bootstrap_addr].copy()
@@ -2116,6 +2217,13 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
+        self.pd_timing = mgr.new_request_timing(bootstrap_room)
+
+    def clear(self):
+        self.kv_mgr.finish_request_timing(
+            self.bootstrap_room, getattr(self, "pd_timing", None)
+        )
+        super().clear()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2214,6 +2322,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        self.pd_timing = mgr.new_request_timing(bootstrap_room)
+
+    def clear(self):
+        self.kv_mgr.finish_request_timing(
+            self.bootstrap_room, getattr(self, "pd_timing", None)
+        )
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2307,6 +2422,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if self.pd_timing is not None:
+            self.pd_timing.mark("metadata_send_begin")
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -2360,6 +2477,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
+        if self.pd_timing is not None:
+            self.pd_timing.mark("metadata_sent")
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
