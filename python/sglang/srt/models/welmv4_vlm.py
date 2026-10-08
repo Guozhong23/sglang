@@ -13,8 +13,15 @@ import torch
 import torch.nn.functional as F
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.welmv4_vision_cache import VisionMetadataCache, vision_grid_key
+from sglang.srt.layers.welmv4_vision_npu import (
+    VisionNPUFusionConfig,
+    vision_add_layer_norm,
+    vision_column_parallel_linear_gelu,
+    vision_row_parallel_linear,
+)
 from sglang.srt.layers.welmv4_vision_op import (
     welmv4_vision_apply_rope,
     welmv4_vision_quick_gelu,
@@ -270,6 +277,21 @@ def _apply_welmv4_vision_rope(
     return welmv4_vision_apply_rope(q, k, cos, sin)
 
 
+class WeLMV4VisionRowParallelLinear(RowParallelLinear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._vision_fusions = VisionNPUFusionConfig.from_env()
+
+    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+        if not skip_all_reduce and not should_skip_mlp_all_reduce():
+            result = vision_row_parallel_linear(self, input_, self._vision_fusions)
+            if result is not None:
+                return result
+        return super().forward(
+            input_, skip_all_reduce=skip_all_reduce, forward_batch=forward_batch
+        )
+
+
 class WeLMV4VisionAttention(VisionAttention):
     def __init__(
         self,
@@ -290,6 +312,7 @@ class WeLMV4VisionAttention(VisionAttention):
             prefix=prefix,
             customized_position_embedding_applier=_apply_welmv4_vision_rope,
             use_data_parallel=use_data_parallel,
+            proj_linear_cls=WeLMV4VisionRowParallelLinear,
         )
 
     def forward(
@@ -317,6 +340,7 @@ class WeLMV4VisionMLP(nn.Module):
     ):
         super().__init__()
         tp_kwargs = _vision_dp_tp_kwargs(use_data_parallel)
+        self._vision_fusions = VisionNPUFusionConfig.from_env()
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
@@ -325,7 +349,7 @@ class WeLMV4VisionMLP(nn.Module):
             prefix=add_prefix("fc1", prefix),
             **tp_kwargs,
         )
-        self.fc2 = RowParallelLinear(
+        self.fc2 = WeLMV4VisionRowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
@@ -342,12 +366,16 @@ class WeLMV4VisionMLP(nn.Module):
             self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.fc1(x)
-        if self._quick_gelu:
-            # Preserve fp32 arithmetic before the final bf16 cast.
-            hidden_states = welmv4_vision_quick_gelu(hidden_states)
-        else:
-            hidden_states = self.act(hidden_states)
+        mode = "quick" if self._quick_gelu else self.act.approximate
+        hidden_states = vision_column_parallel_linear_gelu(
+            self.fc1, x, mode, self._vision_fusions
+        )
+        if hidden_states is None:
+            hidden_states, _ = self.fc1(x)
+            if self._quick_gelu:
+                hidden_states = welmv4_vision_quick_gelu(hidden_states)
+            else:
+                hidden_states = self.act(hidden_states)
         hidden_states, _ = self.fc2(hidden_states)
         return hidden_states
 
@@ -363,6 +391,7 @@ class WeLMV4VisionBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self._vision_fusions = VisionNPUFusionConfig.from_env()
         self.attn = WeLMV4VisionAttention(
             config,
             quant_config=quant_config,
@@ -382,12 +411,15 @@ class WeLMV4VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
+        attn_output = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        hidden_states, normalized = vision_add_layer_norm(
+            attn_output, hidden_states, self.norm2, self._vision_fusions
+        )
+        hidden_states = hidden_states + self.mlp(normalized)
         return hidden_states
 
 
@@ -637,6 +669,7 @@ class WeLMV4VisionProjector(nn.Module):
         merge_hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.merge_hidden_size = merge_hidden_size
         self.ln_q = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self._vision_fusions = VisionNPUFusionConfig.from_env()
         tp_kwargs = _vision_dp_tp_kwargs(use_data_parallel)
         self.mlp = nn.ModuleList(
             [
@@ -649,7 +682,7 @@ class WeLMV4VisionProjector(nn.Module):
                     **tp_kwargs,
                 ),
                 nn.GELU(),
-                RowParallelLinear(
+                WeLMV4VisionRowParallelLinear(
                     merge_hidden_size,
                     config.out_hidden_size,
                     bias=True,
@@ -662,8 +695,13 @@ class WeLMV4VisionProjector(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.ln_q(hidden_states).view(-1, self.merge_hidden_size)
-        hidden_states, _ = self.mlp[0](hidden_states)
-        hidden_states = self.mlp[1](hidden_states)
+        activated = vision_column_parallel_linear_gelu(
+            self.mlp[0], hidden_states, "none", self._vision_fusions
+        )
+        if activated is None:
+            hidden_states, _ = self.mlp[0](hidden_states)
+            activated = self.mlp[1](hidden_states)
+        hidden_states = activated
         hidden_states, _ = self.mlp[2](hidden_states)
         return hidden_states
 

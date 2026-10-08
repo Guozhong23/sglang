@@ -21,6 +21,10 @@ PERFORMANCE_FLAGS = (
     "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER",
     "SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM",
     "SGLANG_NPU_USE_MULTI_STREAM",
+    "SGLANG_VLM_VISION_METADATA_CACHE",
+    "SGLANG_VLM_NPU_USE_MC2",
+    "SGLANG_VLM_NPU_FUSE_GELU",
+    "SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM",
 )
 RECORDED_ENV = PERFORMANCE_FLAGS + (
     "SGLANG_VIT_ENABLE_CUDA_GRAPH",
@@ -140,6 +144,9 @@ def test_default_profile_uses_optimized_tp4(invoke_launcher):
     for call in calls:
         for flag in PERFORMANCE_FLAGS[:3]:
             assert call["env"][flag] == "1"
+        assert call["env"]["SGLANG_VLM_VISION_METADATA_CACHE"] == "1"
+        for flag in PERFORMANCE_FLAGS[-3:]:
+            assert call["env"][flag] == "0"
 
 
 @pytest.mark.parametrize("tp", [2, 4, 8])

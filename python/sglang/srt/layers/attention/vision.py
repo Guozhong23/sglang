@@ -1015,6 +1015,7 @@ class VisionAttention(nn.Module):
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
+        proj_linear_cls: type[RowParallelLinear] = RowParallelLinear,
         **kwargs,
     ):
         super().__init__()
@@ -1107,7 +1108,7 @@ class VisionAttention(nn.Module):
                 tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
-        self.proj = RowParallelLinear(
+        self.proj = proj_linear_cls(
             input_size=self.dummy_dim,
             output_size=embed_dim,
             bias=proj_bias,

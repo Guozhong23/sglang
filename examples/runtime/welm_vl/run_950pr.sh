@@ -17,6 +17,10 @@ esac
 profile_args=()
 case "${WELM_VL_PROFILE}" in
     optimized)
+        export SGLANG_VLM_VISION_METADATA_CACHE=${SGLANG_VLM_VISION_METADATA_CACHE:-1}
+        export SGLANG_VLM_NPU_USE_MC2=${SGLANG_VLM_NPU_USE_MC2:-0}
+        export SGLANG_VLM_NPU_FUSE_GELU=${SGLANG_VLM_NPU_FUSE_GELU:-0}
+        export SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM=${SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM:-0}
         if [[ ${TP_SIZE} == 1 ]]; then
             echo "The optimized DeepEP profile requires TP_SIZE=2, 4 or 8; use baseline for TP=1." >&2
             exit 2
@@ -80,6 +84,10 @@ case "${WELM_VL_PROFILE}" in
         if [[ ${WELM_VL_MIXED_CHUNK} == 1 ]]; then profile_args+=(--enable-mixed-chunk); fi
         ;;
     baseline)
+        export SGLANG_VLM_VISION_METADATA_CACHE=0
+        export SGLANG_VLM_NPU_USE_MC2=0
+        export SGLANG_VLM_NPU_FUSE_GELU=0
+        export SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM=0
         # A reproducible comparison path even when the shell has text tuning set.
         export WELM_NPU_USE_MEGAMOE=0
         export WELM_NPU_USE_FLASH_ATTN=0
