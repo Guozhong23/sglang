@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.welmv4_vision_cache import VisionMetadataCache, vision_grid_key
 from sglang.srt.layers.welmv4_vision_op import (
     welmv4_vision_apply_rope,
     welmv4_vision_quick_gelu,
@@ -253,7 +254,7 @@ class WeLMV4VisionPositionEmbedding(nn.Module):
 
     def forward(self, grid_thw: torch.Tensor) -> torch.Tensor:
         out: List[torch.Tensor] = []
-        for t, h, w in grid_thw.tolist():
+        for t, h, w in vision_grid_key(grid_thw):
             out.append(self._build_for_image(int(t), int(h), int(w)))
         return torch.cat(out, dim=0) if len(out) > 1 else out[0]
 
@@ -402,6 +403,7 @@ class WeLMV4VisionEncoder(nn.Module):
         self.config = config
         self.patch_embed = WeLMV4VisionPatchEmbed(config)
         self.pos_embed = WeLMV4VisionPositionEmbedding(config)
+        self._metadata_cache = VisionMetadataCache.from_env()
         self.blocks = nn.ModuleList(
             [
                 WeLMV4VisionBlock(
@@ -422,17 +424,59 @@ class WeLMV4VisionEncoder(nn.Module):
     def device(self):
         return self.patch_embed.proj.weight.device
 
+    def clear_metadata_cache(self):
+        self._metadata_cache.clear()
+
+    def _apply(self, fn, recurse=True):
+        self.clear_metadata_cache()
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self.clear_metadata_cache()
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def _metadata(self, grids):
+        weight = self.pos_embed.weight
+        try:
+            version = weight._version
+        except RuntimeError:
+            version = None
+        signature = (
+            id(weight),
+            weight.data_ptr(),
+            version,
+            weight.device,
+            weight.dtype,
+            self.device,
+            self.dtype,
+            self.config.spatial_merge_size,
+            self.config.hidden_size,
+            self.config.num_attention_heads,
+            self.pos_embed.num_grid_per_side,
+        )
+
+        def build():
+            cos, sin = self._rope_cos_sin(grids)
+            return self.pos_embed(grids), self._cu_seqlens(grids), cos, sin
+
+        return self._metadata_cache.get_or_build(
+            vision_grid_key(grids),
+            signature,
+            build,
+            enabled=not self.training and not torch.is_grad_enabled(),
+        )
+
     def _rope_pos_ids(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []
         merge = self.config.spatial_merge_size
-        for t, h, w in grid_thw.tolist():
-            hpos_ids = torch.arange(h, device=grid_thw.device).unsqueeze(1).expand(h, w)
+        for t, h, w in vision_grid_key(grid_thw):
+            hpos_ids = torch.arange(h, device=self.device).unsqueeze(1).expand(h, w)
             hpos_ids = (
                 hpos_ids.reshape(h // merge, merge, w // merge, merge)
                 .permute(0, 2, 1, 3)
                 .flatten()
             )
-            wpos_ids = torch.arange(w, device=grid_thw.device).unsqueeze(0).expand(h, w)
+            wpos_ids = torch.arange(w, device=self.device).unsqueeze(0).expand(h, w)
             wpos_ids = (
                 wpos_ids.reshape(h // merge, merge, w // merge, merge)
                 .permute(0, 2, 1, 3)
@@ -449,15 +493,13 @@ class WeLMV4VisionEncoder(nn.Module):
         inv_freq = 1.0 / (
             10000.0
             ** (
-                torch.arange(
-                    0, rope_dim, 2, device=grid_thw.device, dtype=torch.float32
-                )
+                torch.arange(0, rope_dim, 2, device=self.device, dtype=torch.float32)
                 / rope_dim
             )
         )
         pos_ids = self._rope_pos_ids(grid_thw)
-        max_grid = int(grid_thw[:, 1:].max().item())
-        seq = torch.arange(max_grid, device=grid_thw.device, dtype=torch.float32)
+        max_grid = max(max(h, w) for _, h, w in vision_grid_key(grid_thw))
+        seq = torch.arange(max_grid, device=self.device, dtype=torch.float32)
         freqs = torch.outer(seq, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
@@ -467,7 +509,7 @@ class WeLMV4VisionEncoder(nn.Module):
 
     def _cu_seqlens(self, grid_thw: torch.Tensor) -> torch.Tensor:
         seq_lens: List[int] = []
-        for t, h, w in grid_thw.tolist():
+        for t, h, w in vision_grid_key(grid_thw):
             seq_lens.extend([int(h) * int(w)] * int(t))
         # Ascend fused attention consumes host-side cumulative lengths.
         device = "cpu" if self.device.type == "npu" else self.device
@@ -506,7 +548,7 @@ class WeLMV4VisionEncoder(nn.Module):
     ) -> torch.Tensor:
         if grid_thw.ndim != 2 or grid_thw.shape[1] != 3 or grid_thw.shape[0] == 0:
             raise ValueError("image_grid_thw must be a nonempty (images, 3) tensor")
-        grids = grid_thw.tolist()
+        grids = vision_grid_key(grid_thw)
         merge = self.config.spatial_merge_size
         if any(
             t <= 0 or h <= 0 or w <= 0 or h % merge or w % merge for t, h, w in grids
@@ -524,17 +566,12 @@ class WeLMV4VisionEncoder(nn.Module):
                 f"image grids ({patch_count}, {patch_width})"
             )
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
-        grid_thw = grid_thw.to(device=self.device)
         hidden_states = self.patch_embed(pixel_values)
-        hidden_states = hidden_states + self.pos_embed(grid_thw).to(hidden_states.dtype)
-
-        cu_seqlens = self._cu_seqlens(grid_thw)
-        cos, sin = self._rope_cos_sin(grid_thw)
+        position, cu_seqlens, cos, sin = self._metadata(grids)
+        hidden_states = hidden_states + position.to(hidden_states.dtype)
         # Keep cos/sin in fp32 here. Our RoPE operation reads them in fp32;
         # casting to bf16 would lose precision on low-magnitude sin
         # values and add a measurable error to every block.
-        cos = torch.cat([cos, cos], dim=-1)
-        sin = torch.cat([sin, sin], dim=-1)
 
         max_patches = _vision_max_patches()
         total = hidden_states.shape[0]
@@ -712,6 +749,9 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             raise NotImplementedError(
                 "WeLMV4 VLM speculative/MTP loading is not supported"
             )
+        clear_cache = getattr(self.vision_encoder, "clear_metadata_cache", None)
+        if clear_cache is not None:
+            clear_cache()
         # Route every vision tensor ourselves. The text loader performs substring
         # rewrites for packed QKV/MoE parameters and must not touch vision names.
         params = dict(self.named_parameters())
@@ -841,7 +881,9 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         mm_inputs_list = [mm_input for _, mm_input in mm_inputs_with_indices]
         image_items = self._collect_image_items(mm_inputs_list)
         logical_input_ids = (
-            self._logical_input_ids(input_ids, image_items) if image_items else input_ids
+            self._logical_input_ids(input_ids, image_items)
+            if image_items
+            else input_ids
         )
         input_embeds = self.model.embed_tokens(logical_input_ids)
         # NgramEmbeddingManager stores logical image token IDs in the history
