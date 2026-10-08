@@ -91,6 +91,52 @@ bash examples/runtime/welm_vl/run_950pr.sh 2>&1 | tee welmv45-vl-baseline.log
 对 baseline 再执行上述 curl，将结果另存为 `baseline-response.txt`。两种执行顺序可能产生浮点差异；比较图像内容识别和答案正确性，发现明显偏差时在优化配置下逐项关闭 MegaMoE、FlashAttn、fused QKV、decode 图定位。
 进一步验收应覆盖同图重复请求、不同长宽比、多图、纯文本，以及图片跨 chunk 和前缀命中的请求；正式精度结论应来自固定数据集评测，单 curl 仅作冒烟验证。
 
+## 单条图文请求 profiling
+
+`profile_single_image.sh` 可直接复制到服务器运行，只依赖 Bash、curl 和 Python 3 标准库。
+对已启动的服务，它依次执行：`GET /v1/models` → `POST /flush_cache` → `POST /start_profile` → **一次** `POST /v1/chat/completions` → `POST /stop_profile`。
+模型名自动从服务读取，可兼容 `welmv4-vl` / `welmv45-vl`；可用 `SERVED_MODEL_NAME` 显式选择。脚本不额外发送推理预热请求。
+
+在有 `dog.png` 的目录执行（下面的脚本路径对应当前服务器仓库）：
+
+```bash
+IMAGE_PATH=./dog.png \
+SGLANG_URL=http://127.0.0.1:7788 \
+PROFILE_ROOT=/data2/hw_lly/profiling3 \
+MAX_TOKENS=512 \
+bash /data2/hw_sgz/06_code_vlm/sglang/examples/runtime/welm_vl/profile_single_image.sh
+```
+
+如果把脚本单独复制到了 `01_scripts`，最后一行改为 `bash profile_single_image.sh` 即可。
+采集前确保服务没有其他请求，也没有其他 profiling 会话：这些控制接口作用于服务的所有 TP worker，不能按某个 request ID 独立隔离。
+服务端保持 `SGLANG_PROFILE_V2=0`（本分支默认值），V2 的手动 start/stop 尚未实现。
+
+**要包含 ViT，必须处理独立的视觉缓存。** `/flush_cache` 只清 KV/前缀等缓存，不清图像 embedding 缓存。
+之前对 `dog.png` 的请求若已填充视觉缓存，再请求同图可能跳过 vision encoder/projector；`cached_tokens=0` 也不能证明执行了 ViT。
+可改用服务从未处理过的图片，或者在服务启动脚本的 `python -m sglang.launch_server` **之前**添加以下环境变量，再重启服务：
+
+```bash
+export SGLANG_VLM_CACHE_SIZE_MB=0
+```
+
+该设置只在客户端执行没有作用。禁用视觉缓存后，可先手动完成预热；采集脚本随后清前缀缓存，再记录一条包含视觉计算的请求。
+保持当前服务、不改缓存设置时，脚本仍可采集单条请求实际执行的文本 prefill/decode 和其他运算；是否包含 ViT 以 trace 为准。
+
+输出分为两处：
+
+- **服务器**：`${PROFILE_ROOT}/welm_vl_single_<时间>_<进程号>/`，这是 `/start_profile.output_dir`。TP4 的 worker 由 TorchNPU 分别输出采集目录，文件名取决于版本。递归查找 `trace_view.json` 和算子/kernel 报告，不要期待 CUDA 路径的 `TP-*.trace.json.gz`。
+- **客户端**：默认 `./welm_vl_profile_client/<本次ID>/`，保存 `request.json`、`response.json`、`profile_request.json`、`metadata.json`、`summary.json`，以及控制接口原始响应和 HTTP 状态码。可通过 `CLIENT_OUTPUT_DIR` 指定独立目录。客户端目录与服务器 trace 目录可能位于不同机器。
+
+NPU 的活动参数在本分支中仍写 `CPU,GPU`，代码会将 GPU 映射到 NPU。脚本显式关闭 stack/shape 记录，不设 `num_steps` 或分阶段自动停止；因此会记录这次请求的实际 prefill 和所有 decode forward，直到响应完成，再等待 stop/export。
+采集覆盖 scheduler/model worker；tokenizer/HTTP 进程中的全部 CPU 图片预处理不在同一个 profiler 内。
+
+可调整参数：`MAX_TOKENS=512`、`REQUEST_TIMEOUT=1800`、`PROFILE_TIMEOUT=1800`、`FLUSH_TIMEOUT=30`、`WITH_STACK=0`、`RECORD_SHAPES=0`。
+想采集缓存命中路径时设置 `FLUSH_CACHE=0`。若要开启调用栈，需要客户端 `WITH_STACK=1` 且服务端启动时 `SGLANG_PROFILE_WITH_STACK=True`；当前服务脚本的 `False` 会优先生效。
+配置鉴权时使用 `SGLANG_API_KEY` 和可选的 `SGLANG_ADMIN_API_KEY`。
+
+成功 start 后，请求失败或脚本收到中断会尽力停止本次 profiling；start/推理/stop 都不会自动重试。
+若 start 超时，可能已有部分 worker 开始采集，需要查看服务日志并确认状态后再操作。stop 可能耗时数分钟；HTTP 成功后仍需检查服务器实际生成的 trace，才能确认 NPU events 和 ViT 覆盖。
+
 ## 当前范围
 
 本次接通的是 BF16 单体 VL 服务。视频、MTP/speculative decoding、attention DP、视觉 DP、量化 VL、PP、PD/编码器分离部署尚未适配；上游 MXFP8 文本优化已同步，但不等同于 VL 量化支持。
