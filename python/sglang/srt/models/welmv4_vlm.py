@@ -11,6 +11,9 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -26,6 +29,11 @@ from sglang.srt.layers.welmv4_vision_op import (
     welmv4_vision_apply_rope,
     welmv4_vision_quick_gelu,
 )
+from sglang.srt.layers.welmv4_vision_ulysses import (
+    VisionUlyssesPlan,
+    create_vision_ulysses_group,
+    validate_vision_ulysses_input,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     get_embedding_and_mask,
@@ -39,8 +47,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welmv4 import WeLMV4MoeForCausalLM
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import add_prefix, print_warning_once
-from torch import nn
-from transformers import PretrainedConfig
 
 # Maximum number of vision-encoder patch tokens processed in a single
 # forward pass through the 27-layer vision transformer. **Disabled by
@@ -299,6 +305,7 @@ class WeLMV4VisionAttention(VisionAttention):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        ulysses_group=None,
     ):
         super().__init__(
             embed_dim=config.hidden_size,
@@ -311,16 +318,29 @@ class WeLMV4VisionAttention(VisionAttention):
             quant_config=quant_config,
             prefix=prefix,
             customized_position_embedding_applier=_apply_welmv4_vision_rope,
-            use_data_parallel=use_data_parallel,
+            # TP=1 linear loaders replicate weights; this is NOT image-level DP.
+            use_data_parallel=use_data_parallel or ulysses_group is not None,
             proj_linear_cls=WeLMV4VisionRowParallelLinear,
         )
+        self._ulysses_group = ulysses_group
+        if ulysses_group is not None and self.qkv_backend_name != "ascend_attn":
+            raise ValueError(
+                "WeLM vision Ulysses requires the ascend_attn vision backend"
+            )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        ulysses_plan: Optional[VisionUlyssesPlan] = None,
     ) -> torch.Tensor:
+        if self._ulysses_group is not None:
+            if ulysses_plan is None:
+                raise ValueError("Missing Ulysses sequence plan")
+            return self._forward_ulysses(
+                hidden_states, cu_seqlens, position_embeddings, ulysses_plan
+            )
         hidden_states = hidden_states.unsqueeze(0)
         hidden_states = super().forward(
             hidden_states,
@@ -328,6 +348,32 @@ class WeLMV4VisionAttention(VisionAttention):
             position_embeddings=position_embeddings,
         )
         return hidden_states.squeeze(0)
+
+    def _forward_ulysses(self, hidden_states, cu_seqlens, position_embeddings, plan):
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Checkpoint QKV is [all Q heads, all K heads, all V heads], NOT
+        # interleaved Q/K/V per head. Split BEFORE reshaping/packing AllToAll.
+        q, k, v = (
+            x.reshape(plan.local_tokens, plan.heads, self.head_size).contiguous()
+            for x in qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        )
+        q, k = welmv4_vision_apply_rope(q, k, *position_embeddings)
+        q, k, v = plan.sequence_to_heads(q, k, v, self._ulysses_group)
+        # Ascend takes head counts from these TND tensors. FIA sees N REAL rows
+        # and ORIGINAL image/frame lengths, never padding or rank boundaries.
+        output = self.qkv_backend.forward(
+            q=q,
+            k=k,
+            v=v,
+            bsz=1,
+            seq_len=plan.tokens,
+            cu_seqlens=cu_seqlens,
+            softmax_scale=self.softmax_scale,
+        )
+        output = plan.heads_to_sequence(output, self._ulysses_group)
+        # TP=1/rank=0 on EVERY physical rank: one bias per local row, no reduce.
+        output, _ = self.proj(output.flatten(1))
+        return output
 
 
 class WeLMV4VisionMLP(nn.Module):
@@ -387,6 +433,7 @@ class WeLMV4VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        ulysses_group=None,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -397,12 +444,13 @@ class WeLMV4VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
+            **({"ulysses_group": ulysses_group} if ulysses_group is not None else {}),
         )
         self.mlp = WeLMV4VisionMLP(
             config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            use_data_parallel=use_data_parallel,
+            use_data_parallel=use_data_parallel or ulysses_group is not None,
         )
 
     def forward(
@@ -410,11 +458,13 @@ class WeLMV4VisionBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        ulysses_plan: Optional[VisionUlyssesPlan] = None,
     ) -> torch.Tensor:
         attn_output = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            **({"ulysses_plan": ulysses_plan} if ulysses_plan is not None else {}),
         )
         hidden_states, normalized = vision_add_layer_norm(
             attn_output, hidden_states, self.norm2, self._vision_fusions
@@ -433,6 +483,11 @@ class WeLMV4VisionEncoder(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self._ulysses_group = create_vision_ulysses_group(
+            config,
+            use_data_parallel=use_data_parallel,
+            max_patches=_vision_max_patches(),
+        )
         self.patch_embed = WeLMV4VisionPatchEmbed(config)
         self.pos_embed = WeLMV4VisionPositionEmbedding(config)
         self._metadata_cache = VisionMetadataCache.from_env()
@@ -443,6 +498,11 @@ class WeLMV4VisionEncoder(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                     use_data_parallel=use_data_parallel,
+                    **(
+                        {"ulysses_group": self._ulysses_group}
+                        if self._ulysses_group is not None
+                        else {}
+                    ),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -610,6 +670,8 @@ class WeLMV4VisionEncoder(nn.Module):
         # Cheap fast-path: small enough to fit in one shot, or the cap is
         # effectively unlimited. Preserves byte-for-byte the prior behaviour.
         if max_patches <= 0 or total <= max_patches:
+            if self._ulysses_group is not None:
+                return self._forward_ulysses_blocks(hidden_states, cu_seqlens, cos, sin)
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states,
@@ -649,12 +711,40 @@ class WeLMV4VisionEncoder(nn.Module):
             sub_cos = cos[tok_start:tok_end]
             sub_sin = sin[tok_start:tok_end]
             h = hidden_states[tok_start:tok_end]
-            for block in self.blocks:
-                h = block(h, cu_seqlens=sub_cu, position_embeddings=(sub_cos, sub_sin))
+            if self._ulysses_group is not None:
+                h = self._forward_ulysses_blocks(h, sub_cu, sub_cos, sub_sin)
+            else:
+                for block in self.blocks:
+                    h = block(
+                        h, cu_seqlens=sub_cu, position_embeddings=(sub_cos, sub_sin)
+                    )
             # In-place copy so we reuse the pre-allocated buffer rather
             # than holding both old and new activations in memory.
             hidden_states[tok_start:tok_end] = h
         return hidden_states
+
+    def _forward_ulysses_blocks(self, hidden_states, cu_seqlens, cos, sin):
+        validate_vision_ulysses_input(hidden_states)
+        group = self._ulysses_group
+        plan = VisionUlyssesPlan(
+            hidden_states.shape[0],
+            self.config.num_attention_heads,
+            group.world_size,
+            group.rank_in_group,
+        )
+        # Slice global positions; never restart positions at a rank boundary.
+        h = plan.local_slice(hidden_states)
+        position_embeddings = (plan.local_slice(cos, 1), plan.local_slice(sin, 0))
+        for block in self.blocks:
+            h = block(
+                h,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                ulysses_plan=plan,
+            )
+        # SP can bisect a merge group (e.g. 690 patches/rank). Gather BEFORE
+        # projector LayerNorm/view; merging locally would scramble patch order.
+        return plan.gather_sequence(h, group)
 
 
 class WeLMV4VisionProjector(nn.Module):

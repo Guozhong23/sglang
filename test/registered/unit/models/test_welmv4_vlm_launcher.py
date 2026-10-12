@@ -22,6 +22,7 @@ PERFORMANCE_FLAGS = (
     "SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM",
     "SGLANG_NPU_USE_MULTI_STREAM",
     "SGLANG_VLM_VISION_METADATA_CACHE",
+    "SGLANG_VLM_VISION_USE_ULYSSES",
     "SGLANG_VLM_NPU_USE_MC2",
     "SGLANG_VLM_NPU_FUSE_GELU",
     "SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM",
@@ -145,6 +146,7 @@ def test_default_profile_uses_optimized_tp4(invoke_launcher):
         for flag in PERFORMANCE_FLAGS[:3]:
             assert call["env"][flag] == "1"
         assert call["env"]["SGLANG_VLM_VISION_METADATA_CACHE"] == "1"
+        assert call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "0"
         for flag in PERFORMANCE_FLAGS[-3:]:
             assert call["env"][flag] == "0"
 
@@ -171,6 +173,12 @@ def test_optimized_respects_explicit_zero_performance_flags(invoke_launcher):
     assert "--enable-mixed-chunk" not in launch["argv"]
     for call in calls:
         assert all(call["env"][flag] == "0" for flag in PERFORMANCE_FLAGS)
+
+
+def test_optimized_preserves_explicit_ulysses(invoke_launcher):
+    result, calls = invoke_launcher(SGLANG_VLM_VISION_USE_ULYSSES="1")
+    _successful_calls(result, calls)
+    assert all(call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "1" for call in calls)
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])

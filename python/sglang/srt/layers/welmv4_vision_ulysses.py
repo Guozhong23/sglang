@@ -7,7 +7,7 @@ exchange the tail is removed BEFORE attention; zero keys must never enter
 softmax. Keeping all padding at the global tail also makes arbitrary image
 boundaries compatible with the original packed cumulative sequence lengths.
 
-This module has no serving-runtime imports, so layout contracts can be tested
+This module has no import-time serving dependencies, so layouts can be tested
 on CPU. ``group`` implements GroupCoordinator's all_to_all_single and
 all_gather_into_tensor APIs. Collectives are synchronous from the consumer's
 stream perspective; never fall back to a different collective after failure.
@@ -15,9 +15,77 @@ stream perspective; never fall back to a different collective after failure.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
+
+
+def create_vision_ulysses_group(config, use_data_parallel=False, max_patches=0):
+    """Resolve startup mode before choosing checkpoint shard shapes.
+
+    On NPU every TP rank participates, including disabled ranks. Checking flags
+    on the CPU group catches mismatched environments before one rank enters
+    AllToAll while its peers enter the legacy AllReduce path.
+    """
+    from sglang.srt.utils import is_npu
+
+    raw = os.environ.get("SGLANG_VLM_VISION_USE_ULYSSES", "0").strip().lower()
+    if not is_npu():
+        if raw not in {"0", "false"}:
+            raise ValueError("WeLM vision Ulysses requires the NPU runtime")
+        return None
+
+    from sglang.srt.distributed import get_attn_tp_group, get_tp_group
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_mm
+
+    group = get_tp_group()
+    graph = envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+    settings = (
+        raw,
+        max_patches,
+        config.num_attention_heads,
+        config.hidden_size,
+        config.num_hidden_layers,
+        graph,
+        use_data_parallel,
+        get_mm().mm_enable_dp_encoder,
+    )
+    if group.world_size > 1:
+        peer_settings = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            peer_settings, settings, group=group.cpu_group
+        )
+        if any(peer != settings for peer in peer_settings):
+            raise ValueError("WeLM vision parallel settings differ across TP ranks")
+    if raw not in {"0", "1", "false", "true"}:
+        raise ValueError("SGLANG_VLM_VISION_USE_ULYSSES must be 0, 1, false or true")
+    if raw in {"0", "false"}:
+        return None
+    if graph or use_data_parallel or get_mm().mm_enable_dp_encoder:
+        raise ValueError("Vision Ulysses does not support vision graphs or encoder DP")
+    attn_group = get_attn_tp_group()
+    if list(attn_group.ranks) != list(group.ranks):
+        raise ValueError("Vision Ulysses requires identical attention-TP and TP ranks")
+    VisionUlyssesPlan(
+        1, config.num_attention_heads, group.world_size, group.rank_in_group
+    )
+    if config.hidden_size % config.num_attention_heads:
+        raise ValueError("Vision hidden_size must be divisible by attention heads")
+    logging.getLogger(__name__).info(
+        "WeLM vision Ulysses enabled: SP=%d rank=%d, replicated block weights; "
+        "block MC2/AllReduce bypassed, projector retains TP. BF16 eager only.",
+        group.world_size,
+        group.rank_in_group,
+    )
+    return group
+
+
+def validate_vision_ulysses_input(hidden: torch.Tensor):
+    if hidden.device.type != "npu" or hidden.dtype != torch.bfloat16:
+        raise ValueError("WeLM vision Ulysses requires BF16 NPU activations")
 
 
 @dataclass(frozen=True)

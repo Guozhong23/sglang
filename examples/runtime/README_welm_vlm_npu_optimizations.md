@@ -1,5 +1,108 @@
 # WeLM-VLM NPU vision optimizations
 
+## Opt-in ViT Ulysses sequence parallelism
+
+```bash
+# All TP ranks must inherit the same value. Restart the service after changing it.
+export SGLANG_VLM_VISION_USE_ULYSSES=1     # default: 0 (original vision TP)
+export SGLANG_VIT_ENABLE_CUDA_GRAPH=0      # vision encoder remains eager
+```
+
+The language model's TP/EP and projector TP remain unchanged. The SP size is
+the existing TP group size; this first version requires attention-TP and TP
+to have the same rank membership/order, BF16 NPU tensors, and the Ascend vision
+attention backend. Heads must be divisible by SP size. Encoder DP and vision
+graph capture are not supported together with this switch. Text-only decode
+graphs and supported language-backbone prefill graphs are not disabled by it.
+The bundled `welm_vl/run_950pr.sh` optimized profile preserves an explicit value
+and otherwise defaults to 0; its baseline profile forces 0. For an SP-only A/B
+comparison, use the SAME profile and change only this variable.
+
+### Layout and numerical contract
+
+Each block loads full QKV/OProj/FFN weights on every rank using TP=1 linear
+loaders, while keeping the original checkpoint names. Physical rank 1/2/3 also
+use linear `tp_rank=0`: each local output gets exactly one bias. There is no
+block OProj/FFN AllReduce, including when the vision MC2 switch is enabled.
+Projector MC2 retains its original eligibility checks. GELU and residual-norm
+fusions remain independently controlled and operate on the new local shapes.
+
+For N packed patches and P ranks, L=ceil(N/P):
+
+```text
+full hidden/position -> consecutive local rows [L, hidden]
+  norm -> full QKV -> global-position RoPE
+  pack [destination, L, QKV, heads/P, head_dim]
+  AllToAll -> [source, L, QKV, heads/P, head_dim]
+  flatten source+L -> remove global tail -> [N, heads/P, head_dim] x3
+  FIA with original image/frame cumulative lengths
+  pad global tail -> AllToAll -> restore [L, heads, head_dim]
+  full OProj -> residual/norm -> full FFN -> residual
+repeat blocks -> AllGather -> trim to N -> original TP projector
+```
+
+Padding is only at the GLOBAL tail and is removed BEFORE softmax; no dummy key
+is visible to a real query. At most P-1 rows are added per micro-batch. Empty
+local shards still participate using equal-sized buffers. The reverse exchange
+restores heads in source-rank order. QKV checkpoint packing is all-Q/all-K/all-V,
+not Q/K/V interleaved per head. FP32 rotary coefficients/intermediates are kept.
+
+Different legal image sizes, mixed-size images and existing `grid_thw` temporal
+segments preserve their global coordinates and original packed attention
+boundaries. This does not add a new video input API. The existing
+`SGLANG_VLM_VISION_MAX_PATCHES` micro-batch grouping is retained; each group has
+its own SP plan and final gather. A single oversized image still needs memory
+for its full-sequence attention and is not split into independent attentions.
+
+Patch embedding and metadata generation are unchanged in this first version.
+Gathering before projector avoids splitting a spatial-merge group across ranks
+(e.g. 2760 patches / 4 = 690 local rows is not divisible by the merge factor 4).
+It also preserves the original image-token output order. No full-vision TP1
+fallback or branch on local token count is allowed after starting collectives.
+
+Full block weights increase per-rank HBM consumption; recheck available KV
+cache capacity and maximum concurrency. SP reduces communication bytes, not
+the number of per-block collectives. Packing/contiguous copies and changed
+GEMM shapes can offset gains. Mathematical semantics are unchanged, but BF16
+GEMM partition/reduction changes are NOT guaranteed bitwise equivalent to TP.
+
+### Validation
+
+Local CPU tests exercise production layouts, poisoned padding, 1/2/4/8-rank
+simulated collectives, real four-process Gloo exchanges, actual encoder/block forwards, 72-wide BF16 RoPE,
+micro-batches, mixed images, temporal segments, projector ordering and startup
+guards. They cannot certify NPU HCCL/FIA compatibility or task accuracy.
+
+```bash
+python -m pytest -q test/registered/unit/models/test_welmv4_vlm_ulysses_layout.py \
+  test/registered/unit/models/test_welmv4_vlm_ulysses.py
+
+# From the repository root, on a server with four FREE visible NPUs:
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc-per-node=4 \
+  examples/runtime/welm_vl/check_vision_ulysses.py
+```
+
+The smoke test needs no checkpoint. It checks real HCCL exchanges, their exact
+inverse, segmented FIA, RoPE and BF16 QKV/OProj against full-sequence references.
+Default cases include tiny inputs, mixed segments, nondivisible lengths, and
+2760 patches. `--cases '4;12,16;3,2,6;2760'` is customizable. Reported timing is
+AllToAll+packing+FIA+reverse AllToAll wall time, not pure communication and not
+an end-to-end speedup. `--atol/--rtol` are smoke-test tolerances, not model-quality
+acceptance criteria; investigate failures rather than loosening them blindly.
+
+Then compare service SP=0/1 using identical weights, images, decoding settings
+and all other optimization flags. Check image embeddings/logits and application
+accuracy, not only plausible generated text. Profile with image-embedding cache
+misses and separate warm metadata from cold startup. For one micro-batch with
+27 blocks expect 54 AllToAll calls, one final AllGather and the original
+projector reduction (or projector MC2), with no block AllReduce. With multiple
+micro-batches these counts scale accordingly. Actual gains require server tests.
+
+Implementation is split between `models/welmv4_vlm.py` and
+`layers/welmv4_vision_ulysses.py`. The latter documents destination/source and
+sequence/head ordering next to each reshape/permute.
+
 ## Position and RoPE metadata cache
 
 The vision encoder caches the interpolated learned position embeddings, host-side

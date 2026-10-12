@@ -8,8 +8,8 @@ real PyTorch arithmetic; the text model is replaced only for wrapper contracts.
 import ast
 import copy
 import dataclasses
-import logging
 import importlib.util
+import logging
 import os
 import runpy
 import sys
@@ -69,6 +69,7 @@ def _load_definitions(*names, **extra):
         SimpleNamespace=SimpleNamespace,
         vision_grid_key=CACHE.vision_grid_key,
         VisionMetadataCache=CACHE.VisionMetadataCache,
+        create_vision_ulysses_group=lambda *args, **kwargs: None,
     )
     scope.update(extra)
     exec(compile(module, str(MODEL_PATH), "exec"), scope)
