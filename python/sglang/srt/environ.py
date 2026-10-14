@@ -776,8 +776,13 @@ class Envs:
     # regardless of the fusion switch above. MAX_CHUNKS < 2 keeps the old path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
+    # BF16/MXFP8 QKV AG settings apply to Full and, unless overridden, SWA.
+    # MIN_CHUNK_TOKENS counts gathered rows; MAX_CHUNKS < 2 disables chunking.
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS = EnvInt(0)
+    # Each unset SWA override inherits its corresponding common setting.
+    SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MIN_CHUNK_TOKENS = EnvInt(None)
+    SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MAX_CHUNKS = EnvInt(None)
     # Request buckets B for the WeLM BF16 KV-mirror suffix graph, whose
     # Q/hidden/MoE have B rows. Prompt graphs (including mirror K/V preparation)
     # use only the token buckets in cuda_graph_config.prefill.bs: T + B captures,

@@ -2361,22 +2361,22 @@ class Qwen2MoeAttention(nn.Module):
             )
             pending.append((x_work, scale_work, start, end, x_recv, scale_recv))
 
+        # Queue Gate AG after all qx/scale AGs on the same process group.
+        # Fork before any chunk wait/kernel so the input dependency does not
+        # include earlier fused QKV consumers.
+        gate_hidden, gate_ag_on_alt_stream = (
+            self._npu_start_bf16_gate_input_all_gather(
+                local_hidden,
+                all_gather_group,
+                graph_workspace=graph_workspace,
+            )
+        )
+
         for chunk_idx, (x_work, scale_work, start, end, x_recv, scale_recv) in enumerate(
             pending
         ):
             x_work.wait()
             scale_work.wait()
-            if chunk_idx == len(pending) - 1:
-                # All qx/scale communication is joined before this fork. The
-                # full BF16 AG overlaps the last fused chunk and attention;
-                # its original-order result needs no BF16 chunk Gate reorder.
-                gate_hidden, gate_ag_on_alt_stream = (
-                    self._npu_start_bf16_gate_input_all_gather(
-                        local_hidden,
-                        all_gather_group,
-                        graph_workspace=graph_workspace,
-                    )
-                )
             programs[rope_modes[chunk_idx]](
                 x_recv.view(torch.int8),
                 scale_recv.view(torch.int8),
@@ -2860,8 +2860,9 @@ class Qwen2MoeAttention(nn.Module):
         *,
         graph_workspace: Optional[Any] = None,
     ) -> Tuple[Optional[torch.Tensor], bool]:
-        # Call after activation/scale AGs, before the remaining QKV computation
-        # (the last chunk in the pipeline). Gate MM joins only after attention.
+        # Call after submitting activation/scale AGs, before QKV computation.
+        # Pipeline callers must fork before the first chunk wait/kernel.
+        # Gate MM joins this auxiliary stream only after attention.
         gate_hidden_states = None
         gate_all_gather_on_alt_stream = False
         if all_gather_group is not None:
@@ -3967,46 +3968,56 @@ class Qwen2MoeDecoderLayer(nn.Module):
             input_hidden_is_scattered and reuse_prefill_mxfp8_input
         )
         prefill_mxfp8_ag_qkv_slices = None
-        if (
-            defer_mxfp8_hidden_ag
-            and self.self_attn.use_npu_fused_qkv
-            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-        ):
-            max_ag_chunks = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS.get()
-            if max_ag_chunks >= 2:
-                prefill_mxfp8_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
-                    hidden_states.shape[0],
-                    get_tensor_model_parallel_world_size(),
-                    envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get(),
-                    max_ag_chunks,
-                )
         prefill_ag_qkv_slices = None
         if (
             input_hidden_is_scattered
             and self.self_attn.use_npu_fused_qkv
             and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and is_non_consumer_attention_layer
-            and not reuse_prefill_mxfp8_input
         ):
+            # The model config normalizes Full windows to -1 before building
+            # this layer. Share the selected settings across BF16 and MXFP8.
+            min_ag_chunk_tokens = (
+                envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get()
+            )
             max_ag_chunks = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS.get()
+            if self.sliding_window_size > -1:
+                swa_min_ag_chunk_tokens = (
+                    envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MIN_CHUNK_TOKENS.get()
+                )
+                swa_max_ag_chunks = (
+                    envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MAX_CHUNKS.get()
+                )
+                if swa_min_ag_chunk_tokens is not None:
+                    min_ag_chunk_tokens = swa_min_ag_chunk_tokens
+                if swa_max_ag_chunks is not None:
+                    max_ag_chunks = swa_max_ag_chunks
             if max_ag_chunks >= 2:
-                has_mirror = (
-                    self.self_attn.kv_mirror_layer_idx
-                    in self.self_attn.kv_mirror_imitated_layers
-                    and hasattr(self.self_attn, "qkv_proj_weight")
-                )
-                qkv_weight = (
-                    self.self_attn.qkv_proj_weight
-                    if has_mirror
-                    else self.self_attn.qkv_proj.weight
-                )
-                if qkv_weight.dtype == torch.bfloat16:
-                    prefill_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
+                if reuse_prefill_mxfp8_input:
+                    prefill_mxfp8_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
                         hidden_states.shape[0],
                         get_tensor_model_parallel_world_size(),
-                        envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get(),
+                        min_ag_chunk_tokens,
                         max_ag_chunks,
                     )
+                else:
+                    has_mirror = (
+                        self.self_attn.kv_mirror_layer_idx
+                        in self.self_attn.kv_mirror_imitated_layers
+                        and hasattr(self.self_attn, "qkv_proj_weight")
+                    )
+                    qkv_weight = (
+                        self.self_attn.qkv_proj_weight
+                        if has_mirror
+                        else self.self_attn.qkv_proj.weight
+                    )
+                    if qkv_weight.dtype == torch.bfloat16:
+                        prefill_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
+                            hidden_states.shape[0],
+                            get_tensor_model_parallel_world_size(),
+                            min_ag_chunk_tokens,
+                            max_ag_chunks,
+                        )
         defer_bf16_fused_qkv_ag = prefill_ag_qkv_slices is not None
         use_full_mirror_layout = (
             use_npu_prefill_deepep_scattered
