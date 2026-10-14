@@ -133,6 +133,7 @@ _is_npu = is_npu()
 
 # Cache only compiled programs, never per-forward Q/K/V or mirror activations.
 _WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
+_WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool], Any] = {}
 
 # Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
 # rank's packed segment prevents a bulk-RoPE AIV tile from crossing ranks.
@@ -196,6 +197,29 @@ def _get_welm_fused_qkv_program(
                 positions_contiguous=positions_contiguous,
             )
         _WELMV4_FUSED_QKV_PROGRAMS[key] = program
+    return program
+
+
+def _get_welm_fused_qkv_mx_program(
+    device: Any,
+    qkv_width: int,
+    num_slots: int,
+    max_pos: int,
+    positions_contiguous: bool,
+) -> Any:
+    key = (device, qkv_width, num_slots, max_pos, positions_contiguous)
+    program = _WELMV4_FUSED_QKV_MX_PROGRAMS.get(key)
+    if program is None:
+        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache_mx import compile_aot_mx
+
+        program = compile_aot_mx(
+            qkv_width,
+            num_slots,
+            max_pos,
+            return_v=True,
+            positions_contiguous=positions_contiguous,
+        )
+        _WELMV4_FUSED_QKV_MX_PROGRAMS[key] = program
     return program
 
 
@@ -2058,6 +2082,134 @@ class Qwen2MoeAttention(nn.Module):
             mirror_v if has_mirror else None,
         )
 
+    def _try_npu_fused_qkv_mxfp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        all_gather_group: Optional[Any] = None,
+    ) -> Optional[
+        Tuple[
+            Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+            ],
+            Optional[torch.Tensor],
+            bool,
+        ]
+    ]:
+        """Fuse MXFP8 QKV using the existing activation/scale and Gate AGs."""
+        local_rows = hidden_states.shape[0]
+        if local_rows == 0:
+            return None
+        mode = forward_batch.forward_mode
+        if mode not in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+        ):
+            return None
+
+        # Select/compile before submitting any collective. In the scattered
+        # route the original BF16 hidden stays local; only qx/scale are gathered.
+        num_tokens = local_rows * (
+            all_gather_group.world_size if all_gather_group is not None else 1
+        )
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        positions_contiguous = (
+            mode == ForwardMode.EXTEND
+            and forward_batch.batch_size == 1
+            and forward_batch.welm_prefill_graph is None
+            and forward_batch.extend_prefix_lens_cpu[0] + num_tokens
+            <= cos_sin_cache.shape[0]
+        )
+        has_mirror = getattr(self, "_kv_mirror_mxfp8_source_projection", False)
+        # Weight postprocessing stores transpose views. Undo those views, then
+        # reinterpret bytes without copying or modifying the fallback weights.
+        weight = self.qkv_proj.weight.data.transpose(0, 1).view(torch.int8)
+        weight_scale = (
+            self.qkv_proj.weight_scale_inv.data.transpose(0, 1).view(torch.int8)
+        )
+        gamma = self.k_norm.weight.data.view(1, self.head_dim)
+        backend = get_attn_backend()
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        k_cache = k_cache.view(-1, self.head_dim)
+        v_cache = v_cache.view(-1, self.head_dim)
+        graph = forward_batch.welm_prefill_graph
+        slots = (
+            (
+                forward_batch.welm_prefill_swa_write_locs
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.welm_prefill_full_write_locs
+            )
+            if graph is not None
+            else (
+                backend.forward_metadata.swa_out_cache_loc
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.out_cache_loc
+            )
+        )
+        program = _get_welm_fused_qkv_mx_program(
+            hidden_states.device,
+            weight.shape[0],
+            k_cache.shape[0],
+            cos_sin_cache.shape[0],
+            positions_contiguous,
+        )
+        positions = positions.to(torch.int64)
+        slots = slots.to(torch.int64)
+        graph_workspace = graph.mxfp8_ag_workspace if graph is not None else None
+        quantized_x, x_scale, _ = self._npu_prepare_prefill_mxfp8_qkv_input(
+            hidden_states, all_gather_group, graph_workspace=graph_workspace
+        )
+
+        num_tokens = quantized_x.shape[0]
+        output_kwargs = dict(dtype=torch.bfloat16, device=hidden_states.device)
+        q = torch.empty((num_tokens, self.q_size), **output_kwargs)
+        k = torch.empty((num_tokens, self.kv_size), **output_kwargs)
+        v = torch.empty((num_tokens, self.kv_size), **output_kwargs)
+        mirror_rows = num_tokens if has_mirror else 1
+        mirror_k = torch.empty((mirror_rows, self.kv_size), **output_kwargs)
+        mirror_v = torch.empty((mirror_rows, self.kv_size), **output_kwargs)
+        gate_hidden, gate_ag_on_alt_stream = (
+            self._npu_start_bf16_gate_input_all_gather(
+                hidden_states, all_gather_group, graph_workspace=graph_workspace
+            )
+        )
+        program(
+            quantized_x.view(torch.int8),
+            x_scale.view(torch.int8),
+            weight,
+            weight_scale,
+            gamma,
+            positions,
+            cos_sin_cache,
+            slots,
+            q,
+            k,
+            v,
+            mirror_k,
+            mirror_v,
+            k_cache,
+            v_cache,
+            float(self.k_norm.eps),
+        )
+        return (
+            (
+                q,
+                k,
+                v,
+                mirror_k if has_mirror else None,
+                mirror_v if has_mirror else None,
+            ),
+            gate_hidden,
+            gate_ag_on_alt_stream,
+        )
+
     def _npu_prefill_ag_fused_qkv(
         self,
         positions: torch.Tensor,
@@ -2486,30 +2638,15 @@ class Qwen2MoeAttention(nn.Module):
             )
         return quantized_x, x_scale, output_dtype
 
-    def _npu_project_qkv_with_prefill_mxfp8_input(
+    def _npu_start_bf16_gate_input_all_gather(
         self,
         hidden_states: torch.Tensor,
         all_gather_group: Optional[Any],
         *,
         graph_workspace: Optional[Any] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        bool,
-    ]:
-        quantized_x, x_scale, output_dtype = (
-            self._npu_prepare_prefill_mxfp8_qkv_input(
-                hidden_states, all_gather_group, graph_workspace=graph_workspace
-            )
-        )
-
-        # The FP8 activation and scale collectives above stay on the current
-        # stream.  Only after both have been submitted do we enqueue the
-        # original BF16 hidden-row AllGather on the auxiliary stream.  QKV MM
-        # is submitted afterwards on the current stream, so the Gate input
-        # communication can overlap QKV/Norm/RoPE/attention.  Gate MM itself
-        # remains on the current stream and joins this communication only at
-        # its actual point of use.
+    ) -> Tuple[Optional[torch.Tensor], bool]:
+        # Call after activation/scale AGs, before QKV computation. Gate MM
+        # joins this auxiliary communication only after attention.
         gate_hidden_states = None
         gate_all_gather_on_alt_stream = False
         if all_gather_group is not None:
@@ -2526,7 +2663,29 @@ class Qwen2MoeAttention(nn.Module):
                 gate_hidden_states = self._npu_all_gather_bf16_gate_input(
                     hidden_states, all_gather_group, graph_workspace=graph_workspace
                 )
+        return gate_hidden_states, gate_all_gather_on_alt_stream
 
+    def _npu_project_qkv_with_prefill_mxfp8_input(
+        self,
+        hidden_states: torch.Tensor,
+        all_gather_group: Optional[Any],
+        *,
+        graph_workspace: Optional[Any] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        bool,
+    ]:
+        quantized_x, x_scale, output_dtype = (
+            self._npu_prepare_prefill_mxfp8_qkv_input(
+                hidden_states, all_gather_group, graph_workspace=graph_workspace
+            )
+        )
+        gate_hidden_states, gate_all_gather_on_alt_stream = (
+            self._npu_start_bf16_gate_input_all_gather(
+                hidden_states, all_gather_group, graph_workspace=graph_workspace
+            )
+        )
         qkv = self._npu_mxfp8_mm_from_quantized_input(
             self.qkv_proj,
             quantized_x,
@@ -2573,18 +2732,31 @@ class Qwen2MoeAttention(nn.Module):
                 "active draft decode."
             )
 
+        fused_qkv = None
         if prefill_ag_qkv_slices is not None:
             # Only Gate consumes this chunk-major arena. Attention and mirror
             # consumers continue to use the fused outputs in original row order.
             prefill_gate_hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
                 positions, hidden_states, forward_batch, prefill_ag_qkv_slices
             )
-        else:
-            fused_qkv = (
-                self._try_npu_fused_qkv(positions, hidden_states, forward_batch)
-                if self.use_npu_fused_qkv
-                else None
-            )
+        elif self.use_npu_fused_qkv:
+            if self._is_npu_mxfp8_projection(self.qkv_proj):
+                result = self._try_npu_fused_qkv_mxfp8(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    prefill_mxfp8_all_gather_group,
+                )
+                if result is not None:
+                    (
+                        fused_qkv,
+                        prefill_gate_hidden_states,
+                        prefill_gate_all_gather_on_alt_stream,
+                    ) = result
+            else:
+                fused_qkv = self._try_npu_fused_qkv(
+                    positions, hidden_states, forward_batch
+                )
         if fused_qkv is not None:
             q, k, v, mirror_k, mirror_v = fused_qkv
             if mirror_k is not None:
