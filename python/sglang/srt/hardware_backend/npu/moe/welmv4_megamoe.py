@@ -38,6 +38,26 @@ def _weight_mode(experts):
     return None
 
 
+def _prepare_shared_expert_kwargs(shared, weight_mode):
+    """Reuse this WeLM layer's replicated shared weights without changing them."""
+    kwargs = {}
+    for name, projection in (
+        ("l1", shared.gate_up_proj),
+        ("l2", shared.down_proj),
+    ):
+        weight = projection.weight.detach()
+        if weight_mode == _MODE_MXFP8:
+            # Dense MXFP8 stores [K,N] / [K//64,N,2] transpose views.
+            weight = weight.transpose(0, 1)
+            scale = projection.weight_scale_inv.detach().transpose(0, 1).contiguous()
+            if scale.dtype == torch.uint8:
+                # ModelSlim stores E8M0 bytes, not integer-valued scales.
+                scale = scale.view(torch.float8_e8m0fnu)
+            kwargs[f"{name}_weights_shared_sf"] = [scale.unsqueeze(0)]
+        kwargs[f"{name}_weights_shared"] = [weight.contiguous().unsqueeze(0)]
+    return kwargs
+
+
 class WelmPrefillMegaMoE:
     def __init__(self, group, *, config, device, weight_mode=_MODE_BF16):
         from npu_ops_transformer.ops.mega_moe import (
@@ -107,6 +127,7 @@ class WelmPrefillMegaMoE:
         *,
         zero_output_padding: bool = True,
         valid_row_mask: torch.Tensor | None = None,
+        shared_kwargs: dict | None = None,
     ):
         # The caller skips DeepEP's -1 masking. TopK IDs are already legal and
         # distinct, including padding rows; only their mixture weights need 0.
@@ -128,6 +149,8 @@ class WelmPrefillMegaMoE:
                 l2_weights_sf=[experts.w2_weight_scale],
                 x_active_mask=None,
             )
+        if shared_kwargs is not None:
+            quant_args.update(shared_kwargs)
         output, _ = self._mega_moe(
             hidden_states,
             ids,
@@ -210,8 +233,13 @@ def init_welm_prefill_megamoe(model_runner):
         weight_mode=weight_mode,
     )
     _RUNTIMES[group] = runtime
+    fuse_shared = envs.WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT.get()
     for mlp in eligible:
         mlp.welm_prefill_megamoe = runtime
+        if fuse_shared and mlp.shared_expert is not None:
+            mlp.welm_megamoe_shared_kwargs = _prepare_shared_expert_kwargs(
+                mlp.shared_expert, weight_mode
+            )
     return runtime
 
 

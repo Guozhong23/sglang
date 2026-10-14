@@ -831,6 +831,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.last_final_shared_output: Optional[torch.Tensor] = None
         # Bound by the target runner after loading, never by a draft forward.
         self.welm_prefill_megamoe = None
+        self.welm_megamoe_shared_kwargs = None
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -1106,6 +1107,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
         shared_gate_up = None
+        # The caller already checked the MegaMoE mode, threshold and capacity.
+        shared_kwargs = (
+            self.welm_megamoe_shared_kwargs if use_welm_prefill_megamoe else None
+        )
+        fuse_shared_this_call = shared_kwargs is not None
         moe_a2a_backend = get_moe_a2a_backend()
         is_prefill_batch = (
             forward_batch is not None
@@ -1162,13 +1168,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             enable_npu_decode_like_dual_stream
             or enable_npu_prefill_normal_shared_overlap
         )
-        # MegaMoE still forbids whole-shared-MLP overlap. Only its gate/up
-        # projection may overlap TopK; finish the rest before entering MegaMoE.
+        # Routed-only MegaMoE overlaps shared gate/up with TopK. Shared fusion
+        # skips this external work; the operator produces the complete MoE sum.
         # Use the actual per-batch selector, not merely the bound runtime, so
         # capacity/mixed-phase fallback retains its existing stream policy.
         enable_npu_megamoe_shared_gate_up_overlap = (
             _is_npu
             and use_welm_prefill_megamoe
+            and not fuse_shared_this_call
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and num_tokens > 0
@@ -1255,6 +1262,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             if (
                 self.shared_expert is not None
+                and not fuse_shared_this_call
                 and not enable_npu_shared_alt_stream
                 and not enable_npu_megamoe_shared_gate_up_overlap
             ):
@@ -1379,7 +1387,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     if forward_batch.welm_prefill_graph is not None
                     else None
                 ),
+                shared_kwargs=shared_kwargs,
             )
+            # Fused output already contains shared; shared_output stays None,
+            # so the existing external shared wait/add below is skipped.
         elif use_welm_local_ep_moe:
             if not self.welm_local_ep_kernel_available:
                 raise RuntimeError(

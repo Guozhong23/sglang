@@ -643,9 +643,10 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
-    # BF16/MXFP8 WeLM target prefill, non-consumer EP; only shared gate/up may
-    # overlap TopK with NPU multi-stream enabled. The rest precedes MegaMoE.
+    # BF16/MXFP8 WeLM target prefill, non-consumer EP.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
+    # Fuse shared experts on selected MegaMoE calls, including prefill BCG.
+    WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT = EnvBool(False)
     # With MegaMoE enabled, require padded prefill rows before attention-TP
     # scattering to exceed this threshold. Zero keeps the existing selection.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
