@@ -133,7 +133,7 @@ _is_npu = is_npu()
 
 # Cache only compiled programs, never per-forward Q/K/V or mirror activations.
 _WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
-_WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool], Any] = {}
+_WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
 
 # Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
 # rank's packed segment prevents a bulk-RoPE AIV tile from crossing ranks.
@@ -206,19 +206,39 @@ def _get_welm_fused_qkv_mx_program(
     num_slots: int,
     max_pos: int,
     positions_contiguous: bool,
+    *,
+    rank_chunk_layout: bool = False,
 ) -> Any:
-    key = (device, qkv_width, num_slots, max_pos, positions_contiguous)
+    key = (
+        device,
+        qkv_width,
+        num_slots,
+        max_pos,
+        positions_contiguous,
+        rank_chunk_layout,
+    )
     program = _WELMV4_FUSED_QKV_MX_PROGRAMS.get(key)
     if program is None:
-        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache_mx import compile_aot_mx
-
-        program = compile_aot_mx(
-            qkv_width,
-            num_slots,
-            max_pos,
-            return_v=True,
-            positions_contiguous=positions_contiguous,
+        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache_mx import (
+            compile_aot_mx,
+            compile_aot_mx_rank_chunk,
         )
+
+        if rank_chunk_layout:
+            program = compile_aot_mx_rank_chunk(
+                qkv_width,
+                num_slots,
+                max_pos,
+                positions_contiguous=positions_contiguous,
+            )
+        else:
+            program = compile_aot_mx(
+                qkv_width,
+                num_slots,
+                max_pos,
+                return_v=True,
+                positions_contiguous=positions_contiguous,
+            )
         _WELMV4_FUSED_QKV_MX_PROGRAMS[key] = program
     return program
 
@@ -2210,6 +2230,186 @@ class Qwen2MoeAttention(nn.Module):
             gate_ag_on_alt_stream,
         )
 
+    def _npu_prefill_ag_fused_qkv_mxfp8(
+        self,
+        positions: torch.Tensor,
+        local_hidden: torch.Tensor,
+        forward_batch: ForwardBatch,
+        slices: List[Tuple[int, int]],
+        all_gather_group: Any,
+    ) -> Tuple[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ],
+        Optional[torch.Tensor],
+        bool,
+    ]:
+        """Pipeline qx/scale AGs; gather full BF16 Gate input at the tail."""
+        tp_size = all_gather_group.world_size
+        local_rows = local_hidden.shape[0]
+        num_tokens = tp_size * local_rows
+        has_mirror = getattr(self, "_kv_mirror_mxfp8_source_projection", False)
+        weight = self.qkv_proj.weight.data.transpose(0, 1).view(torch.int8)
+        weight_scale = (
+            self.qkv_proj.weight_scale_inv.data.transpose(0, 1).view(torch.int8)
+        )
+        gamma = self.k_norm.weight.data.view(1, self.head_dim)
+        epsilon = float(self.k_norm.eps)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        backend = get_attn_backend()
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        k_cache = k_cache.view(-1, self.head_dim)
+        v_cache = v_cache.view(-1, self.head_dim)
+        graph = forward_batch.welm_prefill_graph
+        slots = (
+            (
+                forward_batch.welm_prefill_swa_write_locs
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.welm_prefill_full_write_locs
+            )
+            if graph is not None
+            else (
+                backend.forward_metadata.swa_out_cache_loc
+                if backend._is_swa_layer(self.attn)
+                else forward_batch.out_cache_loc
+            )
+        )
+        full_positions = positions.to(torch.int64)
+        full_slots = slots.to(torch.int64)
+        bulk_rope_safe = (
+            graph is None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.batch_size == 1
+            and forward_batch.extend_prefix_lens_cpu[0] + num_tokens
+            <= cos_sin_cache.shape[0]
+        )
+        rope_modes = [
+            bulk_rope_safe and (end - start) % _WELMV4_FUSED_QKV_TILE_ROWS == 0
+            for start, end in slices
+        ]
+        programs = {
+            mode: _get_welm_fused_qkv_mx_program(
+                local_hidden.device,
+                weight.shape[0],
+                k_cache.shape[0],
+                cos_sin_cache.shape[0],
+                mode,
+                rank_chunk_layout=True,
+            )
+            for mode in dict.fromkeys(rope_modes)
+        }
+
+        # Quantize once locally; passing no group avoids the whole-input AG.
+        quantized_x, x_scale, _ = self._npu_prepare_prefill_mxfp8_qkv_input(
+            local_hidden, None
+        )
+        send_x = quantized_x.contiguous().view(torch.uint8)
+        send_scale = x_scale.contiguous().view(torch.uint8)
+        graph_workspace = graph.mxfp8_ag_workspace if graph is not None else None
+        receive_x = self._npu_get_mxfp8_ag_receive_buffer(
+            send_x.reshape(-1),
+            all_gather_group,
+            scratch_name="activation",
+            graph_workspace=graph_workspace,
+        ).view(num_tokens, *send_x.shape[1:])
+        receive_scale = self._npu_get_mxfp8_ag_receive_buffer(
+            send_scale.reshape(-1),
+            all_gather_group,
+            scratch_name="scale",
+            graph_workspace=graph_workspace,
+        ).view(num_tokens, *send_scale.shape[1:])
+
+        output_kwargs = dict(dtype=torch.bfloat16, device=local_hidden.device)
+        q = torch.empty((num_tokens, self.q_size), **output_kwargs)
+        k = torch.empty((num_tokens, self.kv_size), **output_kwargs)
+        v = torch.empty((num_tokens, self.kv_size), **output_kwargs)
+        mirror_rows = num_tokens if has_mirror else 1
+        mirror_k = torch.empty((mirror_rows, self.kv_size), **output_kwargs)
+        mirror_v = torch.empty((mirror_rows, self.kv_size), **output_kwargs)
+        # Each full arena is chunk-major, then rank-major within a chunk.
+        # No in-flight AG may reuse another chunk's receive prefix.
+        chunk_buffers = [
+            (
+                start,
+                end,
+                send_x[start:end].reshape(-1),
+                send_scale[start:end].reshape(-1),
+                receive_x[tp_size * start : tp_size * end],
+                receive_scale[tp_size * start : tp_size * end],
+            )
+            for start, end in slices
+        ]
+        pending = []
+        # Submit all pairs before any wait or compute so later AGs never
+        # inherit a dependency on an earlier chunk's fused QKV consumer.
+        for start, end, x_send, scale_send, x_recv, scale_recv in chunk_buffers:
+            x_work = torch.distributed.all_gather_into_tensor(
+                x_recv.view(-1),
+                x_send,
+                group=all_gather_group.device_group,
+                async_op=True,
+            )
+            scale_work = torch.distributed.all_gather_into_tensor(
+                scale_recv.view(-1),
+                scale_send,
+                group=all_gather_group.device_group,
+                async_op=True,
+            )
+            pending.append((x_work, scale_work, start, end, x_recv, scale_recv))
+
+        for chunk_idx, (x_work, scale_work, start, end, x_recv, scale_recv) in enumerate(
+            pending
+        ):
+            x_work.wait()
+            scale_work.wait()
+            if chunk_idx == len(pending) - 1:
+                # All qx/scale communication is joined before this fork. The
+                # full BF16 AG overlaps the last fused chunk and attention;
+                # its original-order result needs no BF16 chunk Gate reorder.
+                gate_hidden, gate_ag_on_alt_stream = (
+                    self._npu_start_bf16_gate_input_all_gather(
+                        local_hidden,
+                        all_gather_group,
+                        graph_workspace=graph_workspace,
+                    )
+                )
+            programs[rope_modes[chunk_idx]](
+                x_recv.view(torch.int8),
+                scale_recv.view(torch.int8),
+                weight,
+                weight_scale,
+                gamma,
+                full_positions,
+                cos_sin_cache,
+                full_slots,
+                q,
+                k,
+                v,
+                mirror_k,
+                mirror_v,
+                k_cache,
+                v_cache,
+                epsilon,
+                local_rows,
+                end - start,
+                start,
+            )
+        return (
+            (
+                q,
+                k,
+                v,
+                mirror_k if has_mirror else None,
+                mirror_v if has_mirror else None,
+            ),
+            gate_hidden,
+            gate_ag_on_alt_stream,
+        )
+
     def _npu_prefill_ag_fused_qkv(
         self,
         positions: torch.Tensor,
@@ -2482,20 +2682,14 @@ class Qwen2MoeAttention(nn.Module):
         return _is_npu and self._is_npu_mxfp8_projection(self.qkv_proj)
 
     @staticmethod
-    def _npu_all_gather_mxfp8_bytes(
-        tensor: torch.Tensor,
+    def _npu_get_mxfp8_ag_receive_buffer(
+        send_bytes: torch.Tensor,
         group: Any,
         *,
         scratch_name: str,
         graph_workspace: Optional[Any] = None,
     ) -> torch.Tensor:
-        if group.world_size == 1:
-            return tensor
-        send = tensor.contiguous()
-        # AllGather is bit-preserving.  Communicate both FP8 activations and
-        # E8M0 scales as bytes so this path does not depend on ProcessGroupHCCL
-        # exposing each torch float8 dtype through its Python frontend.
-        send_bytes = send.view(torch.uint8).reshape(-1)
+        """Reserve the full receive arena before slicing any async chunks."""
         required_bytes = send_bytes.numel() * group.world_size
 
         if graph_workspace is not None:
@@ -2524,6 +2718,27 @@ class Qwen2MoeAttention(nn.Module):
                 )
                 scratch[scratch_key] = gathered_storage
             gathered_bytes = gathered_storage[:required_bytes]
+        return gathered_bytes
+
+    def _npu_all_gather_mxfp8_bytes(
+        self,
+        tensor: torch.Tensor,
+        group: Any,
+        *,
+        scratch_name: str,
+        graph_workspace: Optional[Any] = None,
+    ) -> torch.Tensor:
+        if group.world_size == 1:
+            return tensor
+        send = tensor.contiguous()
+        # Preserve FP8/E8M0 bits without requiring HCCL float8 dtype support.
+        send_bytes = send.view(torch.uint8).reshape(-1)
+        gathered_bytes = self._npu_get_mxfp8_ag_receive_buffer(
+            send_bytes,
+            group,
+            scratch_name=scratch_name,
+            graph_workspace=graph_workspace,
+        )
         group.all_gather_into_tensor(gathered_bytes, send_bytes)
         gathered_shape = (
             send.shape[0] * group.world_size,
@@ -2645,8 +2860,8 @@ class Qwen2MoeAttention(nn.Module):
         *,
         graph_workspace: Optional[Any] = None,
     ) -> Tuple[Optional[torch.Tensor], bool]:
-        # Call after activation/scale AGs, before QKV computation. Gate MM
-        # joins this auxiliary communication only after attention.
+        # Call after activation/scale AGs, before the remaining QKV computation
+        # (the last chunk in the pipeline). Gate MM joins only after attention.
         gate_hidden_states = None
         gate_all_gather_on_alt_stream = False
         if all_gather_group is not None:
@@ -2707,6 +2922,7 @@ class Qwen2MoeAttention(nn.Module):
         o_proj_rs_pipeline_chunks: int = 0,
         o_proj_rs_group: Optional[Any] = None,
         prefill_ag_qkv_slices: Optional[List[Tuple[int, int]]] = None,
+        prefill_mxfp8_ag_qkv_slices: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
         prefill_gate_hidden_states = None
         prefill_gate_all_gather_on_alt_stream = False
@@ -2738,6 +2954,18 @@ class Qwen2MoeAttention(nn.Module):
             # consumers continue to use the fused outputs in original row order.
             prefill_gate_hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
                 positions, hidden_states, forward_batch, prefill_ag_qkv_slices
+            )
+        elif prefill_mxfp8_ag_qkv_slices is not None:
+            (
+                fused_qkv,
+                prefill_gate_hidden_states,
+                prefill_gate_all_gather_on_alt_stream,
+            ) = self._npu_prefill_ag_fused_qkv_mxfp8(
+                positions,
+                hidden_states,
+                forward_batch,
+                prefill_mxfp8_ag_qkv_slices,
+                prefill_mxfp8_all_gather_group,
             )
         elif self.use_npu_fused_qkv:
             if self._is_npu_mxfp8_projection(self.qkv_proj):
@@ -3738,6 +3966,20 @@ class Qwen2MoeDecoderLayer(nn.Module):
         defer_mxfp8_hidden_ag = (
             input_hidden_is_scattered and reuse_prefill_mxfp8_input
         )
+        prefill_mxfp8_ag_qkv_slices = None
+        if (
+            defer_mxfp8_hidden_ag
+            and self.self_attn.use_npu_fused_qkv
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        ):
+            max_ag_chunks = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS.get()
+            if max_ag_chunks >= 2:
+                prefill_mxfp8_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
+                    hidden_states.shape[0],
+                    get_tensor_model_parallel_world_size(),
+                    envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get(),
+                    max_ag_chunks,
+                )
         prefill_ag_qkv_slices = None
         if (
             input_hidden_is_scattered
@@ -3907,6 +4149,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     get_tp_group() if defer_mxfp8_hidden_ag else None
                 ),
                 prefill_ag_qkv_slices=prefill_ag_qkv_slices,
+                prefill_mxfp8_ag_qkv_slices=prefill_mxfp8_ag_qkv_slices,
             )
         if split_first:
             if forward_batch.welm_prefill_graph.mirror_residual_is_partial:

@@ -155,6 +155,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
         return_v: bool = False,
         has_mirror: bool = True,
         positions_contiguous: bool = True,
+        rank_chunk_layout: bool = False,
     ):
         # Trace-time constants: fold the optional v materialization, the
         # mirror block-store, and the cos/sin load mode away before IR
@@ -162,6 +163,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
         self.return_v = bool(return_v)
         self.has_mirror = bool(has_mirror)
         self.positions_contiguous = bool(positions_contiguous)
+        self.rank_chunk_layout = bool(rank_chunk_layout)
 
     @jit
     def _rope_q(self, in_ch, out_ch, cs_ch, cur_rows):
@@ -419,11 +421,106 @@ class FusedQkvProjNormRopeCacheMxKernel:
         gm_v_cache: Tensor,
         epsilon,
     ):
+        """Original 16-argument entry; the helper is trace-time inlined."""
+        self._run(
+            gm_qx,
+            gm_sa,
+            gm_w,
+            gm_sb,
+            gm_gamma,
+            gm_positions,
+            gm_cos_sin,
+            gm_slot,
+            gm_q,
+            gm_k,
+            gm_v,
+            gm_mk,
+            gm_mv,
+            gm_k_cache,
+            gm_v_cache,
+            epsilon,
+            0,
+            0,
+            0,
+        )
+
+    def rank_chunk(
+        self,
+        gm_qx: Tensor,
+        gm_sa: Tensor,
+        gm_w: Tensor,
+        gm_sb: Tensor,
+        gm_gamma: Tensor,
+        gm_positions: Tensor,
+        gm_cos_sin: Tensor,
+        gm_slot: Tensor,
+        gm_q: Tensor,
+        gm_k: Tensor,
+        gm_v: Tensor,
+        gm_mk: Tensor,
+        gm_mv: Tensor,
+        gm_k_cache: Tensor,
+        gm_v_cache: Tensor,
+        epsilon,
+        full_local_rows,
+        chunk_local_rows,
+        chunk_start,
+    ):
+        """Packed per-rank qx/scale input, full original-order output."""
+        self._run(
+            gm_qx,
+            gm_sa,
+            gm_w,
+            gm_sb,
+            gm_gamma,
+            gm_positions,
+            gm_cos_sin,
+            gm_slot,
+            gm_q,
+            gm_k,
+            gm_v,
+            gm_mk,
+            gm_mv,
+            gm_k_cache,
+            gm_v_cache,
+            epsilon,
+            full_local_rows,
+            chunk_local_rows,
+            chunk_start,
+        )
+
+    @jit
+    def _run(
+        self,
+        gm_qx: Tensor,
+        gm_sa: Tensor,
+        gm_w: Tensor,
+        gm_sb: Tensor,
+        gm_gamma: Tensor,
+        gm_positions: Tensor,
+        gm_cos_sin: Tensor,
+        gm_slot: Tensor,
+        gm_q: Tensor,
+        gm_k: Tensor,
+        gm_v: Tensor,
+        gm_mk: Tensor,
+        gm_mv: Tensor,
+        gm_k_cache: Tensor,
+        gm_v_cache: Tensor,
+        epsilon,
+        full_local_rows,
+        chunk_local_rows,
+        chunk_start,
+    ):
         block_idx = get_block_idx()
         block_num = get_block_num()
         sub = get_subblock_id()
 
-        m_rows = gm_qx.shape[0]
+        if const_expr(self.rank_chunk_layout):
+            m_rows = chunk_local_rows
+            rank_count = gm_qx.shape[0] // chunk_local_rows
+        else:
+            m_rows = gm_qx.shape[0]
         m_pairs = (m_rows + PAIR_M - 1) // PAIR_M
         # Unit count follows the projection width: 2560 = mirror-source
         # layer (10 units), 2048 = plain QKV layer (8 units).
@@ -476,10 +573,41 @@ class FusedQkvProjNormRopeCacheMxKernel:
         )
 
         # Work-item scheduling: granularity is (pair, unit), grid-stride.
-        total_items = m_pairs * n_units
+        if const_expr(self.rank_chunk_layout):
+            total_items = rank_count * m_pairs * n_units
+        else:
+            total_items = m_pairs * n_units
         for item in range(block_idx, total_items, block_num):
-            pair = item // n_units
-            u = item - pair * n_units
+            if const_expr(self.rank_chunk_layout):
+                rank_pair = item // n_units
+                rank = rank_pair // m_pairs
+                pair = rank_pair - rank * m_pairs
+                u = item - rank_pair * n_units
+                input_base = rank * chunk_local_rows
+                output_base = rank * full_local_rows + chunk_start
+                # Both data and paired scales have the same rank-local rows.
+                # Interval aliases keep each rank's tail separate from the next.
+                qx_span = gm_qx[input_base : input_base + m_rows, None]
+                sa_span = gm_sa[input_base : input_base + m_rows, None, None]
+                q_span = gm_q[output_base : output_base + m_rows, None]
+                k_span = gm_k[output_base : output_base + m_rows, None]
+                v_span = gm_v[output_base : output_base + m_rows, None]
+                if const_expr(self.has_mirror):
+                    mk_span = gm_mk[output_base : output_base + m_rows, None]
+                    mv_span = gm_mv[output_base : output_base + m_rows, None]
+                else:
+                    mk_span = gm_mk
+                    mv_span = gm_mv
+            else:
+                pair = item // n_units
+                u = item - pair * n_units
+                qx_span = gm_qx
+                sa_span = gm_sa
+                q_span = gm_q
+                k_span = gm_k
+                v_span = gm_v
+                mk_span = gm_mk
+                mv_span = gm_mv
 
             cur_tokens = m_rows - pair * PAIR_M
             if cur_tokens > PAIR_M:
@@ -487,7 +615,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
 
             # Balanced split-M plan for this (possibly tail-clipped) pair
             # tile; a trailing odd tile clips to its real row count.
-            q_tile0 = tile_slice(gm_q, (PAIR_M, HEAD_DIM), (pair, 0))
+            q_tile0 = tile_slice(q_span, (PAIR_M, HEAD_DIM), (pair, 0))
             rows_here = cv_valid_extent(q_tile0, axis=0, part_id=sub)
             sub_start = sub * (cur_tokens - rows_here)
             row0 = pair * PAIR_M + sub_start
@@ -496,13 +624,17 @@ class FusedQkvProjNormRopeCacheMxKernel:
             # though every per-row loop below is empty.
             if row0 >= m_rows:
                 row0 = m_rows - 1
+            if const_expr(self.rank_chunk_layout):
+                meta_row0 = output_base + row0
+            else:
+                meta_row0 = row0
 
             # Vec-side preload for this item (this AIV's cos/sin rows).
             cs_w = cs_ch.head_next()
             table_rows = gm_cos_sin.shape[0]
             if const_expr(self.positions_contiguous):
                 # Prefill: one run of TILE_VEC_M consecutive table rows.
-                pos_base = gm_positions[row0]
+                pos_base = gm_positions[meta_row0]
                 if rows_here > 0:
                     if pos_base + TILE_VEC_M <= table_rows:
                         # Fast path: one bulk (<=128, 64) DMA.
@@ -525,7 +657,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
                 # Decode: arbitrary per-token positions (each request's own
                 # last position). One 1x64 gather per token.
                 for r in range(rows_here):
-                    pos = gm_positions[row0 + r]
+                    pos = gm_positions[meta_row0 + r]
                     mem_copy(
                         tile_slice(cs_w, (1, ROPE_DIM), (r, 0)),
                         tile_slice(gm_cos_sin, (1, ROPE_DIM), (pos, 0)),
@@ -539,10 +671,10 @@ class FusedQkvProjNormRopeCacheMxKernel:
             # aclnnQuantMatmulV5's QuantBatchMatmulV3).
             l0c_acc = l0c.head_next()
             for k_l1 in range(K_L1_TILES):
-                a_tile = tile_slice(gm_qx, (PAIR_M, K_L1), (pair, k_l1))
+                a_tile = tile_slice(qx_span, (PAIR_M, K_L1), (pair, k_l1))
                 b_tile = tile_slice(gm_w, (BASE_N, K_L1), (u, k_l1))
                 sa_tile = tile_slice(
-                    gm_sa, (PAIR_M, PACKED_S_L1, 2), (pair, k_l1, 0)
+                    sa_span, (PAIR_M, PACKED_S_L1, 2), (pair, k_l1, 0)
                 )
                 sb_tile = tile_slice(
                     gm_sb, (BASE_N, PACKED_S_L1, 2), (u, k_l1, 0)
@@ -607,7 +739,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
             if u < NUM_Q_HEADS:
                 self._rope_q(cv_r, out_w, cs_r, rows_here)
                 q_half = tile_slice(
-                    gm_q, (PAIR_M, HEAD_DIM), (pair, u)
+                    q_span, (PAIR_M, HEAD_DIM), (pair, u)
                 ).partition(dim=0, part_id=sub)
                 mem_copy(q_half, out_ch.tail_next())
             elif u == UNIT_K:
@@ -616,13 +748,13 @@ class FusedQkvProjNormRopeCacheMxKernel:
                 )
                 out_r = out_ch.tail_next()
                 k_half = tile_slice(
-                    gm_k, (PAIR_M, HEAD_DIM), (pair, 0)
+                    k_span, (PAIR_M, HEAD_DIM), (pair, 0)
                 ).partition(dim=0, part_id=sub)
                 # The tile drain and the slot scatter are two readers of one
                 # out_ch slot; both consume the same VF-written epoch.
                 mem_copy(k_half, out_r)
                 for r in range(rows_here):
-                    slot = gm_slot[row0 + r]
+                    slot = gm_slot[meta_row0 + r]
                     if slot != -1:
                         mem_copy(
                             tile_slice(gm_k_cache, (1, HEAD_DIM), (slot, 0)),
@@ -635,11 +767,11 @@ class FusedQkvProjNormRopeCacheMxKernel:
                     # Transitional interface: materialize v like the
                     # production scatter's transient contiguous copy.
                     v_half = tile_slice(
-                        gm_v, (PAIR_M, HEAD_DIM), (pair, 0)
+                        v_span, (PAIR_M, HEAD_DIM), (pair, 0)
                     ).partition(dim=0, part_id=sub)
                     mem_copy(v_half, out_r)
                 for r in range(rows_here):
-                    slot = gm_slot[row0 + r]
+                    slot = gm_slot[meta_row0 + r]
                     if slot != -1:
                         mem_copy(
                             tile_slice(gm_v_cache, (1, HEAD_DIM), (slot, 0)),
@@ -648,7 +780,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
             else:
                 self._cast_rows(cv_r, out_w, rows_here)
                 out_r = out_ch.tail_next()
-                gm_m = gm_mk if u == UNIT_MK else gm_mv
+                gm_m = mk_span if u == UNIT_MK else mv_span
                 if const_expr(self.has_mirror):
                     m_half = tile_slice(
                         gm_m, (PAIR_M, HEAD_DIM), (pair, 0)
@@ -716,6 +848,50 @@ def compile_aot_mx(
         TensorSpec((num_slots, HEAD_DIM), bf),
         TensorSpec((num_slots, HEAD_DIM), bf),
         dtypes.float32,
+    )
+
+
+def compile_aot_mx_rank_chunk(
+    qkv_width, num_slots, max_pos, *, positions_contiguous=True
+):
+    """Compile a direct-write MXFP8 pipeline artifact (19 runtime args).
+
+    qx/sa have Mchunk=P*m rows; metadata and dense outputs have Mfull=P*L.
+    L/m/a are runtime scalars with 0 <= a < a+m <= L, not compile constants.
+    """
+    n_units = qkv_width // HEAD_DIM
+    if n_units * HEAD_DIM != qkv_width or n_units not in (8, 10):
+        raise ValueError(f"qkv_width must be 2048 or 2560, got {qkv_width}")
+    op = FusedQkvProjNormRopeCacheMx(
+        return_v=True,
+        has_mirror=(n_units == 10),
+        positions_contiguous=positions_contiguous,
+    )
+    m_chunk = Dim("Mchunk", min=1)
+    m_full = Dim("Mfull", min=1)
+    mirror_rows = m_full if n_units == 10 else 1
+    i8, bf, f32, i64 = dtypes.int8, BF16, F32, dtypes.int64
+    return cannbotdsl.compile(
+        op.run_rank_chunk,
+        TensorSpec((m_chunk, HIDDEN), i8),
+        TensorSpec((m_chunk, SCALE_PAIRS, 2), i8),
+        TensorSpec((qkv_width, HIDDEN), i8),
+        TensorSpec((qkv_width, SCALE_PAIRS, 2), i8),
+        TensorSpec((1, HEAD_DIM), bf),
+        TensorSpec((m_full,), i64),
+        TensorSpec((max_pos, ROPE_DIM), f32),
+        TensorSpec((m_full,), i64),
+        TensorSpec((m_full, NUM_Q_HEADS * HEAD_DIM), bf),
+        TensorSpec((m_full, HEAD_DIM), bf),
+        TensorSpec((m_full, HEAD_DIM), bf),
+        TensorSpec((mirror_rows, HEAD_DIM), bf),
+        TensorSpec((mirror_rows, HEAD_DIM), bf),
+        TensorSpec((num_slots, HEAD_DIM), bf),
+        TensorSpec((num_slots, HEAD_DIM), bf),
+        dtypes.float32,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
     )
 
 
@@ -809,4 +985,61 @@ class FusedQkvProjNormRopeCacheMx:
             gm_k_cache,
             gm_v_cache,
             eps,
+        )
+
+    @host
+    def run_rank_chunk(
+        self,
+        gm_qx,
+        gm_sa,
+        gm_w,
+        gm_sb,
+        gm_gamma,
+        gm_positions,
+        gm_cos_sin,
+        gm_slot,
+        gm_q,
+        gm_k,
+        gm_v,
+        gm_mk,
+        gm_mv,
+        gm_k_cache,
+        gm_v_cache,
+        eps: float,
+        full_local_rows: int,
+        chunk_local_rows: int,
+        chunk_start: int,
+    ):
+        rank_count = gm_qx.shape[0] // chunk_local_rows
+        pairs_per_rank = (chunk_local_rows + PAIR_M - 1) // PAIR_M
+        block_dim = rank_count * pairs_per_rank * (gm_w.shape[0] // BASE_N)
+        grid_cap = _aic_block_limit()
+        if block_dim > grid_cap:
+            block_dim = grid_cap
+        op = FusedQkvProjNormRopeCacheMxKernel(
+            self._return_v,
+            self._has_mirror,
+            self._positions_contiguous,
+            rank_chunk_layout=True,
+        )
+        op[block_dim].rank_chunk(
+            gm_qx,
+            gm_sa,
+            gm_w,
+            gm_sb,
+            gm_gamma,
+            gm_positions,
+            gm_cos_sin,
+            gm_slot,
+            gm_q,
+            gm_k,
+            gm_v,
+            gm_mk,
+            gm_mv,
+            gm_k_cache,
+            gm_v_cache,
+            eps,
+            full_local_rows,
+            chunk_local_rows,
+            chunk_start,
         )
