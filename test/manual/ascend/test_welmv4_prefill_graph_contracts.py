@@ -90,6 +90,7 @@ Adapter = ADAPTER["WelmPrefillGraphAdapter"]
 # Existing fixtures construct only the buffers needed by each contract, not
 # the hardware-dependent __init__. Their default profile has mixed disabled.
 Adapter.mixed_chunk = False
+Adapter.use_megamoe = False
 Adapter.pad_mirror = False
 Adapter.mxfp8_ag_workspace = None
 

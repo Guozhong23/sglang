@@ -20,9 +20,10 @@ NS = types.SimpleNamespace
 
 
 class TestMixedBuckets(unittest.TestCase):
-    def adapter(self, enabled=True):
+    def adapter(self, enabled=True, megamoe=False):
         adapter = Adapter.__new__(Adapter)
         adapter.mixed_chunk = adapter.pad_mirror = enabled
+        adapter.use_megamoe = megamoe
         adapter.prune = True
         adapter.batch_sizes = (1, 2, 8)
         adapter.max_requests = 8
@@ -80,6 +81,30 @@ class TestMixedBuckets(unittest.TestCase):
         batch = self.batch(3, mode=1)
         batch.enable_kv_mirror = False
         self.assertTrue(adapter.can_run(batch, 4))
+
+    def test_megamoe_graph_rejects_mixed_and_keeps_pure_prefill(self):
+        for mixed_enabled in (False, True):
+            for megamoe in (False, True):
+                with self.subTest(mixed=mixed_enabled, megamoe=megamoe):
+                    adapter = self.adapter(
+                        enabled=mixed_enabled, megamoe=megamoe
+                    )
+                    # Both modes have the same captured token and mirror keys.
+                    # Admission must still keep decode rows out of fused graphs.
+                    self.assertTrue(adapter.can_run(self.batch(2, mode=1), 4))
+                    self.assertEqual(
+                        adapter.can_run(self.batch(2, mode=3), 4),
+                        mixed_enabled and not megamoe,
+                    )
+                    self.assertFalse(adapter.can_run(self.batch(2, mode=2), 4))
+
+    def test_megamoe_rejects_mixed_before_graph_metadata_access(self):
+        adapter = self.adapter(megamoe=True)
+        self.assertFalse(adapter.can_run(NS(forward_mode=3), 4))
+        self.assertEqual(
+            adapter._warned,
+            {"MegaMoE shared fusion requires pure EXTEND prefill"},
+        )
 
     def test_request_mask_clears_full_capacity_on_large_small_large(self):
         adapter = self.adapter()

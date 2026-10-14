@@ -643,11 +643,12 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
-    # BF16/MXFP8 WeLM target prefill, non-consumer EP; only shared gate/up may
-    # overlap TopK with NPU multi-stream enabled. The rest precedes MegaMoE.
+    # BF16 WeLM target prefill, non-consumer EP, with shared experts fused.
+    # Only actual MegaMoE calls skip the external shared FFN; all fallbacks
+    # retain the ordinary MoE backend and its shared-expert stream policy.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
-    # With MegaMoE enabled, require padded prefill rows before attention-TP
-    # scattering to exceed this threshold. Zero keeps the existing selection.
+    # Read only with MegaMoE enabled. Padded prefill rows before attention-TP
+    # scattering must exceed this threshold; nonpositive values impose no limit.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2

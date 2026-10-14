@@ -150,6 +150,9 @@ class TestMXFP8Workspace(unittest.TestCase):
                 enable_dp_attention=False, pp_size=1, attn_cp_size=1, moe_ep_size=1
             ),
             "envs": types.SimpleNamespace(
+                WELM_NPU_USE_MEGAMOE=types.SimpleNamespace(
+                    get=lambda: False
+                ),
                 SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES=types.SimpleNamespace(
                     get=lambda: "1,2,4"
                 )

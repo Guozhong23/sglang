@@ -176,6 +176,7 @@ class WelmPrefillGraphAdapter:
             raise ValueError("WeLM breakable prefill does not capture scale-seq expansion")
         self.prune = bool(args.enable_kv_mirror)
         self.mixed_chunk = bool(args.enable_mixed_chunk)
+        self.use_megamoe = envs.WELM_NPU_USE_MEGAMOE.get()
         # Keep the validated exact-B path, including its capture topology,
         # unchanged unless mixed chunk was explicitly enabled.
         self.pad_mirror = self.prune and self.mixed_chunk
@@ -315,6 +316,10 @@ class WelmPrefillGraphAdapter:
         return False
 
     def can_run(self, batch: ForwardBatch, capacity: int) -> bool:
+        if self.use_megamoe and batch.forward_mode == ForwardMode.MIXED:
+            # EXTEND and MIXED share a token-bucket graph key. An EXTEND graph
+            # captured with shared fusion must never process decode rows.
+            return self.reject("MegaMoE shared fusion requires pure EXTEND prefill")
         if batch.forward_mode != ForwardMode.EXTEND and not (
             self.mixed_chunk and batch.forward_mode == ForwardMode.MIXED
         ):

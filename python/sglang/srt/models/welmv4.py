@@ -831,6 +831,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.last_final_shared_output: Optional[torch.Tensor] = None
         # Bound by the target runner after loading, never by a draft forward.
         self.welm_prefill_megamoe = None
+        self.welm_megamoe_shared_weights = None
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -1089,7 +1090,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_welm_prefill_normal_stream_policy: bool = False,
         use_welm_prefill_megamoe: bool = False,
         megamoe_num_valid_rows: Optional[int] = None,
-        force_serial_shared_expert: bool = False,
         valid_row_mask: Optional[torch.Tensor] = None,
         invalid_row_mask: Optional[torch.Tensor] = None,
         invalid_topk_id: Optional[int] = None,
@@ -1105,7 +1105,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
-        shared_gate_up = None
         moe_a2a_backend = get_moe_a2a_backend()
         is_prefill_batch = (
             forward_batch is not None
@@ -1113,6 +1112,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 include_draft_extend_v2=True
             )
         )
+        # Every MegaMoE call includes shared experts. A bound runtime alone
+        # must not disable the external FFN/overlap when this batch falls back
+        # because of its threshold, capacity, phase or token layout.
+        fuse_shared_experts = use_welm_prefill_megamoe
         is_kv_mirror_prefill = (
             forward_batch is not None
             and forward_batch.enable_kv_mirror
@@ -1128,7 +1131,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         enable_npu_decode_like_dual_stream = (
             _is_npu
-            and not force_serial_shared_expert
             and not use_welm_prefill_megamoe
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
@@ -1138,7 +1140,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         enable_npu_prefill_normal_shared_overlap = (
             _is_npu
-            and not force_serial_shared_expert
             and not use_welm_prefill_megamoe
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
@@ -1161,17 +1162,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         enable_npu_shared_alt_stream = (
             enable_npu_decode_like_dual_stream
             or enable_npu_prefill_normal_shared_overlap
-        )
-        # MegaMoE still forbids whole-shared-MLP overlap. Only its gate/up
-        # projection may overlap TopK; finish the rest before entering MegaMoE.
-        # Use the actual per-batch selector, not merely the bound runtime, so
-        # capacity/mixed-phase fallback retains its existing stream policy.
-        enable_npu_megamoe_shared_gate_up_overlap = (
-            _is_npu
-            and use_welm_prefill_megamoe
-            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-            and self.shared_expert is not None
-            and num_tokens > 0
         )
         num_token_non_padded = (
             getattr(forward_batch, "num_token_non_padded", None)
@@ -1255,8 +1245,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             if (
                 self.shared_expert is not None
+                and not fuse_shared_experts
                 and not enable_npu_shared_alt_stream
-                and not enable_npu_megamoe_shared_gate_up_overlap
             ):
                 shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
@@ -1275,12 +1265,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 # both paths only read the original hidden_states storage.
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_expert
-                )
-            if enable_npu_megamoe_shared_gate_up_overlap:
-                # The helper makes the shared stream wait for the router GEMM
-                # and input sanitization, then returns without blocking TopK.
-                shared_gate_up, _ = process_shared_expert(
-                    hidden_states, self.shared_expert.gate_up_proj
                 )
             # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
             # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
@@ -1353,23 +1337,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states, self._forward_shared_expert
             )
         if use_welm_prefill_megamoe:
-            if enable_npu_megamoe_shared_gate_up_overlap:
-                wait_share_stream()
-                # Allocated on the shared stream, consumed by SwiGLU on this
-                # stream: prevent allocator reuse until the consumer finishes.
-                shared_gate_up.record_stream(
-                    torch.get_device_module().current_stream()
-                )
-                shared_output = self._forward_shared_expert(
-                    hidden_states, gate_up=shared_gate_up
-                )
             experts_output = self.welm_prefill_megamoe.forward_layer(
                 self.experts,
                 hidden_states,
                 topk_output,
                 megamoe_num_valid_rows,
-                # DP clears the final expert+shared output at its transport
-                # boundary; do not clear the expert component a second time.
+                shared_weights=self.welm_megamoe_shared_weights,
+                # DP clears the combined output at its transport boundary;
+                # do not clear that output a second time here.
                 zero_output_padding=(
                     valid_row_mask is None
                     or forward_batch.welm_prefill_graph is not None
@@ -1404,6 +1379,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             experts_output = self.experts(hidden_states, topk_output)
+        if fuse_shared_experts:
+            # MegaMoE already combined routed and shared experts. Do not expose
+            # this tensor as a routed-only component to final-layer RMSNorm or
+            # run another all-reduce/add over the complete output.
+            self.last_final_experts_output = None
+            self.last_final_shared_output = None
+            output = experts_output.view(num_tokens, hidden_dim)
+            return (output, None, None) if return_components else output
         if return_components and skip_component_output:
             if enable_npu_shared_alt_stream:
                 # This early return hands shared_output to the caller, so it is
@@ -3858,7 +3841,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         megamoe = self.mlp.welm_prefill_megamoe
         use_megamoe_prefill = (
             megamoe is not None
-            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and forward_batch.forward_mode == ForwardMode.EXTEND
             and output_hidden_is_scattered
             # MoE input is already scattered; recover OProj's padded MM rows.
             and megamoe.meets_prefill_threshold(hidden_states.shape[0] * tp_size)
@@ -3882,7 +3865,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 use_welm_prefill_megamoe=(
                     use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
                 ),
-                force_serial_shared_expert=use_megamoe_prefill,
                 return_components=self.is_final_layer,
                 skip_component_output=(
                     self.is_final_layer

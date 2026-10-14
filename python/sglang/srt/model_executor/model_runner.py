@@ -1102,17 +1102,23 @@ class ModelRunner:
 
     def maybe_init_welm_prefill_megamoe(self) -> None:
         self.welm_prefill_megamoe = None
+        # Draft workers inherit the target's environment but keep their own
+        # backend and weights. The disabled path does not read the threshold
+        # or import the optional MegaMoE runtime.
+        if not envs.WELM_NPU_USE_MEGAMOE.get() or self.is_draft_worker:
+            return
         if (
-            not envs.WELM_NPU_USE_MEGAMOE.get()
-            or self.device != "npu"
-            or self.is_draft_worker
+            self.device != "npu"
             or self.dtype != torch.bfloat16
             or self.ps.moe_ep_size <= 1
             or get_parallel().moe_tp_size != 1
             or "WeLMV4MoeForCausalLM"
             not in (self.model_config.hf_config.architectures or [])
         ):
-            return
+            raise ValueError(
+                "WeLM MegaMoE shared fusion requires an NPU WeLMV4 target "
+                "with BF16 activations, EP>1 and MoE TP=1"
+            )
         from sglang.srt.hardware_backend.npu.moe.welmv4_megamoe import (
             init_welm_prefill_megamoe,
         )
