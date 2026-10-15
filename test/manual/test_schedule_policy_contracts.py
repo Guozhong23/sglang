@@ -13,12 +13,11 @@ import time
 import unittest
 from array import array
 from collections import Counter, defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from enum import Enum, auto
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Union
-
 
 ROOT = Path(__file__).resolve().parents[2]
 SRT = ROOT / "python/sglang/srt"
@@ -225,6 +224,298 @@ class TestHRRN(unittest.TestCase):
                 queue = [req("z", 100), req("a", 1)]
                 policy(name, cache).calc_priority(queue, processed_tokens=1000)
                 self.assertEqual(ids(queue), ["z", "a"])
+
+
+class TestShortestPrefillFirst(unittest.TestCase):
+    def test_uncached_work_includes_retracted_output_and_minimum_one(self):
+        cached = req("cached", 100, matched=90)
+        replay = req("replay", 20, matched=10)
+        replay.output_ids = [0] * 50
+        zero = req("zero", 10, matched=10)
+        queue = [replay, cached, zero]
+        SchedulePolicy._sort_by_shortest_prefill(queue, set())
+        self.assertEqual(ids(queue), ["zero", "cached", "replay"])
+        self.assertEqual(
+            [SchedulePolicy._shortest_prefill_work(r) for r in queue], [1, 10, 60]
+        )
+
+    def test_equal_work_uses_arrival_then_stable_input_order(self):
+        older, newer, equal = req("z", 32), req("a", 32), req("b", 32)
+        older.time_stats.wait_queue_entry_time = 1
+        newer.time_stats.wait_queue_entry_time = 2
+        equal.time_stats.wait_queue_entry_time = 2
+        queue = [newer, equal, older]
+        SchedulePolicy._sort_by_shortest_prefill(queue, set())
+        self.assertEqual(queue, [older, newer, equal])
+
+    def test_calc_priority_matches_cache_and_deprioritizes_duplicate(self):
+        cache = Cache({(1,) * 100: (80, 10)})
+        queue = [req("long", 90, token=2), req("cached", 100)]
+        policy("shortest-prefill-first", cache).calc_priority(queue)
+        self.assertEqual(ids(queue), ["cached", "long"])
+        duplicate = req("duplicate", 1)
+        queue.append(duplicate)
+        SchedulePolicy._sort_by_shortest_prefill(queue, {"duplicate"})
+        self.assertIs(queue[-1], duplicate)
+
+    def test_cache_disabled_rejected_and_large_queue_still_sorted(self):
+        with self.assertRaises(ValueError):
+            policy("shortest-prefill-first", Cache(disable=True))
+        queue = [req(f"{i:03}", i + 1, token=i + 1) for i in reversed(range(129))]
+        policy("shortest-prefill-first").calc_priority(queue)
+        self.assertEqual(ids(queue), sorted(ids(queue)))
+
+    def test_page128_reservation_and_continuation_progress(self):
+        p = policy("shortest-prefill-first")
+        continuation = admission_req("continuation", 33024)
+        for work, expected in ((1, 16384), (129, 16256), (16384, 128)):
+            with self.subTest(work=work):
+                self.assertEqual(
+                    p.shortest_prefill_chunk_limit(
+                        continuation, [req("short", work)], 16512, 128
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            p.shortest_prefill_chunk_limit(
+                continuation, [req("a", 512), req("b", 1024)], 16512, 128
+            ),
+            14976,
+        )
+
+    def test_reservation_stops_at_first_nonfitting_candidate(self):
+        p = policy("shortest-prefill-first")
+        continuation = admission_req("continuation", 33024)
+        # The later one-token candidate must not be scanned past the blocker.
+        queue = [req("first", 128), req("blocker", 16384), req("later", 1)]
+        self.assertEqual(
+            p.shortest_prefill_chunk_limit(continuation, queue, 16512, 128), 16384
+        )
+
+    def test_no_reservation_for_small_budget_or_nonshorter_work(self):
+        continuation = admission_req("continuation", 1024)
+        for name, budget, waiting in (
+            ("hrrn", 16512, [req("short", 1)]),
+            ("shortest-prefill-first", 128, [req("short", 1)]),
+            ("shortest-prefill-first", 16512, [req("same", 1024)]),
+            ("shortest-prefill-first", 16512, []),
+        ):
+            with self.subTest(name=name, budget=budget):
+                self.assertIsNone(
+                    policy(name).shortest_prefill_chunk_limit(
+                        continuation, waiting, budget, 128
+                    )
+                )
+
+
+class HybridAllocator:
+    def available_size(self):
+        return 1_000_000
+
+    full_available_size = available_size
+    swa_available_size = available_size
+
+
+class AdmissionCache(Cache):
+    def __init__(self):
+        super().__init__()
+        self.locks = 0
+        self.load_calls = 0
+        self.host_loaded = 0
+        self.sliding_window_size = 4096
+
+    def supports_mamba(self):
+        return False
+
+    def is_tree_cache(self):
+        return False
+
+    def evictable_size(self):
+        return 0
+
+    full_evictable_size = evictable_size
+    swa_evictable_size = evictable_size
+
+    def inc_lock_ref(self, node):
+        self.locks += 1
+        return NS(swa_uuid_for_lock="swa")
+
+    def dec_lock_ref(self, node):
+        self.locks -= 1
+
+    def init_load_back(self, params):
+        self.load_calls += 1
+        return list(range(self.host_loaded)), "loaded-node"
+
+
+SCHEDULE = NS(schedule_policy="shortest-prefill-first")
+ADMISSION = load_nodes(
+    SRT / "managers/schedule_policy.py",
+    ["AddReqResult", "PrefillAdder"],
+    {
+        "Enum": Enum,
+        "auto": auto,
+        "contextmanager": contextmanager,
+        "CLIP_MAX_NEW_TOKENS": 4096,
+        "InitLoadBackParams": NS,
+        "SWATokenToKVPoolAllocator": HybridAllocator,
+        "DeepSeekV4HiSparseTokenToKVPoolAllocator": type("HiSparse", (), {}),
+        "PureSWATokenToKVPoolAllocator": type("PureSWA", (), {}),
+        "UnifiedMambaTokenToKVPoolAllocator": type("UnifiedMamba", (), {}),
+        "is_dsa_prefill_cp_in_seq_split": lambda: False,
+        "is_prefill_context_parallel_enabled": lambda: False,
+        "get_schedule": lambda: SCHEDULE,
+        "torch": NS(cat=lambda values: sum(values, [])),
+    },
+)
+PrefillAdder = ADMISSION["PrefillAdder"]
+AddReqResult = ADMISSION["AddReqResult"]
+
+
+def admission_req(rid, length, *, host=0):
+    candidate = req(rid, length)
+    candidate.full_untruncated_fill_ids = candidate.origin_input_ids
+    candidate.sampling_params = NS(max_new_tokens=1, ignore_eos=False)
+    candidate.last_node = "node"
+    candidate.best_match_node = "best-node"
+    candidate.retracted_stain = False
+    candidate.mamba_pool_idx = None
+    candidate.swa_host_hit_length = 0
+    candidate.host_hit_length = host
+    candidate.needs_host_load_back = lambda: host > 0
+    candidate.set_extend_range = lambda start, end: setattr(
+        candidate, "extend_range", NS(start=start, end=end, length=end - start)
+    )
+    return candidate
+
+
+def make_adder(
+    *, budget=16512, mixed=0, mixed_kv=None, available=1_000_000, hybrid=False
+):
+    cache = AdmissionCache()
+    allocator = HybridAllocator() if hybrid else NS(available_size=lambda: available)
+    adder = PrefillAdder(
+        page_size=128,
+        tree_cache=cache,
+        token_to_kv_pool_allocator=allocator,
+        running_batch=NS(reqs=[], batch_size=lambda: 0),
+        new_token_ratio=1,
+        rem_input_tokens=1_000_000,
+        rem_chunk_tokens=budget,
+        num_mixed_decode_tokens=mixed,
+        mixed_decode_kv_tokens=mixed_kv,
+    )
+    return adder
+
+
+class TestSPFAdmission(unittest.TestCase):
+    def setUp(self):
+        SCHEDULE.schedule_policy = "shortest-prefill-first"
+
+    def add(self, adder, candidate, active=True):
+        return adder.add_one_req(
+            candidate, has_chunked_req=active, truncation_align_size=None
+        )
+
+    def test_continuation_and_completed_short_requests_share_batch(self):
+        for hybrid in (False, True):
+            with self.subTest(hybrid=hybrid):
+                adder = make_adder(hybrid=hybrid)
+                continuation = admission_req("continuation", 33024)
+                waiting = [admission_req("a", 512), admission_req("b", 1024)]
+                adder.chunked_req_limit = policy(
+                    "shortest-prefill-first"
+                ).shortest_prefill_chunk_limit(
+                    continuation, waiting, adder.rem_chunk_tokens, 128
+                )
+                self.assertIs(adder.add_chunked_req(continuation), continuation)
+                self.assertEqual(continuation.extend_range.length, 14976)
+                for candidate in waiting:
+                    self.add(adder, candidate)
+                self.assertEqual(adder.can_run_list, [continuation, *waiting])
+                self.assertIsNone(adder.new_chunked_req)
+                self.assertEqual(adder.rem_chunk_tokens, 0)
+                self.assertEqual(adder.tree_cache.locks, 2)
+                self.assertGreater(adder.rem_total_tokens, 0)
+
+    def test_mixed_compute_and_kv_budgets_remain_distinct(self):
+        adder = make_adder(mixed=1, mixed_kv=128)
+        self.assertEqual(adder.rem_chunk_tokens, 16511)
+        self.assertEqual(adder.rem_total_tokens, 1_000_000 - 128)
+        self.assertEqual(adder.rem_swa_token_offset, 128)
+        continuation = admission_req("old", 33024)
+        limit = policy("shortest-prefill-first").shortest_prefill_chunk_limit(
+            continuation, [req("short", 128)], adder.rem_chunk_tokens, 128
+        )
+        self.assertEqual(limit, 16256)
+        adder.chunked_req_limit = limit
+        adder.add_chunked_req(continuation)
+        self.assertEqual(adder.rem_chunk_tokens, 255)
+
+    def test_second_unfinished_chunk_rejected_before_load_or_delayer(self):
+        adder = make_adder(budget=512)
+        candidate = admission_req("second", 1024, host=128)
+        calls = []
+        adder.prefill_delayer_single_pass = NS(
+            negotiate_should_allow_prefill=lambda **kwargs: calls.append(kwargs) or True
+        )
+        self.assertEqual(self.add(adder, candidate), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertFalse(hasattr(candidate, "extend_range"))
+        self.assertEqual(adder.tree_cache.load_calls, 0)
+        self.assertEqual(adder.tree_cache.locks, 0)
+        self.assertEqual(calls, [])
+
+    def test_host_miss_rechecked_and_temporary_lock_released(self):
+        adder = make_adder(budget=512)
+        candidate = admission_req("miss", 1024, host=768)
+        self.assertEqual(self.add(adder, candidate), AddReqResult.OTHER)
+        self.assertEqual(adder.tree_cache.load_calls, 1)
+        self.assertEqual(adder.tree_cache.locks, 0)
+        self.assertFalse(hasattr(candidate, "extend_range"))
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 512)
+
+    def test_successful_host_load_can_complete_next_to_old_chunk(self):
+        adder = make_adder(budget=512)
+        adder.tree_cache.host_loaded = 768
+        candidate = admission_req("hit", 1024, host=768)
+        self.add(adder, candidate)
+        self.assertEqual(candidate.extend_range.length, 256)
+        self.assertEqual(adder.can_run_list, [candidate])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.tree_cache.locks, 1)
+
+    def test_kv_and_request_count_admission_gates_are_preserved(self):
+        adder = make_adder(available=256)
+        self.assertEqual(
+            self.add(adder, admission_req("memory", 512)), AddReqResult.NO_TOKEN
+        )
+        self.assertEqual(adder.tree_cache.locks, 0)
+        adder = make_adder()
+        adder.prefill_max_requests = 0
+        self.assertEqual(
+            self.add(adder, admission_req("slots", 512)), AddReqResult.OTHER
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_old_chunk_finishes_then_new_chunk_is_allowed(self):
+        adder = make_adder()
+        old = adder.add_chunked_req(admission_req("old", 512))
+        self.assertIsNone(old)
+        candidate = admission_req("new", 33024)
+        self.add(adder, candidate, active=old is not None)
+        self.assertIs(adder.new_chunked_req, candidate)
+        self.assertEqual(candidate.extend_range.length, 16000)
+
+    def test_fcfs_keeps_its_previous_admission_behavior(self):
+        SCHEDULE.schedule_policy = "fcfs"
+        adder = make_adder(budget=512)
+        candidate = admission_req("fcfs", 1024)
+        self.add(adder, candidate)
+        self.assertIs(adder.new_chunked_req, candidate)
+        self.assertEqual(candidate.extend_range.length, 512)
 
 
 DisaggregationMode = NS(NULL="null", PREFILL="prefill", DECODE="decode")

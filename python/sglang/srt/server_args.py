@@ -811,6 +811,7 @@ class ServerArgs:
                 "priority",
                 "routing-key",
                 "hrrn",
+                "shortest-prefill-first",
             ],
         ),
         NS("schedule"),

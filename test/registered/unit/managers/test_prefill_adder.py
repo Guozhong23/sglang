@@ -2,12 +2,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    SchedulePolicy,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
@@ -115,6 +123,203 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def create_shortest_prefill_adder(
+        self,
+        *,
+        chunk_tokens=4096,
+        page_size=256,
+        schedule_policy="shortest-prefill-first",
+        **kwargs,
+    ):
+        override = get_context().override_server_args(schedule_policy=schedule_policy)
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=chunk_tokens,
+            **kwargs,
+        )
+
+    def create_shortest_prefill_req(self, rid, num_tokens):
+        req = self._create_delayer_req(num_tokens)
+        req.rid = rid
+        req.origin_input_ids = req.full_untruncated_fill_ids[:]
+        req.num_matched_prefix_tokens = 0
+        req.swa_host_hit_length = 0
+        return req
+
+    def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
+        adder = self.create_shortest_prefill_adder()
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shortest_prefill_req("continuation", 16384)
+        waiting = [
+            self.create_shortest_prefill_req("a", 512),
+            self.create_shortest_prefill_req("b", 1024),
+        ]
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+        )
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        self.assertEqual(continuation.extend_range.length, 2560)
+        for req in waiting:
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+            self.assertEqual(req.extend_range.length, len(req.origin_input_ids))
+        self.assertEqual(adder.can_run_list, [continuation, *waiting])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+        self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_rejects_second_unfinished_chunk(self):
+        delayer = _RecordingDelayer(allow=True)
+        adder = self.create_shortest_prefill_adder(
+            chunk_tokens=512, prefill_delayer_single_pass=delayer
+        )
+        req = self.create_shortest_prefill_req("second-chunk", 1024)
+        req.needs_host_load_back.return_value = True
+        before_budget = (
+            adder.rem_chunk_tokens,
+            adder.rem_input_tokens,
+            adder.rem_total_tokens,
+        )
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        req.set_extend_range.assert_not_called()
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertEqual(delayer.calls, [])
+        self.mock_tree_cache.inc_lock_ref.assert_called_once_with(req.last_node)
+        self.mock_tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        self.assertEqual(
+            (adder.rem_chunk_tokens, adder.rem_input_tokens, adder.rem_total_tokens),
+            before_budget,
+        )
+
+    def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        req = self.create_shortest_prefill_req("host-miss", 1024)
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.host_hit_length = 768
+        req.best_match_node = req.last_node
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.empty(0, dtype=torch.int64),
+            req.last_node,
+        )
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        req.set_extend_range.assert_not_called()
+        self.mock_tree_cache.inc_lock_ref.assert_called_once_with(req.last_node)
+        self.mock_tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        self.assertEqual(adder.rem_chunk_tokens, 512)
+
+    def test_shortest_prefill_preserves_memory_admission(self):
+        adder = self.create_shortest_prefill_adder()
+        self.mock_token_allocator.available_size.return_value = 256
+        req = self.create_shortest_prefill_req("no-memory", 512)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_continuation_without_limit_keeps_normal_chunk_size(self):
+        adder = self.create_shortest_prefill_adder()
+        req = self.create_shortest_prefill_req("continuation", 8192)
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_range.length, 4096)
+
+    def test_shortest_prefill_page128_reservation_with_current_chunk_budget(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=16512, page_size=128)
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shortest_prefill_req("continuation", 33024)
+        waiting = [
+            self.create_shortest_prefill_req("a", 129),
+            self.create_shortest_prefill_req("b", 257),
+        ]
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+        )
+        self.assertEqual(adder.chunked_req_limit, 15872)  # 16512 - 256 - 384
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        self.assertEqual(continuation.extend_range.length, 15872)
+        for req in waiting:
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+            self.assertEqual(req.extend_range.length, len(req.origin_input_ids))
+        self.assertEqual(adder.can_run_list, [continuation, *waiting])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+        self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_finishing_continuation_allows_new_chunk(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=1024)
+        continuation = self.create_shortest_prefill_req("continuation", 256)
+        active = adder.add_chunked_req(continuation)
+        self.assertIsNone(active)
+        req = self.create_shortest_prefill_req("new-chunk", 1536)
+        self.assertEqual(
+            adder.add_one_req(
+                req, has_chunked_req=active is not None, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [continuation, req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_range.length, 768)
+
+    def test_shortest_prefill_uses_swa_cap_when_rejecting_second_chunk(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=2048, page_size=128)
+        adder.is_hybrid_swa = True
+        self.mock_tree_cache.sliding_window_size = 128
+        self.mock_token_allocator.swa_available_size.return_value = 512
+        req = self.create_shortest_prefill_req("swa-second-chunk", 1024)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+        self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_fcfs_retains_existing_chunk_admission(self):
+        adder = self.create_shortest_prefill_adder(
+            chunk_tokens=512, schedule_policy="fcfs"
+        )
+        req = self.create_shortest_prefill_req("new-chunk", 1024)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_range.length, 512)
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
