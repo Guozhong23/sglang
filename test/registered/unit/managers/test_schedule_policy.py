@@ -226,25 +226,6 @@ class TestShortestPrefillFirst(CustomTestCase):
             )
         )
 
-    def test_sort_only_uses_same_cache_aware_order_without_reservation(self):
-        self.policy = SchedulePolicy(
-            policy="shortest-prefill-first-sort-only",
-            tree_cache=RadixCache.create_simulated(),
-            enable_hierarchical_cache=True,
-            enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
-        )
-        self.test_calc_priority_uses_uncached_work()
-        self.test_duplicate_prefix_is_deprioritized()
-        self.assertIsNone(
-            self.policy.shortest_prefill_chunk_limit(
-                self.make_req("continuation", 33024),
-                [self.make_req("a", 512), self.make_req("b", 1024)],
-                16512,
-                128,
-            )
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

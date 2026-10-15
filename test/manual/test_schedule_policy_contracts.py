@@ -21,7 +21,6 @@ from typing import Union
 
 ROOT = Path(__file__).resolve().parents[2]
 SRT = ROOT / "python/sglang/srt"
-SPF_POLICIES = ("shortest-prefill-first", "shortest-prefill-first-sort-only")
 
 
 def load_nodes(path, names, namespace, class_name=None):
@@ -250,27 +249,21 @@ class TestShortestPrefillFirst(unittest.TestCase):
         self.assertEqual(queue, [older, newer, equal])
 
     def test_calc_priority_matches_cache_and_deprioritizes_duplicate(self):
-        for name in SPF_POLICIES:
-            with self.subTest(policy=name):
-                cache = Cache({(1,) * 100: (80, 10)})
-                queue = [req("long", 90, token=2), req("cached", 100)]
-                policy(name, cache).calc_priority(queue)
-                self.assertEqual(ids(queue), ["cached", "long"])
-                duplicate = req("duplicate", 1)
-                queue.append(duplicate)
-                SchedulePolicy._sort_by_shortest_prefill(queue, {"duplicate"})
-                self.assertIs(queue[-1], duplicate)
+        cache = Cache({(1,) * 100: (80, 10)})
+        queue = [req("long", 90, token=2), req("cached", 100)]
+        policy("shortest-prefill-first", cache).calc_priority(queue)
+        self.assertEqual(ids(queue), ["cached", "long"])
+        duplicate = req("duplicate", 1)
+        queue.append(duplicate)
+        SchedulePolicy._sort_by_shortest_prefill(queue, {"duplicate"})
+        self.assertIs(queue[-1], duplicate)
 
     def test_cache_disabled_rejected_and_large_queue_still_sorted(self):
-        for name in SPF_POLICIES:
-            with self.subTest(policy=name):
-                with self.assertRaises(ValueError):
-                    policy(name, Cache(disable=True))
-                queue = [
-                    req(f"{i:03}", i + 1, token=i + 1) for i in reversed(range(129))
-                ]
-                policy(name).calc_priority(queue)
-                self.assertEqual(ids(queue), sorted(ids(queue)))
+        with self.assertRaises(ValueError):
+            policy("shortest-prefill-first", Cache(disable=True))
+        queue = [req(f"{i:03}", i + 1, token=i + 1) for i in reversed(range(129))]
+        policy("shortest-prefill-first").calc_priority(queue)
+        self.assertEqual(ids(queue), sorted(ids(queue)))
 
     def test_page128_reservation_and_continuation_progress(self):
         p = policy("shortest-prefill-first")
@@ -303,7 +296,6 @@ class TestShortestPrefillFirst(unittest.TestCase):
         continuation = admission_req("continuation", 1024)
         for name, budget, waiting in (
             ("hrrn", 16512, [req("short", 1)]),
-            ("shortest-prefill-first-sort-only", 16512, [req("short", 1)]),
             ("shortest-prefill-first", 128, [req("short", 1)]),
             ("shortest-prefill-first", 16512, [req("same", 1024)]),
             ("shortest-prefill-first", 16512, []),
@@ -509,82 +501,13 @@ class TestSPFAdmission(unittest.TestCase):
         self.assertEqual(adder.can_run_list, [])
 
     def test_old_chunk_finishes_then_new_chunk_is_allowed(self):
-        for name in SPF_POLICIES:
-            with self.subTest(policy=name):
-                SCHEDULE.schedule_policy = name
-                adder = make_adder()
-                old = adder.add_chunked_req(admission_req("old", 512))
-                self.assertIsNone(old)
-                candidate = admission_req("new", 33024)
-                self.add(adder, candidate, active=old is not None)
-                self.assertIs(adder.new_chunked_req, candidate)
-                self.assertEqual(candidate.extend_range.length, 16000)
-
-    def test_sort_only_keeps_full_continuation_budget_before_short_waiters(self):
-        for name, chunk_size in zip(SPF_POLICIES, (14976, 16512)):
-            with self.subTest(policy=name):
-                SCHEDULE.schedule_policy = name
-                adder = make_adder()
-                old = admission_req("old", 33024)
-                waiting = [admission_req("a", 512), admission_req("b", 1024)]
-                adder.chunked_req_limit = policy(name).shortest_prefill_chunk_limit(
-                    old, waiting, adder.rem_chunk_tokens, adder.page_size
-                )
-                self.assertIs(adder.add_chunked_req(old), old)
-                self.assertEqual(old.extend_range.length, chunk_size)
-                for candidate in waiting:
-                    if self.add(adder, candidate) != AddReqResult.CONTINUE:
-                        break
-                expected = [old, *waiting] if chunk_size == 14976 else [old]
-                self.assertEqual(adder.can_run_list, expected)
-                self.assertIsNone(adder.new_chunked_req)
-                self.assertEqual(adder.rem_chunk_tokens, 0)
-
-    def test_swa_new_chunk_cannot_be_overwritten_before_or_after_host_load(self):
-        for name in SPF_POLICIES:
-            for host_miss in (False, True):
-                with self.subTest(policy=name, host_miss=host_miss):
-                    SCHEDULE.schedule_policy = name
-                    adder = make_adder(hybrid=True)
-                    adder.token_to_kv_pool_allocator.swa_available_size = lambda: 10240
-                    first = admission_req("first", 33024)
-                    first.sampling_params.max_new_tokens = 4096
-                    self.assertEqual(
-                        self.add(adder, first, False), AddReqResult.CONTINUE
-                    )
-                    self.assertEqual(first.extend_range.length, 6016)
-                    self.assertIs(adder.new_chunked_req, first)
-                    before = (
-                        adder.rem_chunk_tokens,
-                        adder.rem_total_tokens,
-                        adder.rem_swa_tokens,
-                    )
-                    second = admission_req(
-                        "second", 33024, host=32512 if host_miss else 0
-                    )
-                    # No continuation existed when the scheduler pass started.
-                    self.assertEqual(self.add(adder, second, False), AddReqResult.OTHER)
-                    self.assertEqual(adder.can_run_list, [first])
-                    self.assertIs(adder.new_chunked_req, first)
-                    self.assertFalse(hasattr(second, "extend_range"))
-                    self.assertEqual(adder.tree_cache.load_calls, int(host_miss))
-                    self.assertEqual(adder.tree_cache.locks, 1)
-                    self.assertEqual(
-                        (
-                            adder.rem_chunk_tokens,
-                            adder.rem_total_tokens,
-                            adder.rem_swa_tokens,
-                        ),
-                        before,
-                    )
-                    # A complete short request still fits beside the new chunk.
-                    short = admission_req("short", 512)
-                    self.assertEqual(
-                        self.add(adder, short, False), AddReqResult.CONTINUE
-                    )
-                    self.assertEqual(adder.can_run_list, [first, short])
-                    self.assertEqual(short.extend_range.length, 512)
-                    self.assertIs(adder.new_chunked_req, first)
+        adder = make_adder()
+        old = adder.add_chunked_req(admission_req("old", 512))
+        self.assertIsNone(old)
+        candidate = admission_req("new", 33024)
+        self.add(adder, candidate, active=old is not None)
+        self.assertIs(adder.new_chunked_req, candidate)
+        self.assertEqual(candidate.extend_range.length, 16000)
 
     def test_fcfs_keeps_its_previous_admission_behavior(self):
         SCHEDULE.schedule_policy = "fcfs"

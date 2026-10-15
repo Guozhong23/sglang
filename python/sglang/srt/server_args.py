@@ -812,7 +812,6 @@ class ServerArgs:
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
-                "shortest-prefill-first-sort-only",
             ],
         ),
         NS("schedule"),
