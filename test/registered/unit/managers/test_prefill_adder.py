@@ -321,6 +321,59 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.new_chunked_req, req)
         self.assertEqual(req.extend_range.length, 512)
 
+    def test_spf_modes_preserve_new_chunk_under_swa_pressure(self):
+        for name in ("shortest-prefill-first", "shortest-prefill-first-sort-only"):
+            for host_miss in (False, True):
+                with self.subTest(policy=name, host_miss=host_miss):
+                    self.mock_tree_cache.reset_mock()
+                    adder = self.create_shortest_prefill_adder(
+                        chunk_tokens=16512, page_size=128, schedule_policy=name
+                    )
+                    adder.is_hybrid_swa = True
+                    self.mock_tree_cache.sliding_window_size = 4096
+                    self.mock_token_allocator.swa_available_size.return_value = 10240
+                    first = self.create_shortest_prefill_req("first", 33024)
+                    first.sampling_params.max_new_tokens = 4096
+                    self.assertEqual(
+                        adder.add_one_req(first, False, None), AddReqResult.CONTINUE
+                    )
+                    self.assertEqual(first.extend_range.length, 6016)
+                    self.assertIs(adder.new_chunked_req, first)
+                    before_budget = (
+                        adder.rem_chunk_tokens,
+                        adder.rem_total_tokens,
+                        adder.rem_swa_tokens,
+                    )
+                    second = self.create_shortest_prefill_req("second", 33024)
+                    second.sampling_params.max_new_tokens = 1
+                    if host_miss:
+                        second.host_hit_length = 32512
+                        second.prefix_indices = torch.empty(0, dtype=torch.int64)
+                        second.best_match_node = second.last_node
+                        second.needs_host_load_back.return_value = True
+                        self.mock_tree_cache.init_load_back.return_value = (
+                            torch.empty(0, dtype=torch.int64),
+                            second.last_node,
+                        )
+                    # There was no old chunk at entry to this scheduler pass.
+                    self.assertEqual(
+                        adder.add_one_req(second, False, None), AddReqResult.OTHER
+                    )
+                    self.assertEqual(adder.can_run_list, [first])
+                    self.assertIs(adder.new_chunked_req, first)
+                    second.set_extend_range.assert_not_called()
+                    self.assertEqual(
+                        self.mock_tree_cache.init_load_back.call_count, int(host_miss)
+                    )
+                    self.assertEqual(
+                        (
+                            adder.rem_chunk_tokens,
+                            adder.rem_total_tokens,
+                            adder.rem_swa_tokens,
+                        ),
+                        before_budget,
+                    )
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

@@ -121,6 +121,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "shortest-prefill-first-sort-only",
             ],
         )
         self.assertEqual(

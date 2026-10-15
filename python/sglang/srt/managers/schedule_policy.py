@@ -153,6 +153,7 @@ class CacheAwarePolicy(Enum):
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
+    SHORTEST_PREFILL_FIRST_SORT_ONLY = "shortest-prefill-first-sort-only"
 
 
 class CacheAgnosticPolicy(Enum):
@@ -227,14 +228,18 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_hrrn(
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
-            elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            elif policy in (
+                CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
+                CacheAwarePolicy.SHORTEST_PREFILL_FIRST_SORT_ONLY,
+            ):
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
+                        "Experimental %s: queue=%d shortest_uncached=%d",
+                        policy.value,
                         len(waiting_queue),
                         self._shortest_prefill_work(waiting_queue[0]),
                     )
@@ -279,9 +284,12 @@ class SchedulePolicy:
         try:
             policy_enum = CacheAwarePolicy(policy)
             if getattr(tree_cache, "disable", True):
-                if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                if policy_enum in (
+                    CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
+                    CacheAwarePolicy.SHORTEST_PREFILL_FIRST_SORT_ONLY,
+                ):
                     raise ValueError(
-                        "Experimental shortest-prefill-first requires prefix caching"
+                        f"Experimental {policy} requires prefix caching"
                     )
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
@@ -365,7 +373,7 @@ class SchedulePolicy:
     def shortest_prefill_chunk_limit(
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        """Only SPF-Full reserves chunk budget for shorter waiting requests."""
         if (
             self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
             or budget < 2 * page_size
@@ -1279,11 +1287,12 @@ class PrefillAdder:
                 self.dllm_config is None
                 and chunk_tokens_limit is not None
                 and real_input_tokens > chunk_tokens_limit
-                and has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+                and (has_chunked_req or self.new_chunked_req is not None)
+                and get_schedule().schedule_policy
+                in ("shortest-prefill-first", "shortest-prefill-first-sort-only")
             ):
-                # Only one unfinished chunked request can be tracked. Check
-                # before negotiating or loading the candidate's host prefix.
+                # Only one unfinished chunk can be tracked, including a new
+                # one admitted this pass. Check before negotiation or host load.
                 return AddReqResult.OTHER
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
@@ -1356,8 +1365,9 @@ class PrefillAdder:
                 )
             else:
                 if (
-                    has_chunked_req
-                    and get_schedule().schedule_policy == "shortest-prefill-first"
+                    (has_chunked_req or self.new_chunked_req is not None)
+                    and get_schedule().schedule_policy
+                    in ("shortest-prefill-first", "shortest-prefill-first-sort-only")
                 ):
                     # Recheck actual work after host load-back may have missed.
                     return AddReqResult.OTHER
