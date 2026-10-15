@@ -107,6 +107,7 @@ from cannbotdsl.ops.reg import (
     vsub,
 )
 from cannbotdsl.ops.reg.cast import RoundingMode
+from cannbotdsl.ops.sync import vec_sync_all
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import tile_slice
 from cannbotdsl.types.dtypes import bfloat16 as BF16
@@ -669,6 +670,7 @@ class FusedQkvProjNormRopeCacheMxKernel:
             # matmul selects asc_mmad_mx (per-32-group dequant, fp32
             # accumulate -- the same OCP MXFP8 hardware path as
             # aclnnQuantMatmulV5's QuantBatchMatmulV3).
+            vec_sync_all()
             l0c_acc = l0c.head_next()
             for k_l1 in range(K_L1_TILES):
                 a_tile = tile_slice(qx_span, (PAIR_M, K_L1), (pair, k_l1))
