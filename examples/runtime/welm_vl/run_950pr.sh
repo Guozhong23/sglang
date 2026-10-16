@@ -30,6 +30,8 @@ case "${WELM_VL_PROFILE}" in
             exit 2
         fi
         export WELM_NPU_USE_MEGAMOE=${WELM_NPU_USE_MEGAMOE:-1}
+        # Requires a MegaMoE extension with shared-weight arguments; opt in.
+        export WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT=${WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT:-0}
         export WELM_NPU_USE_FLASH_ATTN=${WELM_NPU_USE_FLASH_ATTN:-1}
         fused_qkv_default=0
         if [[ ${TP_SIZE} == 4 ]]; then fused_qkv_default=1; fi
@@ -97,6 +99,7 @@ case "${WELM_VL_PROFILE}" in
         export SGLANG_VLM_NPU_FUSE_ROPE=0
         # A reproducible comparison path even when the shell has text tuning set.
         export WELM_NPU_USE_MEGAMOE=0
+        export WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT=0
         export WELM_NPU_USE_FLASH_ATTN=0
         export SGLANG_NPU_WELMV4_FUSED_QKV=0
         export SGLANG_NPU_USE_MULTI_STREAM=0

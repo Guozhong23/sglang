@@ -76,7 +76,7 @@ def test_split_shared_gate_up_preserves_mlp_math_and_reduce_contract(
     assert reductions == [reduce_scatter, reduce_scatter]
 
 
-def _run_sparse_moe(*, sidecar, multi_stream):
+def _run_sparse_moe(*, sidecar, multi_stream, fuse_shared=False):
     events = []
     device_stream = object()
 
@@ -130,7 +130,8 @@ def _run_sparse_moe(*, sidecar, multi_stream):
 
         def forward_layer(self, experts, hidden, topk, rows, **kwargs):
             events.append("megamoe")
-            return hidden * 2
+            assert (kwargs["shared_kwargs"] is not None) == fuse_shared
+            return hidden * (7 if fuse_shared else 2)
 
     def experts(hidden, topk):
         events.append("fallback_experts")
@@ -178,6 +179,7 @@ def _run_sparse_moe(*, sidecar, multi_stream):
         get_npu_router_compute_weight_t=lambda: torch.ones((2, 1)),
         _resolve_deepep_mode_for_topk=lambda _: "normal",
         welm_prefill_megamoe=MegaMoE(),
+        welm_megamoe_shared_kwargs={"shared": True} if fuse_shared else None,
         topk=TopK(),
         experts=experts,
     )
@@ -223,9 +225,19 @@ def test_megamoe_serial_path_still_computes_shared_expert():
     ]
 
 
-def test_small_m_or_capacity_fallback_keeps_deepep_shared_overlap():
+@pytest.mark.parametrize("fuse_shared", [False, True])
+def test_small_m_or_capacity_fallback_keeps_deepep_shared_overlap(fuse_shared):
     # The layer calls with sidecar=False after either threshold/capacity rejects
     # MegaMoE. The shared expert must retain the normal DeepEP stream policy.
-    assert _run_sparse_moe(sidecar=False, multi_stream=True) == [
+    assert _run_sparse_moe(
+        sidecar=False, multi_stream=True, fuse_shared=fuse_shared
+    ) == [
         "router", "topk", "shared_whole", "fallback_experts", "wait",
     ]
+
+
+@pytest.mark.parametrize("multi_stream", [False, True])
+def test_fused_megamoe_skips_external_shared_compute_and_add(multi_stream):
+    assert _run_sparse_moe(
+        sidecar=True, multi_stream=multi_stream, fuse_shared=True
+    ) == ["router", "topk", "megamoe"]

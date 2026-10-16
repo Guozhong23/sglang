@@ -108,7 +108,7 @@ def check_optimization_dependencies(tp: int, profile: str = "baseline") -> None:
         )
     if tp == 4 and os.getenv("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1":
         # Import the real kernel module: importing cannbotdsl alone would miss
-        # incompatible Channel/Dim/memory/register APIs used by its decorators.
+        # incompatible cannbotdsl 0.7 RingBuffer/memory/register APIs.
         required.append(
             (
                 "sglang.srt.layers.fused_qkv_proj_norm_rope_cache",

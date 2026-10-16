@@ -109,6 +109,42 @@ def padded_rope_tiles(
     return [0] * (max_tiles - len(starts)) + starts + [offset]
 
 
+class WelmMXFP8GraphWorkspace:
+    """AG receive storage owned by one prefill runner, not the TP group's eager cache.
+
+    The largest prompt bucket warms up first. Learn actual activation/scale
+    storage sizes there (including packed scale layouts), then freeze before
+    recording any graph. Layers and smaller buckets reuse contiguous prefixes.
+    This assumes the existing serial forward order and Gate AG fork/join.
+    """
+
+    def __init__(self):
+        self._buffers = {}
+        self.frozen = False
+
+    def freeze(self) -> None:
+        self.frozen = True
+
+    def get_buffer(self, group, kind: str, send: torch.Tensor) -> torch.Tensor:
+        key = (group.unique_name, group.world_size, kind, send.device, send.dtype)
+        required = send.numel() * group.world_size
+        storage = self._buffers.get(key)
+        if storage is None or storage.numel() < required:
+            if self.frozen:
+                capacity = 0 if storage is None else storage.numel()
+                raise RuntimeError(
+                    "WeLM MXFP8 graph AG workspace was not warmed up for "
+                    f"{key}: requires {required} elements, capacity {capacity}. "
+                    "Captured storage cannot grow or fall back to eager scratch."
+                )
+            # Warmup is outside capture. Do not round up to a geometric eager
+            # capacity or allocate one buffer per layer/bucket. No data copy is
+            # needed: the collective overwrites the entire returned view.
+            storage = torch.empty(required, dtype=send.dtype, device=send.device)
+            self._buffers[key] = storage
+        return storage[:required]
+
+
 class WelmPrefillGraphAdapter:
     # VL composes base/OE/vision eagerly for both image and text-only requests.
     # A fixed capture boundary prevents replay from applying OE to image rows.
@@ -142,6 +178,8 @@ class WelmPrefillGraphAdapter:
             "input_embeds"
         ):
             raise ValueError("WeLM VL prefill graph requires an input embedding buffer")
+        if self.eager_input_embeddings and runner.quant_config is not None:
+            raise ValueError("WeLM VL prefill graph currently requires unquantized BF16")
         self.backend = runner.model_runner.attn_backend
         self.max_tokens = runner.max_num_tokens
         self.device = runner.device
@@ -150,9 +188,8 @@ class WelmPrefillGraphAdapter:
         if (
             runner.model_runner.dtype != torch.bfloat16
             or runner.model_runner.kv_cache_dtype != torch.bfloat16
-            or runner.quant_config is not None
         ):
-            raise ValueError("WeLM breakable prefill currently requires unquantized BF16")
+            raise ValueError("WeLM breakable prefill requires BF16 compute and KV cache")
         if (
             parallel.enable_dp_attention
             or parallel.pp_size != 1
@@ -173,6 +210,17 @@ class WelmPrefillGraphAdapter:
         # Keep the validated exact-B path, including its capture topology,
         # unchanged unless mixed chunk was explicitly enabled.
         self.pad_mirror = self.prune and self.mixed_chunk
+        # Pure BF16 never enters the MXFP8 helpers and owns no AG workspace.
+        # Keep strong references here for every captured bucket's lifetime;
+        # capture_inputs also retains this adapter via the private batch.
+        self.mxfp8_ag_workspace = (
+            WelmMXFP8GraphWorkspace()
+            if any(
+                layer.self_attn.can_reuse_prefill_mxfp8_input()
+                for layer in self.model.layers
+            )
+            else None
+        )
         self.ep = parallel.moe_ep_size > 1
         if self.ep:
             from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -258,8 +306,9 @@ class WelmPrefillGraphAdapter:
         logger.info(
             "WeLM BF16 breakable prefill: T-only prompt graphs, %s mirror "
             "batches %s, mirror=%s, "
-            "MoE=%s; native Flash is captured, LM head/logits stay eager; Gate side "
-            "stream and CMO weight prefetch are disabled for graph prefill",
+            "MoE=%s; native Flash is captured, LM head/logits stay eager; Gate MM "
+            "side stream and CMO weight prefetch are disabled for graph prefill; "
+            "MXFP8 Gate-input AG retains its side stream",
             "padded capacity" if self.pad_mirror else "exact",
             self.batch_sizes,
             self.prune,
@@ -442,6 +491,15 @@ class WelmPrefillGraphAdapter:
     def before_capture_forward(self, batch: ForwardBatch):
         from sglang.srt.models.welmv4 import KVMirrorManager
 
+        if (
+            self.mxfp8_ag_workspace is not None
+            and not self.mxfp8_ag_workspace.frozen
+            and torch.get_device_module().is_current_stream_capturing()
+        ):
+            # The broad BCG context flag is also set during warmup. Freeze on
+            # real device capture, before any model/collective work is recorded.
+            # Later bucket warmups must not replace storage used by earlier graphs.
+            self.mxfp8_ag_workspace.freeze()
         KVMirrorManager.activations_dict_kv.clear()
         # Record schedule producers on EVERY warmup and actual capture. A
         # warmup schedule is not a valid substitute for an in-graph producer.

@@ -320,5 +320,36 @@ def test_graph_mask_preserves_optional_vendor_completion_sync(monkeypatch):
     assert not output[1].any()
 
 
+@pytest.mark.parametrize("mode", ["bf16", "mxfp8"])
+def test_shared_weights_reach_vendor_with_routed_scales_and_live_padding(monkeypatch, mode):
+    module, runtime, vendor = _runtime(monkeypatch, mode=mode)
+    hidden = torch.ones(3, 4, dtype=torch.bfloat16)
+    shared = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=torch.randn(6, 4).bfloat16()),
+        down_proj=SimpleNamespace(weight=torch.randn(4, 3).bfloat16()),
+    )
+    # Exercise the BF16 packing independently of the routed weight mode.
+    packed = module._prepare_shared_expert_kwargs(shared, "bf16")
+    torch.testing.assert_close(packed["l1_weights_shared"][0][0], shared.gate_up_proj.weight)
+    torch.testing.assert_close(packed["l2_weights_shared"][0][0], shared.down_proj.weight)
+    experts = _experts(torch.float8_e4m3fn if mode == "mxfp8" else torch.bfloat16)
+    routing = SimpleNamespace(
+        topk_ids=torch.tensor([[0, 1], [1, 0], [0, 1]]),
+        topk_weights=torch.full((3, 2), 0.5),
+    )
+    # Simulate the full routed+shared result, including nonzero padded rows.
+    vendor.mega_moe.return_value = (hidden * 7, None)
+    result = runtime.forward_layer(
+        experts, hidden, routing, 3,
+        valid_row_mask=torch.tensor([True, False, True]), shared_kwargs=packed,
+    )
+    kwargs = vendor.mega_moe.call_args.kwargs
+    assert kwargs["l1_weights_shared"] is packed["l1_weights_shared"]
+    assert kwargs["l2_weights_shared"] is packed["l2_weights_shared"]
+    if mode == "mxfp8":
+        assert kwargs["l1_weights_sf"][0] is experts.w13_weight_scale
+    torch.testing.assert_close(result, hidden * torch.tensor([7, 0, 7])[:, None])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

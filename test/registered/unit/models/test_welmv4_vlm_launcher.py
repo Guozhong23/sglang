@@ -21,6 +21,7 @@ PERFORMANCE_FLAGS = (
     "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER",
     "SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM",
     "SGLANG_NPU_USE_MULTI_STREAM",
+    "WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT",
     "SGLANG_VLM_VISION_METADATA_CACHE",
     "SGLANG_VLM_VISION_USE_ULYSSES",
     "SGLANG_VLM_VISION_USE_DP",
@@ -150,6 +151,7 @@ def test_default_profile_uses_optimized_tp4(invoke_launcher):
         assert call["env"]["SGLANG_VLM_VISION_METADATA_CACHE"] == "1"
         assert call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "0"
         assert call["env"]["SGLANG_VLM_VISION_USE_DP"] == "0"
+        assert call["env"]["WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT"] == "0"
         for flag in PERFORMANCE_FLAGS[-4:]:
             assert call["env"][flag] == "0"
 
@@ -182,6 +184,14 @@ def test_optimized_preserves_explicit_ulysses(invoke_launcher):
     result, calls = invoke_launcher(SGLANG_VLM_VISION_USE_ULYSSES="1")
     _successful_calls(result, calls)
     assert all(call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "1" for call in calls)
+
+
+def test_optimized_preserves_shared_megamoe_opt_in(invoke_launcher):
+    result, calls = invoke_launcher(WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT="1")
+    _successful_calls(result, calls)
+    assert all(
+        call["env"]["WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT"] == "1" for call in calls
+    )
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE"])

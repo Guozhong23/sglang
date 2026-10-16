@@ -311,7 +311,9 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
 
-def _apply_shared_welm_prefill_policy(args, monkeypatch, native_flash=True, npu=True):
+def _apply_shared_welm_prefill_policy(
+    args, monkeypatch, native_flash=True, npu=True, model_arch=ARCH
+):
     """Execute the production policy nodes shared by text and VL architectures."""
     monkeypatch.setenv("WELM_NPU_USE_FLASH_ATTN", "1" if native_flash else "0")
     tree = ast.parse((SRT / "server_args.py").read_text())
@@ -343,6 +345,7 @@ def _apply_shared_welm_prefill_policy(args, monkeypatch, native_flash=True, npu=
         ),
         {
             "self": args,
+            "model_arch": model_arch,
             "os": os,
             "torch": torch,
             "is_npu": lambda: npu,
@@ -377,6 +380,14 @@ def test_unsupported_shared_prefill_layout_falls_back_to_eager(monkeypatch, chan
     _apply_shared_welm_prefill_policy(args, monkeypatch)
     assert args.cuda_graph_config.prefill.backend == "disabled"
     assert not args.enable_mixed_chunk
+
+
+def test_text_modelslim_prefill_graph_remains_supported(monkeypatch):
+    args = _server_args(quantization="modelslim")
+    _apply_shared_welm_prefill_policy(
+        args, monkeypatch, model_arch="WeLMV4MoeForCausalLM"
+    )
+    assert args.cuda_graph_config.prefill.backend == "breakable"
 
 
 @pytest.mark.parametrize("native_flash,npu", [(False, True), (True, False)])
