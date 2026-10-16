@@ -7,6 +7,34 @@ import os
 from pathlib import Path
 
 
+def vision_parallel_mode() -> str:
+    flags = []
+    for name in ("SGLANG_VLM_VISION_USE_ULYSSES", "SGLANG_VLM_VISION_USE_DP"):
+        value = os.getenv(name, "0").strip().lower()
+        if value not in ("0", "1", "false", "true"):
+            raise ValueError(f"{name} must be 0, 1, false or true.")
+        flags.append(value in ("1", "true"))
+    ulysses, dp = flags
+    if ulysses and dp:
+        raise ValueError("Choose either ViT Ulysses or image DP, not both.")
+    return "dp" if dp else "ulysses" if ulysses else "tp"
+
+
+def check_parallel_dimensions(config: dict, tp: int) -> str:
+    mode = vision_parallel_mode()
+    dimensions = [(config["text_config"], "num_attention_heads")]
+    # DP has full heads/MLPs on each worker; Ulysses only shards heads during
+    # attention, while its block MLP weights are replicated.
+    if mode != "dp":
+        dimensions.append((config["vision_config"], "num_attention_heads"))
+    if mode == "tp":
+        dimensions.append((config["vision_config"], "intermediate_size"))
+    for cfg, field in dimensions:
+        if cfg[field] % tp:
+            raise ValueError(f"{field}={cfg[field]} is not divisible by TP={tp}.")
+    return mode
+
+
 def check_artifacts(model_path: Path) -> dict:
     config_path = model_path / "config.json"
     if not config_path.is_file():
@@ -110,8 +138,10 @@ def check_runtime(
     chat_template: str | None,
     profile: str = "baseline",
 ):
+    mode = vision_parallel_mode()
     import torch
     import torch_npu  # noqa: F401
+    from sglang.srt.layers.welmv4_vision_npu import VisionNPUFusionConfig
     from sglang.srt.utils.hf_transformers_utils import get_config, get_processor
 
     if not torch.npu.is_available():
@@ -122,6 +152,9 @@ def check_runtime(
             f"only {torch.npu.device_count()} are visible."
         )
     with torch.npu.device(torch.device(f"npu:{base_device}")):
+        VisionNPUFusionConfig.from_env().validate_runtime(
+            torch.device(f"npu:{base_device}")
+        )
         check_optimization_dependencies(tp, profile)
     config = get_config(str(model_path), trust_remote_code=True, local_files_only=True)
     processor = get_processor(
@@ -164,9 +197,12 @@ def check_runtime(
     else:
         heads, width = vision.num_attention_heads, vision.hidden_size
     head_dim = width // heads
+    attention_heads = heads if mode == "dp" else heads // tp
     device = torch.device(f"npu:{base_device}")
     with torch.npu.device(device), torch.inference_mode():
-        q = torch.zeros((8, heads // tp, head_dim), device=device, dtype=torch.bfloat16)
+        q = torch.zeros(
+            (8, attention_heads, head_dim), device=device, dtype=torch.bfloat16
+        )
         values = torch.arange(8, device=device, dtype=torch.float32).to(torch.bfloat16)
         values = values[:, None, None].expand_as(q).contiguous()
         output = torch_npu.npu_fused_infer_attention_score(
@@ -176,15 +212,18 @@ def check_runtime(
             actual_seq_lengths=[4, 8],
             actual_seq_lengths_kv=[4, 8],
             scale=head_dim**-0.5,
-            num_heads=heads // tp,
-            num_key_value_heads=heads // tp,
+            num_heads=attention_heads,
+            num_key_value_heads=attention_heads,
             sparse_mode=0,
             input_layout="TND",
         )[0]
         expected = torch.full_like(q, 1.5)
         expected[4:] = 5.5
         torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
-    print(f"NPU vision attention probe passed: BF16, head_dim={head_dim}, TP={tp}.")
+    print(
+        f"NPU vision attention probe passed: BF16, head_dim={head_dim}, "
+        f"vision={mode}, local_heads={attention_heads}, LLM TP={tp}."
+    )
 
 
 def main():
@@ -204,15 +243,7 @@ def main():
             raise ValueError(
                 "This checkpoint's basic TP path supports TP=1, 2, 4 or 8."
             )
-        for cfg, field in (
-            (config["text_config"], "num_attention_heads"),
-            (config["vision_config"], "num_attention_heads"),
-            (config["vision_config"], "intermediate_size"),
-        ):
-            if cfg[field] % args.tp:
-                raise ValueError(
-                    f"{field}={cfg[field]} is not divisible by TP={args.tp}."
-                )
+        check_parallel_dimensions(config, args.tp)
         if args.chat_template and not Path(args.chat_template).is_file():
             raise ValueError(f"Chat template does not exist: {args.chat_template}")
         if args.runtime:

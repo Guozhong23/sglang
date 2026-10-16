@@ -22,20 +22,16 @@ from dataclasses import dataclass
 import torch
 
 
-def create_vision_ulysses_group(config, use_data_parallel=False, max_patches=0):
-    """Resolve startup mode before choosing checkpoint shard shapes.
-
-    On NPU every TP rank participates, including disabled ranks. Checking flags
-    on the CPU group catches mismatched environments before one rank enters
-    AllToAll while its peers enter the legacy AllReduce path.
-    """
+def resolve_vision_parallel_group(config, use_data_parallel=False, max_patches=0):
+    """Agree on image-DP / Ulysses / legacy TP before loading vision weights."""
     from sglang.srt.utils import is_npu
 
-    raw = os.environ.get("SGLANG_VLM_VISION_USE_ULYSSES", "0").strip().lower()
+    raw_sp = os.environ.get("SGLANG_VLM_VISION_USE_ULYSSES", "0").strip().lower()
+    raw_dp = os.environ.get("SGLANG_VLM_VISION_USE_DP", "0").strip().lower()
     if not is_npu():
-        if raw not in {"0", "false"}:
-            raise ValueError("WeLM vision Ulysses requires the NPU runtime")
-        return None
+        if raw_sp not in {"0", "false"} or raw_dp not in {"0", "false"}:
+            raise ValueError("WeLM vision Ulysses / image DP requires the NPU runtime")
+        return None, None
 
     from sglang.srt.distributed import get_attn_tp_group, get_tp_group
     from sglang.srt.environ import envs
@@ -44,7 +40,8 @@ def create_vision_ulysses_group(config, use_data_parallel=False, max_patches=0):
     group = get_tp_group()
     graph = envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
     settings = (
-        raw,
+        raw_sp,
+        raw_dp,
         max_patches,
         config.num_attention_heads,
         config.hidden_size,
@@ -60,23 +57,41 @@ def create_vision_ulysses_group(config, use_data_parallel=False, max_patches=0):
         )
         if any(peer != settings for peer in peer_settings):
             raise ValueError("WeLM vision parallel settings differ across TP ranks")
-    if raw not in {"0", "1", "false", "true"}:
-        raise ValueError("SGLANG_VLM_VISION_USE_ULYSSES must be 0, 1, false or true")
-    if raw in {"0", "false"}:
-        return None
-    if graph or use_data_parallel or get_mm().mm_enable_dp_encoder:
-        raise ValueError("Vision Ulysses does not support vision graphs or encoder DP")
+    for name, raw in (
+        ("SGLANG_VLM_VISION_USE_ULYSSES", raw_sp),
+        ("SGLANG_VLM_VISION_USE_DP", raw_dp),
+    ):
+        if raw not in {"0", "1", "false", "true"}:
+            raise ValueError(f"{name} must be 0, 1, false or true")
+    sp, dp = raw_sp in {"1", "true"}, raw_dp in {"1", "true"}
+    if sp and dp:
+        raise ValueError("Vision Ulysses and image DP are mutually exclusive")
+    if not (sp or dp):
+        return None, None
+    if graph or get_mm().mm_enable_dp_encoder or (sp and use_data_parallel):
+        raise ValueError(
+            "Vision parallel modes do not support vision graphs or generic encoder DP"
+        )
     attn_group = get_attn_tp_group()
     if list(attn_group.ranks) != list(group.ranks):
-        raise ValueError("Vision Ulysses requires identical attention-TP and TP ranks")
+        raise ValueError(
+            "Vision parallel modes require identical attention-TP and TP ranks"
+        )
+    if config.hidden_size % config.num_attention_heads:
+        raise ValueError("Vision hidden_size must be divisible by attention heads")
+    return group, "dp" if dp else "ulysses"
+
+
+def create_vision_ulysses_group(config, use_data_parallel=False, max_patches=0):
+    group, mode = resolve_vision_parallel_group(config, use_data_parallel, max_patches)
+    if mode != "ulysses":
+        return None
     VisionUlyssesPlan(
         1, config.num_attention_heads, group.world_size, group.rank_in_group
     )
-    if config.hidden_size % config.num_attention_heads:
-        raise ValueError("Vision hidden_size must be divisible by attention heads")
     logging.getLogger(__name__).info(
         "WeLM vision Ulysses enabled: SP=%d rank=%d, replicated block weights; "
-        "block MC2/AllReduce bypassed, projector retains TP. BF16 eager only.",
+        "block AllReduce bypassed, projector retains TP. BF16 eager only.",
         group.world_size,
         group.rank_in_group,
     )

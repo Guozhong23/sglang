@@ -16,14 +16,17 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.welmv4_vision_cache import VisionMetadataCache, vision_grid_key
+from sglang.srt.layers.welmv4_vision_dp import (
+    create_vision_dp_group,
+    encode_vision_dp,
+    synchronize_vision_dp_cache,
+)
 from sglang.srt.layers.welmv4_vision_npu import (
     VisionNPUFusionConfig,
     vision_add_layer_norm,
     vision_column_parallel_linear_gelu,
-    vision_row_parallel_linear,
 )
 from sglang.srt.layers.welmv4_vision_op import (
     welmv4_vision_apply_rope,
@@ -283,21 +286,6 @@ def _apply_welmv4_vision_rope(
     return welmv4_vision_apply_rope(q, k, cos, sin)
 
 
-class WeLMV4VisionRowParallelLinear(RowParallelLinear):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._vision_fusions = VisionNPUFusionConfig.from_env()
-
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
-        if not skip_all_reduce and not should_skip_mlp_all_reduce():
-            result = vision_row_parallel_linear(self, input_, self._vision_fusions)
-            if result is not None:
-                return result
-        return super().forward(
-            input_, skip_all_reduce=skip_all_reduce, forward_batch=forward_batch
-        )
-
-
 class WeLMV4VisionAttention(VisionAttention):
     def __init__(
         self,
@@ -318,9 +306,9 @@ class WeLMV4VisionAttention(VisionAttention):
             quant_config=quant_config,
             prefix=prefix,
             customized_position_embedding_applier=_apply_welmv4_vision_rope,
-            # TP=1 linear loaders replicate weights; this is NOT image-level DP.
+            # Replicate full QKV/projection weights for image DP or Ulysses.
             use_data_parallel=use_data_parallel or ulysses_group is not None,
-            proj_linear_cls=WeLMV4VisionRowParallelLinear,
+            proj_linear_cls=RowParallelLinear,
         )
         self._ulysses_group = ulysses_group
         if ulysses_group is not None and self.qkv_backend_name != "ascend_attn":
@@ -354,7 +342,7 @@ class WeLMV4VisionAttention(VisionAttention):
         # Checkpoint QKV is [all Q heads, all K heads, all V heads], NOT
         # interleaved Q/K/V per head. Split BEFORE reshaping/packing AllToAll.
         q, k, v = (
-            x.reshape(plan.local_tokens, plan.heads, self.head_size).contiguous()
+            x.reshape(plan.local_tokens, plan.heads, self.head_size)
             for x in qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         )
         q, k = welmv4_vision_apply_rope(q, k, *position_embeddings)
@@ -395,7 +383,7 @@ class WeLMV4VisionMLP(nn.Module):
             prefix=add_prefix("fc1", prefix),
             **tp_kwargs,
         )
-        self.fc2 = WeLMV4VisionRowParallelLinear(
+        self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
@@ -772,7 +760,7 @@ class WeLMV4VisionProjector(nn.Module):
                     **tp_kwargs,
                 ),
                 nn.GELU(),
-                WeLMV4VisionRowParallelLinear(
+                RowParallelLinear(
                     merge_hidden_size,
                     config.out_hidden_size,
                     bias=True,
@@ -830,11 +818,17 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             raise ValueError("image_token_id must be inside the text vocabulary")
         super().__init__(text_config, quant_config=None, prefix=prefix)
         self.vlm_config = config
+        self._vision_dp_group = create_vision_dp_group(
+            vision_config, max_patches=_vision_max_patches()
+        )
+        dp_kwargs = (
+            {"use_data_parallel": True} if self._vision_dp_group is not None else {}
+        )
         self.vision_encoder = WeLMV4VisionEncoder(
-            vision_config, prefix=add_prefix("vision_encoder", prefix)
+            vision_config, prefix=add_prefix("vision_encoder", prefix), **dp_kwargs
         )
         self.vision_projector = WeLMV4VisionProjector(
-            vision_config, prefix=add_prefix("vision_projector", prefix)
+            vision_config, prefix=add_prefix("vision_projector", prefix), **dp_kwargs
         )
 
     @classmethod
@@ -859,7 +853,13 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             or module_name.startswith("vision_projector")
         )
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_feature(
+        self, items: List[MultimodalDataItem]
+    ) -> torch.Tensor | List[torch.Tensor]:
+        if self._vision_dp_group is not None:
+            return encode_vision_dp(
+                items, self.vision_encoder, self.vision_projector, self._vision_dp_group
+            )
         # Note: peak-memory control for high-resolution / many-image
         # batches is delegated to ``WeLMV4VisionEncoder.forward`` which
         # splits the concatenated input along image boundaries when the
@@ -968,12 +968,10 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         )
         # Third return value is the (possibly pruned) input_ids for EVS.
         # WeLMV4 VLM does not use EVS, so it is safe to discard.
-        # mm_utils moves cache-miss pixels onto the accelerator by replacing
-        # item.feature *before* calling get_image_feature. Keep the original CPU
-        # storage here: requests survive chunked prefill and decode, while the
-        # embedding cache is best-effort and can evict an image between chunks.
-        # Restoring pixels also on failure avoids retaining request-sized device
-        # allocations without discarding the data needed to recompute a miss.
+        # Defer raw-feature transfers to the encoder. Retain CPU storage across
+        # chunked prefill and decode so embedding-cache eviction can recompute
+        # a miss. The finally block also restores CPU pixels if an encoder fails
+        # or a caller supplies features already resident on the accelerator.
         cpu_features = []
         for item in image_items:
             feature = getattr(item, "feature", None)
@@ -981,6 +979,14 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
                 cpu_features.append(
                     (item, feature if feature.device.type == "cpu" else feature.cpu())
                 )
+        dp_options = {}
+        if self._vision_dp_group is not None:
+            dp_options = dict(
+                batch_encode_per_image=True,
+                synchronize_cache_misses=lambda items, hits: synchronize_vision_dp_cache(
+                    items, hits, group=self._vision_dp_group
+                ),
+            )
         try:
             embedding, mask, _pruned_ids = get_embedding_and_mask(
                 data_embedding_func=self.get_image_feature,
@@ -991,6 +997,8 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
                 prefix_length=prefix_lens,
                 extend_length=extend_lens,
                 items_offset_list=items_offsets,
+                defer_feature_move=True,
+                **dp_options,
             )
         finally:
             for item, feature in cpu_features:

@@ -19,9 +19,12 @@ case "${WELM_VL_PROFILE}" in
     optimized)
         export SGLANG_VLM_VISION_METADATA_CACHE=${SGLANG_VLM_VISION_METADATA_CACHE:-1}
         export SGLANG_VLM_VISION_USE_ULYSSES=${SGLANG_VLM_VISION_USE_ULYSSES:-0}
-        export SGLANG_VLM_NPU_USE_MC2=${SGLANG_VLM_NPU_USE_MC2:-0}
+        export SGLANG_VLM_VISION_USE_DP=${SGLANG_VLM_VISION_USE_DP:-0}
+        # ViT MC2 has been removed; never inherit the former opt-in switch.
+        export SGLANG_VLM_NPU_USE_MC2=0
         export SGLANG_VLM_NPU_FUSE_GELU=${SGLANG_VLM_NPU_FUSE_GELU:-0}
         export SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM=${SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM:-0}
+        export SGLANG_VLM_NPU_FUSE_ROPE=${SGLANG_VLM_NPU_FUSE_ROPE:-0}
         if [[ ${TP_SIZE} == 1 ]]; then
             echo "The optimized DeepEP profile requires TP_SIZE=2, 4 or 8; use baseline for TP=1." >&2
             exit 2
@@ -87,9 +90,11 @@ case "${WELM_VL_PROFILE}" in
     baseline)
         export SGLANG_VLM_VISION_METADATA_CACHE=0
         export SGLANG_VLM_VISION_USE_ULYSSES=0
+        export SGLANG_VLM_VISION_USE_DP=0
         export SGLANG_VLM_NPU_USE_MC2=0
         export SGLANG_VLM_NPU_FUSE_GELU=0
         export SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM=0
+        export SGLANG_VLM_NPU_FUSE_ROPE=0
         # A reproducible comparison path even when the shell has text tuning set.
         export WELM_NPU_USE_MEGAMOE=0
         export WELM_NPU_USE_FLASH_ATTN=0
@@ -111,6 +116,19 @@ case "${WELM_VL_PROFILE}" in
     *) echo "Unknown WELM_VL_PROFILE=${WELM_VL_PROFILE}; choose optimized or baseline." >&2; exit 2 ;;
 esac
 
+for flag in SGLANG_VLM_VISION_USE_ULYSSES SGLANG_VLM_VISION_USE_DP; do
+    value=${!flag}
+    case "${value,,}" in
+        0|false) printf -v "${flag}" '%s' 0 ;;
+        1|true) printf -v "${flag}" '%s' 1 ;;
+        *) echo "${flag} must be 0, 1, false or true." >&2; exit 2 ;;
+    esac
+done
+if [[ ${SGLANG_VLM_VISION_USE_ULYSSES} == 1 && ${SGLANG_VLM_VISION_USE_DP} == 1 ]]; then
+    echo "Choose either ViT Ulysses or image DP; they cannot be enabled together." >&2
+    exit 2
+fi
+
 # Vision/base/OE embedding stay eager; supported text bodies use prefill/decode graphs.
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=0
 export ASCEND_USE_FIA=1
@@ -124,7 +142,7 @@ if [[ -n ${CHAT_TEMPLATE:-} ]]; then
     preflight+=(--chat-template "${CHAT_TEMPLATE}")
     extra_args+=(--chat-template "${CHAT_TEMPLATE}")
 fi
-echo "WeLM-VL profile=${WELM_VL_PROFILE} TP=${TP_SIZE} MegaMoE=${WELM_NPU_USE_MEGAMOE} FlashAttn=${WELM_NPU_USE_FLASH_ATTN} fusedQKV=${SGLANG_NPU_WELMV4_FUSED_QKV} prefillGraph=${WELM_VL_PREFILL_GRAPH} mixedChunk=${WELM_VL_MIXED_CHUNK}"
+echo "WeLM-VL profile=${WELM_VL_PROFILE} TP=${TP_SIZE} MegaMoE=${WELM_NPU_USE_MEGAMOE} FlashAttn=${WELM_NPU_USE_FLASH_ATTN} fusedQKV=${SGLANG_NPU_WELMV4_FUSED_QKV} prefillGraph=${WELM_VL_PREFILL_GRAPH} mixedChunk=${WELM_VL_MIXED_CHUNK} visionUlysses=${SGLANG_VLM_VISION_USE_ULYSSES} visionDP=${SGLANG_VLM_VISION_USE_DP} visionMC2=0"
 "${PYTHON_BIN}" "${preflight[@]}"
 
 exec "${PYTHON_BIN}" -m sglang.launch_server \

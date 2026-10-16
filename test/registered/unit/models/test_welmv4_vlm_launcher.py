@@ -23,7 +23,9 @@ PERFORMANCE_FLAGS = (
     "SGLANG_NPU_USE_MULTI_STREAM",
     "SGLANG_VLM_VISION_METADATA_CACHE",
     "SGLANG_VLM_VISION_USE_ULYSSES",
+    "SGLANG_VLM_VISION_USE_DP",
     "SGLANG_VLM_NPU_USE_MC2",
+    "SGLANG_VLM_NPU_FUSE_ROPE",
     "SGLANG_VLM_NPU_FUSE_GELU",
     "SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM",
 )
@@ -147,7 +149,8 @@ def test_default_profile_uses_optimized_tp4(invoke_launcher):
             assert call["env"][flag] == "1"
         assert call["env"]["SGLANG_VLM_VISION_METADATA_CACHE"] == "1"
         assert call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "0"
-        for flag in PERFORMANCE_FLAGS[-3:]:
+        assert call["env"]["SGLANG_VLM_VISION_USE_DP"] == "0"
+        for flag in PERFORMANCE_FLAGS[-4:]:
             assert call["env"][flag] == "0"
 
 
@@ -179,6 +182,39 @@ def test_optimized_preserves_explicit_ulysses(invoke_launcher):
     result, calls = invoke_launcher(SGLANG_VLM_VISION_USE_ULYSSES="1")
     _successful_calls(result, calls)
     assert all(call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "1" for call in calls)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE"])
+def test_image_dp_preserves_llm_tp_and_removes_inherited_mc2(invoke_launcher, value):
+    result, calls = invoke_launcher(
+        SGLANG_VLM_VISION_USE_DP=value, SGLANG_VLM_NPU_USE_MC2="1"
+    )
+    _, launch = _successful_calls(result, calls)
+    _assert_optimized(launch, 4)
+    assert "--mm-enable-dp-encoder" not in launch["argv"]
+    for call in calls:
+        assert call["env"]["SGLANG_VLM_VISION_USE_DP"] == "1"
+        assert call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "0"
+        assert call["env"]["SGLANG_VLM_NPU_USE_MC2"] == "0"
+
+
+def test_conflicting_vision_modes_fail_before_loading_checkpoint(invoke_launcher):
+    result, calls = invoke_launcher(
+        SGLANG_VLM_VISION_USE_DP="true", SGLANG_VLM_VISION_USE_ULYSSES="1"
+    )
+    assert result.returncode == 2
+    assert "cannot be enabled together" in result.stderr
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "flag", ["SGLANG_VLM_VISION_USE_DP", "SGLANG_VLM_VISION_USE_ULYSSES"]
+)
+def test_invalid_vision_mode_fails_before_preflight(invoke_launcher, flag):
+    result, calls = invoke_launcher(**{flag: "yes"})
+    assert result.returncode == 2
+    assert flag in result.stderr
+    assert calls == []
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])

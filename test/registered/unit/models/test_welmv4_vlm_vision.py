@@ -70,6 +70,8 @@ def _load_definitions(*names, **extra):
         vision_grid_key=CACHE.vision_grid_key,
         VisionMetadataCache=CACHE.VisionMetadataCache,
         create_vision_ulysses_group=lambda *args, **kwargs: None,
+        create_vision_dp_group=lambda *args, **kwargs: None,
+        _vision_max_patches=lambda: 0,
     )
     scope.update(extra)
     exec(compile(module, str(MODEL_PATH), "exec"), scope)
@@ -525,12 +527,6 @@ def _assert_retained_cpu_pixels(*items):
 
 def test_real_cache_chunks_cross_image_boundaries_and_decode_keeps_cpu_pixels():
     wrapper, encoder, oe, cache, moved = _make_chunk_cache_wrapper()
-
-
-def test_real_oe_and_visual_embeddings_match_full_prefill_across_chunks():
-    wrapper, _, _, _, _ = _make_chunk_cache_wrapper()
-    _install_real_oe(wrapper.model)
-    model = wrapper.model
     first = _cache_test_image(100001, 1, 3, 100)
     second = _cache_test_image(100002, 5, 3, 200)
     prompt = [

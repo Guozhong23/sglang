@@ -568,6 +568,8 @@ def _get_chunked_embedding_full(
     extend_seq_len: int,
     input_ids: torch.Tensor,
     device: torch.device,
+    *,
+    defer_feature_move: bool = False,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """
     Fallback: encode all items at once, cache combined result, extract chunk.
@@ -578,7 +580,9 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+        if not defer_feature_move and not _can_skip_pre_embed_feature_move(
+            data_embedding_func
+        ):
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
         if isinstance(embedding, list):
@@ -633,6 +637,11 @@ def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
+    *,
+    defer_feature_move: bool = False,
+    synchronize_cache_misses: Optional[
+        Callable[[List[MultimodalDataItem], List[bool]], List[bool]]
+    ] = None,
 ) -> Dict[int, torch.Tensor]:
     """
     Collect cache misses across ALL per-image requests, deduplicate by hash,
@@ -643,6 +652,7 @@ def _batch_encode_per_image_misses(
     """
     unique_misses: Dict[int, Tuple[MultimodalDataItem, int]] = {}
     hash_to_embedding: Dict[int, torch.Tensor] = {}
+    synchronized_items: Dict[int, Tuple[MultimodalDataItem, int]] = {}
 
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
@@ -658,6 +668,8 @@ def _batch_encode_per_image_misses(
         req_info.overlapping = overlapping
 
         for _idx, item, start, end in overlapping:
+            if synchronize_cache_misses is not None:
+                synchronized_items.setdefault(item.hash, (item, end - start + 1))
             if item.hash in hash_to_embedding:
                 continue
             cached = embedding_cache.get_single(item.hash)
@@ -667,13 +679,33 @@ def _batch_encode_per_image_misses(
                 token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
 
+    if synchronize_cache_misses is not None:
+        # DP ranks must enter the same encoder collectives even if their LRU
+        # caches differ. Coordinate ALL unique overlapping images, including
+        # local hits, before deciding whether the encoder can be skipped.
+        ordered_hashes = list(synchronized_items)
+        global_misses = synchronize_cache_misses(
+            [synchronized_items[h][0] for h in ordered_hashes],
+            [h in hash_to_embedding for h in ordered_hashes],
+        )
+        if len(global_misses) != len(ordered_hashes):
+            raise ValueError("Image cache synchronization returned an invalid mask length")
+        unique_misses = {}
+        for h, missing in zip(ordered_hashes, global_misses):
+            if missing:
+                unique_misses[h] = synchronized_items[h]
+            elif h not in hash_to_embedding:
+                raise RuntimeError("Image cache synchronization omitted a local cache miss")
+
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
         ordered_hashes = list(unique_misses.keys())
         miss_items = [unique_misses[h][0] for h in ordered_hashes]
         token_counts = [unique_misses[h][1] for h in ordered_hashes]
 
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+        if not defer_feature_move and not _can_skip_pre_embed_feature_move(
+            data_embedding_func
+        ):
             _move_items_to_device(miss_items, device)
         all_miss_embedding = data_embedding_func(miss_items)
 
@@ -695,6 +727,10 @@ def _batch_encode_per_image_misses(
             )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
         for h, emb in zip(ordered_hashes, split_embeddings):
+            if synchronize_cache_misses is not None:
+                # set() otherwise retains an existing local hit. Replace it
+                # with the shared result so future all-hit requests agree too.
+                embedding_cache.free(h, None)
             embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[h] = emb
@@ -709,6 +745,8 @@ def _get_chunked_embedding_by_item(
     extend_prefix_len: int,
     extend_seq_len: int,
     device: torch.device,
+    *,
+    defer_feature_move: bool = False,
 ) -> Optional[torch.Tensor]:
     """
     Per-image chunk-aware encoding for one request.
@@ -742,7 +780,9 @@ def _get_chunked_embedding_by_item(
 
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+        if not defer_feature_move and not _can_skip_pre_embed_feature_move(
+            data_embedding_func
+        ):
             _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
 
@@ -817,12 +857,20 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
+    *,
+    batch_encode_per_image: bool = False,
+    defer_feature_move: bool = False,
+    synchronize_cache_misses: Optional[
+        Callable[[List[MultimodalDataItem], List[bool]], List[bool]]
+    ] = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     Chunked prefill embedding: encode items across all requests and extract
     per-request chunks. Images from all requests are batched into a single
     ViT call for efficiency.
     """
+    if synchronize_cache_misses is not None and not batch_encode_per_image:
+        raise ValueError("Image cache synchronization requires batched per-image encoding")
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
@@ -858,9 +906,9 @@ def _get_chunked_prefill_embedding(
 
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
         if is_per_image:
-            if _is_hip or _is_npu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP while CUDA uses batching.
+            if (_is_hip or _is_npu) and not batch_encode_per_image:
+                # Preserve the existing NPU/HIP per-request path unless an
+                # encoder explicitly supports cross-request batching.
                 chunk = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
@@ -868,19 +916,26 @@ def _get_chunked_prefill_embedding(
                     extend_prefix_len,
                     extend_seq_len,
                     device,
+                    defer_feature_move=defer_feature_move,
                 )
                 if chunk is not None:
                     all_chunks.append((i, chunk))
             else:
                 per_image_requests.append(req_info)
         else:
+            if synchronize_cache_misses is not None:
+                raise ValueError("Synchronized image encoding requires one offset per image")
             full_path_requests.append(req_info)
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
     hash_to_embedding: Dict[int, torch.Tensor] = {}
-    if per_image_requests:
+    if per_image_requests or synchronize_cache_misses is not None:
         hash_to_embedding = _batch_encode_per_image_misses(
-            data_embedding_func, per_image_requests, device
+            data_embedding_func,
+            per_image_requests,
+            device,
+            defer_feature_move=defer_feature_move,
+            synchronize_cache_misses=synchronize_cache_misses,
         )
 
     # Phase 2: assemble per-request chunks in original request order
@@ -903,6 +958,7 @@ def _get_chunked_prefill_embedding(
             req_info.extend_seq_len,
             input_ids,
             device,
+            defer_feature_move=defer_feature_move,
         )
         if chunk_embedding is not None:
             all_chunks.append((req_info.req_idx, chunk_embedding))
@@ -963,6 +1019,12 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    *,
+    batch_encode_per_image: bool = False,
+    defer_feature_move: bool = False,
+    synchronize_cache_misses: Optional[
+        Callable[[List[MultimodalDataItem], List[bool]], List[bool]]
+    ] = None,
 ) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
@@ -976,6 +1038,10 @@ def get_embedding_and_mask(
         prefix_length: Prefix lengths for each request
         extend_length: Sequence lengths for each request
         items_offset_list: List of offset ranges for multimodal items in each request
+        batch_encode_per_image: Opt into cross-request per-image encoding on NPU/HIP
+        defer_feature_move: Let the encoder move raw features to its device
+        synchronize_cache_misses: Optional DP callback taking unique overlapping
+            images and local cache-hit flags; returns the shared cache-miss mask
 
     Returns:
         A tuple containing:
@@ -996,6 +1062,9 @@ def get_embedding_and_mask(
             extend_length,
             items_offset_list,
             input_ids,
+            batch_encode_per_image=batch_encode_per_image,
+            defer_feature_move=defer_feature_move,
+            synchronize_cache_misses=synchronize_cache_misses,
         )
         if embedding is None:
             return None, None, input_ids

@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import runpy
 import sys
@@ -25,28 +26,28 @@ sys.modules[SPEC.name] = HELPERS
 SPEC.loader.exec_module(HELPERS)
 
 
-@pytest.mark.parametrize("flag", ["USE_MC2", "FUSE_GELU", "FUSE_ADD_LAYERNORM"])
+@pytest.mark.parametrize("flag", ["FUSE_ROPE", "FUSE_GELU", "FUSE_ADD_LAYERNORM"])
 def test_flags_are_strict_and_independent(monkeypatch, flag):
-    for suffix in ["USE_MC2", "FUSE_GELU", "FUSE_ADD_LAYERNORM"]:
+    for suffix in ["FUSE_ROPE", "FUSE_GELU", "FUSE_ADD_LAYERNORM"]:
         monkeypatch.delenv(f"SGLANG_VLM_NPU_{suffix}", raising=False)
     monkeypatch.setenv(f"SGLANG_VLM_NPU_{flag}", "true")
     config = HELPERS.VisionNPUFusionConfig.from_env()
-    assert sum((config.mc2, config.gelu, config.add_layer_norm)) == 1
+    assert sum((config.rope, config.gelu, config.add_layer_norm)) == 1
     monkeypatch.setenv(f"SGLANG_VLM_NPU_{flag}", "typo")
     with pytest.raises(ValueError):
         HELPERS.VisionNPUFusionConfig.from_env()
 
 
-@pytest.mark.parametrize("options", [{"mc2_min_m": 0}, {"mc2_comm_mode": "auto"}])
-def test_invalid_mc2_configuration_fails_early(options):
-    with pytest.raises(ValueError):
-        HELPERS.VisionNPUFusionConfig(**options)
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_removed_mc2_flag_fails_early(monkeypatch, value):
+    monkeypatch.setenv("SGLANG_VLM_NPU_USE_MC2", value)
+    with pytest.raises(ValueError, match="MC2 has been removed"):
+        HELPERS.VisionNPUFusionConfig.from_env()
 
 
 def test_cpu_dispatch_retains_existing_linear_paths():
     hidden = torch.randn(3, 8).bfloat16()
-    config = HELPERS.VisionNPUFusionConfig(mc2=True, gelu=True)
-    assert HELPERS.vision_row_parallel_linear(None, hidden, config) is None
+    config = HELPERS.VisionNPUFusionConfig(gelu=True)
     assert (
         HELPERS.vision_column_parallel_linear_gelu(None, hidden, "none", config) is None
     )
@@ -75,79 +76,6 @@ def test_add_norm_reference_preserves_bf16_residual_rounding():
         norm.eps,
     ).bfloat16()
     assert not torch.equal(result, unrounded)
-
-
-def _install_mc2_mocks(monkeypatch, rank, operation):
-    backend = SimpleNamespace(get_hccl_comm_name=Mock(return_value="vision_tp"))
-    process_group = SimpleNamespace(
-        _get_backend=Mock(return_value=backend), rank=lambda: rank
-    )
-    group = SimpleNamespace(
-        world_size=4, rank_in_group=rank, device_group=process_group
-    )
-    distributed = types.ModuleType("sglang.srt.distributed")
-    distributed.get_tp_group = lambda: group
-    npu = types.ModuleType("torch_npu")
-    npu.npu_mm_all_reduce_base = operation
-    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed)
-    monkeypatch.setitem(sys.modules, "torch_npu", npu)
-    monkeypatch.setattr(HELPERS, "_mc2_eligible", lambda *args: True)
-    monkeypatch.setattr(
-        HELPERS.VisionNPUFusionConfig, "validate_runtime", lambda *args: None
-    )
-    return group, backend
-
-
-@pytest.mark.parametrize("rank", [0, 1, 2, 3])
-@pytest.mark.parametrize("skip_bias", [False, True])
-def test_mc2_preserves_bias_and_uses_one_collective(monkeypatch, rank, skip_bias):
-    hidden = torch.randn(1, 3, 1076).bfloat16()
-    layer = SimpleNamespace(
-        tp_size=4,
-        tp_rank=rank,
-        skip_bias_add=skip_bias,
-        weight=torch.randn(8, 1076).bfloat16(),
-        bias=torch.randn(8).bfloat16(),
-    )
-    operation = Mock(return_value=torch.ones(3, 8).bfloat16())
-    _, backend = _install_mc2_mocks(monkeypatch, rank, operation)
-    config = HELPERS.VisionNPUFusionConfig(mc2=True)
-    output, output_bias = HELPERS.vision_row_parallel_linear(layer, hidden, config)
-    assert output.shape == (1, 3, 8)
-    assert output_bias is (layer.bias if skip_bias else None)
-    assert operation.call_count == 1
-    positional, keyword = operation.call_args
-    assert positional[0].shape == (3, 1076)
-    assert positional[1].shape == (1076, 8)
-    assert positional[2] == "vision_tp"
-    assert keyword["bias"] is (layer.bias if rank == 0 and not skip_bias else None)
-    assert keyword["reduce_op"] == "sum"
-    assert keyword["comm_mode"] == "ccu"
-    HELPERS.vision_row_parallel_linear(layer, hidden, config)
-    assert backend.get_hccl_comm_name.call_count == 1
-
-
-def test_mc2_collective_failure_is_not_swallowed(monkeypatch):
-    operation = Mock(side_effect=RuntimeError("HCCL collective failed"))
-    _install_mc2_mocks(monkeypatch, 0, operation)
-    layer = SimpleNamespace(
-        tp_size=4, tp_rank=0, skip_bias_add=False, weight=torch.ones(4, 8), bias=None
-    )
-    with pytest.raises(RuntimeError, match="HCCL collective failed"):
-        HELPERS.vision_row_parallel_linear(
-            layer, torch.ones(3, 8), HELPERS.VisionNPUFusionConfig(mc2=True)
-        )
-
-
-def test_mc2_wrong_tp_group_fails_before_collective(monkeypatch):
-    operation = Mock()
-    _install_mc2_mocks(monkeypatch, 0, operation)
-    layer = SimpleNamespace(tp_size=2, tp_rank=0)
-    with pytest.raises(RuntimeError, match="TP group"):
-        HELPERS.vision_row_parallel_linear(
-            layer, torch.ones(3, 8), HELPERS.VisionNPUFusionConfig(mc2=True)
-        )
-    operation.assert_not_called()
 
 
 class _NPUTensorProxy:
@@ -209,14 +137,11 @@ def _model_definitions(*names, **extra):
         *names,
         VisionNPUFusionConfig=HELPERS.VisionNPUFusionConfig,
         vision_column_parallel_linear_gelu=HELPERS.vision_column_parallel_linear_gelu,
-        vision_row_parallel_linear=HELPERS.vision_row_parallel_linear,
         vision_add_layer_norm=HELPERS.vision_add_layer_norm,
         RowParallelLinear=_Linear,
         ColumnParallelLinear=_Linear,
-        WeLMV4VisionRowParallelLinear=_Linear,
         _vision_dp_tp_kwargs=lambda use_dp: {},
         welmv4_vision_quick_gelu=OPS.welmv4_vision_quick_gelu,
-        should_skip_mlp_all_reduce=lambda: False,
         add_prefix=lambda name, prefix: name,
         **extra,
     )
@@ -295,28 +220,6 @@ def test_model_block_retains_rounded_residual_norm(monkeypatch, enabled):
     torch.testing.assert_close(model(hidden, None, None), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("skip", [False, True])
-def test_row_subclass_fused_result_is_not_reduced_twice(monkeypatch, skip):
-    cls = _model_definitions(
-        "WeLMV4VisionRowParallelLinear"
-    ).WeLMV4VisionRowParallelLinear
-    model = cls(8, 4).bfloat16()
-    hidden = torch.randn(3, 8).bfloat16()
-    globals_ = cls.forward.__globals__
-    fused_output = (torch.ones(3, 4).bfloat16(), None)
-    dispatch = Mock(return_value=fused_output)
-    monkeypatch.setitem(globals_, "vision_row_parallel_linear", dispatch)
-    result = model(hidden, skip_all_reduce=skip)
-    if skip:
-        dispatch.assert_not_called()
-        torch.testing.assert_close(
-            result[0], F.linear(hidden, model.weight, model.bias), rtol=0, atol=0
-        )
-    else:
-        dispatch.assert_called_once()
-        assert result is fused_output
-
-
 def test_attention_passes_local_projection_factory():
     class _AttentionBase(torch.nn.Module):
         def __init__(self, **kwargs):
@@ -329,4 +232,160 @@ def test_attention_passes_local_projection_factory():
         _apply_welmv4_vision_rope=lambda *args: None,
     ).WeLMV4VisionAttention
     model = cls(SimpleNamespace(hidden_size=1152, num_attention_heads=16))
-    assert model.kwargs["proj_linear_cls"] is _Linear
+    assert model.kwargs.get("proj_linear_cls", _Linear) is _Linear
+
+
+@pytest.mark.parametrize("bias_shape", [(1,), (2, 1076), (1077,)])
+def test_fused_gelu_rejects_incompatible_bias_shape(bias_shape):
+    layer = SimpleNamespace(
+        weight=_NPUTensorProxy(torch.randn(1076, 72).bfloat16()),
+        bias=_NPUTensorProxy(torch.randn(*bias_shape).bfloat16()),
+        gather_output=False,
+        skip_bias_add=False,
+        quant_method=type("UnquantizedLinearMethod", (), {})(),
+    )
+    result = HELPERS.vision_column_parallel_linear_gelu(
+        layer,
+        _NPUTensorProxy(torch.randn(3, 72).bfloat16()),
+        "tanh",
+        HELPERS.VisionNPUFusionConfig(gelu=True),
+    )
+    assert result is None
+
+
+def _kernel_definition(name, **globals_):
+    path = ROOT / "python/sglang/srt/layers/welmv4_vision_npu_kernels.py"
+    tree = ast.parse(path.read_text())
+    node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    node.decorator_list = []
+    module = ast.Module(body=[node], type_ignores=[])
+    namespace = {"torch": torch, **globals_}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[name]
+
+
+def test_gelu_runtime_checks_only_the_requested_activation():
+    validate = _kernel_definition(
+        "validate_gelu_runtime", tl=SimpleNamespace(erf=Mock()), libdevice=None
+    )
+    validate("none")
+    with pytest.raises(RuntimeError, match="libdevice.tanh"):
+        validate("tanh")
+    validate.__globals__["tl"] = SimpleNamespace()
+    validate.__globals__["libdevice"] = SimpleNamespace(tanh=Mock())
+    validate("tanh")
+    with pytest.raises(RuntimeError, match="tl.erf"):
+        validate("none")
+    with pytest.raises(ValueError, match="Unsupported"):
+        validate("quick")
+
+
+class _TensorPointer:
+    """CPU storage pointer for evaluating the actual elementwise Triton body."""
+
+    def __init__(self, tensor, offsets=None):
+        self.storage = tensor.as_strided(
+            (tensor.untyped_storage().nbytes() // tensor.element_size(),), (1,), 0
+        )
+        self.offsets = tensor.storage_offset() if offsets is None else offsets
+
+    def __add__(self, offset):
+        return _TensorPointer(self.storage, self.offsets + offset)
+
+
+class _ElementwiseTL:
+    constexpr = None
+    float32 = torch.float32
+    program = 0
+
+    def program_id(self, _):
+        return self.program
+
+    def arange(self, start, end):
+        return torch.arange(start, end)
+
+    def load(self, pointer, mask, other):
+        output = torch.full(mask.shape, other, dtype=pointer.storage.dtype)
+        output[mask] = pointer.storage[pointer.offsets[mask]]
+        return output
+
+    def store(self, pointer, value, mask):
+        pointer.storage[pointer.offsets[mask]] = value[mask].to(pointer.storage.dtype)
+
+
+@pytest.mark.parametrize("heads", [4, 16])
+@pytest.mark.parametrize("full_width", [False, True])
+def test_fused_rope_actual_kernel_handles_head72_strides_and_tail(heads, full_width):
+    generator = torch.Generator().manual_seed(178)
+    tokens, dim = 5, 72
+    # Split QKV views are strided, and K need not share Q's strides.
+    q = torch.randn(tokens * 2, heads, 3, dim * 2, generator=generator).bfloat16()[
+        ::2, :, 0, ::2
+    ]
+    k = (
+        torch.randn(heads, tokens, dim * 2, generator=generator)
+        .bfloat16()
+        .permute(1, 0, 2)[..., ::2]
+    )
+    width = dim if full_width else dim // 2
+    # The second half is intentionally different: only the first half is read.
+    cos = torch.randn(tokens, width * 2, generator=generator)[:, ::2]
+    sin = torch.randn(tokens * 2, width, generator=generator)[::2]
+    expected = OPS.welmv4_vision_apply_rope(q, k, cos, sin)
+    actual = (
+        torch.full(q.shape, float("nan")).bfloat16(),
+        torch.full(k.shape, float("nan")).bfloat16(),
+    )
+    tl = _ElementwiseTL()
+    kernel = _kernel_definition("_apply_rope_kernel", tl=tl)
+    pairs = tokens * heads * (dim // 2)
+    for program in range((pairs + 255) // 256):
+        tl.program = program
+        kernel(
+            *map(_TensorPointer, (q, k, cos, sin, *actual)),
+            pairs,
+            heads,
+            dim // 2,
+            *q.stride(),
+            *k.stride(),
+            *cos.stride(),
+            *sin.stride(),
+            256,
+        )
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    rounded_coefficients = OPS.welmv4_vision_apply_rope(
+        q, k, cos.bfloat16(), sin.bfloat16()
+    )
+    assert not torch.equal(expected[0], rounded_coefficients[0])
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_rope_cpu_reference_remains_available_when_fusion_enabled(monkeypatch, enabled):
+    monkeypatch.setenv("SGLANG_VLM_NPU_FUSE_ROPE", enabled)
+    q = torch.randn(3, 4, 72).bfloat16()
+    k = torch.randn_like(q)
+    cos, sin = torch.randn(3, 36), torch.randn(3, 36)
+    output = OPS.welmv4_vision_apply_rope(q, k, cos, sin)
+    assert output[0].dtype == torch.bfloat16
+    assert output[0].device.type == "cpu"
+
+
+def test_npu_rope_dispatch_passes_strided_qk_and_fp32_coefficients(monkeypatch):
+    monkeypatch.setenv("SGLANG_VLM_NPU_FUSE_ROPE", "1")
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.welmv4_vision_npu", HELPERS)
+    qkv = torch.randn(3, 4, 3, 72).bfloat16()
+    query, key = _NPUTensorProxy(qkv[:, :, 0, :]), _NPUTensorProxy(qkv[:, :, 1, :])
+    cos, sin = _NPUTensorProxy(torch.randn(3, 36)), _NPUTensorProxy(torch.randn(3, 36))
+    assert not query.is_contiguous()
+    expected = (torch.zeros(3, 4, 72).bfloat16(), torch.zeros(3, 4, 72).bfloat16())
+    kernel = Mock(return_value=expected)
+    module = types.ModuleType("sglang.srt.layers.welmv4_vision_npu_kernels")
+    module.apply_rope = kernel
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert OPS.welmv4_vision_apply_rope(query, key, cos, sin) is expected
+    kernel.assert_called_once_with(query, key, cos, sin)

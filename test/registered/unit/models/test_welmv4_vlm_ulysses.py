@@ -145,7 +145,7 @@ def _types(group, cap):
         "WeLMV4VisionProjector",
         VisionAttention=_AttentionBase,
         ColumnParallelLinear=_Linear,
-        WeLMV4VisionRowParallelLinear=_Linear,
+        RowParallelLinear=_Linear,
         VisionNPUFusionConfig=HELPERS.VisionNPUFusionConfig,
         vision_column_parallel_linear_gelu=HELPERS.vision_column_parallel_linear_gelu,
         vision_add_layer_norm=HELPERS.vision_add_layer_norm,
@@ -367,7 +367,7 @@ def test_real_attention_constructor_replicates_qkv_and_projection_on_nonzero_ran
     types = _load_definitions(
         "WeLMV4VisionAttention",
         VisionAttention=scope["VisionAttention"],
-        WeLMV4VisionRowParallelLinear=_Linear,
+        RowParallelLinear=_Linear,
         _apply_welmv4_vision_rope=lambda *args: None,
     )
     config = SimpleNamespace(hidden_size=1152, num_attention_heads=16)

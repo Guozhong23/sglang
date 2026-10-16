@@ -4,7 +4,8 @@
 
 Keep these separate from the decoder's fused kernels: vision uses 72-wide
 heads and fp32 rotary coefficients, unlike the text model's partial RoPE.
-All operations dispatch through PyTorch and work on CPU and Ascend NPU.
+The reference path works on CPU and Ascend NPU. Optional fused NPU RoPE
+preserves its FP32 intermediate calculations and BF16 output boundary.
 """
 
 from __future__ import annotations
@@ -47,6 +48,18 @@ def welmv4_vision_apply_rope(
         raise ValueError("cos and sin must have shape (tokens, head_dim/2 or head_dim)")
     if not (q.device == k.device == cos.device == sin.device):
         raise ValueError("query, key, cos and sin must be on the same device")
+    if q.device.type == "npu":
+        from sglang.srt.layers.welmv4_vision_npu import _env_bool
+
+        if (
+            _env_bool("SGLANG_VLM_NPU_FUSE_ROPE")
+            and cos.dtype == torch.float32
+            and sin.dtype == torch.float32
+            and q.numel() > 0
+        ):
+            from sglang.srt.layers.welmv4_vision_npu_kernels import apply_rope
+
+            return apply_rope(q, k, cos, sin)
     cos = cos[:, :half].float().unsqueeze(1)
     sin = sin[:, :half].float().unsqueeze(1)
 

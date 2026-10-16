@@ -10,9 +10,9 @@ from unittest.mock import Mock
 import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
-register_cpu_ci = runpy.run_path(
-    str(ROOT / "python/sglang/test/ci/ci_register.py")
-)["register_cpu_ci"]
+register_cpu_ci = runpy.run_path(str(ROOT / "python/sglang/test/ci/ci_register.py"))[
+    "register_cpu_ci"
+]
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 MEGAMOE = "npu_ops_transformer.ops.mega_moe"
@@ -37,7 +37,7 @@ def preflight(monkeypatch):
     spec = importlib.util.spec_from_file_location("welm_vl_preflight_deps", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    for flag in FLAGS:
+    for flag in FLAGS + ("SGLANG_VLM_VISION_USE_DP", "SGLANG_VLM_VISION_USE_ULYSSES"):
         monkeypatch.delenv(flag, raising=False)
     extensions = {
         name: SimpleNamespace(**{symbol: Mock() for symbol in symbols})
@@ -204,6 +204,54 @@ def test_unknown_profile_is_rejected_before_imports(preflight):
     with pytest.raises(ValueError, match="Unknown WeLM-VL profile"):
         preflight.module.check_optimization_dependencies(tp=4, profile="unknown")
     preflight.importer.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "flag,mode",
+    [
+        (None, "tp"),
+        ("SGLANG_VLM_VISION_USE_DP", "dp"),
+        ("SGLANG_VLM_VISION_USE_ULYSSES", "ulysses"),
+    ],
+)
+def test_vision_parallel_mode_and_conflict(preflight, monkeypatch, flag, mode):
+    if flag:
+        monkeypatch.setenv(flag, "true")
+    assert preflight.module.vision_parallel_mode() == mode
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", "1")
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "1")
+    with pytest.raises(ValueError, match="not both"):
+        preflight.module.vision_parallel_mode()
+
+
+def test_dp_does_not_require_vision_shards_but_still_validates_llm(
+    preflight, monkeypatch
+):
+    config = {
+        "text_config": {"num_attention_heads": 24},
+        "vision_config": {"num_attention_heads": 5, "intermediate_size": 37},
+    }
+    with pytest.raises(ValueError, match="num_attention_heads=5"):
+        preflight.module.check_parallel_dimensions(config, 4)
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", "1")
+    assert preflight.module.check_parallel_dimensions(config, 4) == "dp"
+    config["text_config"]["num_attention_heads"] = 7
+    with pytest.raises(ValueError, match="num_attention_heads=7"):
+        preflight.module.check_parallel_dimensions(config, 4)
+
+
+def test_ulysses_does_not_shard_mlp_but_requires_divisible_heads(
+    preflight, monkeypatch
+):
+    config = {
+        "text_config": {"num_attention_heads": 24},
+        "vision_config": {"num_attention_heads": 16, "intermediate_size": 37},
+    }
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "1")
+    assert preflight.module.check_parallel_dimensions(config, 4) == "ulysses"
+    config["vision_config"]["num_attention_heads"] = 5
+    with pytest.raises(ValueError, match="num_attention_heads=5"):
+        preflight.module.check_parallel_dimensions(config, 4)
 
 
 if __name__ == "__main__":

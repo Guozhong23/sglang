@@ -10,10 +10,14 @@ except ImportError:
     libdevice = None
 
 
-def validate_gelu_runtime():
-    if not callable(getattr(tl, "erf", None)):
+def validate_gelu_runtime(mode=None):
+    if mode not in (None, "none", "tanh"):
+        raise ValueError(f"Unsupported vision GELU mode: {mode}")
+    if mode in (None, "none") and not callable(getattr(tl, "erf", None)):
         raise RuntimeError("Vision fused GELU requires Triton Ascend tl.erf")
-    if libdevice is None or not callable(getattr(libdevice, "tanh", None)):
+    if mode in (None, "tanh") and (
+        libdevice is None or not callable(getattr(libdevice, "tanh", None))
+    ):
         raise RuntimeError(
             "Vision fused GELU requires triton.language.extra.cann.libdevice.tanh"
         )
@@ -73,7 +77,7 @@ def _linear_gelu_kernel(
 def linear_gelu(
     hidden: torch.Tensor, weight: torch.Tensor, bias, mode: str
 ) -> torch.Tensor:
-    validate_gelu_runtime()
+    validate_gelu_runtime(mode)
     rows = hidden.numel() // hidden.shape[-1]
     output = torch.empty(
         (*hidden.shape[:-1], weight.shape[0]), device=hidden.device, dtype=hidden.dtype
@@ -145,3 +149,87 @@ def add_layer_norm(hidden, residual, weight, bias, epsilon):
         enable_fp_fusion=False,
     )
     return summed, output
+
+
+@triton.jit
+def _apply_rope_kernel(
+    query_ptr,
+    key_ptr,
+    cos_ptr,
+    sin_ptr,
+    query_output_ptr,
+    key_output_ptr,
+    pairs: tl.constexpr,
+    heads: tl.constexpr,
+    half: tl.constexpr,
+    q_token_stride: tl.constexpr,
+    q_head_stride: tl.constexpr,
+    q_dim_stride: tl.constexpr,
+    k_token_stride: tl.constexpr,
+    k_head_stride: tl.constexpr,
+    k_dim_stride: tl.constexpr,
+    cos_token_stride: tl.constexpr,
+    cos_dim_stride: tl.constexpr,
+    sin_token_stride: tl.constexpr,
+    sin_dim_stride: tl.constexpr,
+    block: tl.constexpr,
+):
+    indices = tl.program_id(0) * block + tl.arange(0, block)
+    valid = indices < pairs
+    frequency = indices % half
+    head = (indices // half) % heads
+    token = indices // (half * heads)
+    q_offsets = token * q_token_stride + head * q_head_stride + frequency * q_dim_stride
+    k_offsets = token * k_token_stride + head * k_head_stride + frequency * k_dim_stride
+    q_lo = tl.load(query_ptr + q_offsets, valid, 0).to(tl.float32)
+    q_hi = tl.load(query_ptr + q_offsets + half * q_dim_stride, valid, 0).to(tl.float32)
+    k_lo = tl.load(key_ptr + k_offsets, valid, 0).to(tl.float32)
+    k_hi = tl.load(key_ptr + k_offsets + half * k_dim_stride, valid, 0).to(tl.float32)
+    cosine = tl.load(
+        cos_ptr + token * cos_token_stride + frequency * cos_dim_stride, valid, 0
+    )
+    sine = tl.load(
+        sin_ptr + token * sin_token_stride + frequency * sin_dim_stride, valid, 0
+    )
+    output_offsets = token * heads * half * 2 + head * half * 2 + frequency
+    # Keep each product and sum in FP32, then round only the BF16 stores.
+    tl.store(query_output_ptr + output_offsets, q_lo * cosine - q_hi * sine, valid)
+    tl.store(
+        query_output_ptr + output_offsets + half, q_lo * sine + q_hi * cosine, valid
+    )
+    tl.store(key_output_ptr + output_offsets, k_lo * cosine - k_hi * sine, valid)
+    tl.store(key_output_ptr + output_offsets + half, k_lo * sine + k_hi * cosine, valid)
+
+
+def apply_rope(query, key, cos, sin):
+    """Fuse Q/K half rotation without copying their possibly strided QKV views.
+
+    Called after shape/device validation in welmv4_vision_apply_rope. The
+    coefficients must remain FP32; converting them to BF16 changes the model.
+    """
+    if query.dtype != torch.bfloat16 or key.dtype != torch.bfloat16:
+        raise TypeError("Fused vision RoPE requires BF16 query/key")
+    if cos.dtype != torch.float32 or sin.dtype != torch.float32:
+        raise TypeError("Fused vision RoPE requires FP32 cosine/sine")
+    tokens, heads, head_dim = query.shape
+    query_output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    key_output = torch.empty(key.shape, dtype=key.dtype, device=key.device)
+    pairs = tokens * heads * (head_dim // 2)
+    _apply_rope_kernel[(triton.cdiv(pairs, 256),)](
+        query,
+        key,
+        cos,
+        sin,
+        query_output,
+        key_output,
+        pairs,
+        heads,
+        head_dim // 2,
+        *query.stride(),
+        *key.stride(),
+        *cos.stride(),
+        *sin.stride(),
+        256,
+        enable_fp_fusion=False,
+    )
+    return query_output, key_output

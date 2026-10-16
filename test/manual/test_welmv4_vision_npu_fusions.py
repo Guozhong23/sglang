@@ -1,20 +1,21 @@
 """Standalone NPU correctness and eager-device-time checks for vision fusions.
 
 python test/manual/test_welmv4_vision_npu_fusions.py --op all
-torchrun --standalone --nproc_per_node=4 test/manual/test_welmv4_vision_npu_fusions.py --op mc2
+python test/manual/test_welmv4_vision_npu_fusions.py --op norm --probe-native-add-layer-norm
+
+No MC2 collectives are used. Timings synchronize NPU events. Passing tolerances
+is a kernel smoke check, not a substitute for model-level accuracy evaluation.
 """
 
 import argparse
 import importlib.util
 import json
 import math
-import os
 import statistics
 import sys
 from pathlib import Path
 
 import torch
-import torch.distributed as distributed
 import torch.nn.functional as F
 
 
@@ -56,6 +57,11 @@ def _measure(operation, warmup, iterations):
 
 
 def _check(actual, expected, args):
+    if isinstance(actual, tuple):
+        return {
+            f"output_{index}": _check(value, expected[index], args)
+            for index, value in enumerate(actual)
+        }
     difference = actual.float() - expected.float()
     result = {
         "max_abs_error": difference.abs().max().item(),
@@ -75,26 +81,12 @@ def _report(label, shape, reference, fused, args, extra=None):
         accuracy = _check(actual, expected, args)
     except AssertionError as exc:
         error = exc
-    is_distributed = distributed.is_initialized()
-    if is_distributed:
-        passed = torch.tensor(
-            int(error is None), device=actual.device, dtype=torch.int32
-        )
-        distributed.all_reduce(passed, op=distributed.ReduceOp.MIN)
-        if not passed.item():
-            raise AssertionError(
-                f"{label}: at least one TP rank failed accuracy; local error={error}"
-            )
-        distributed.barrier()
-    elif error is not None:
+    if error is not None:
         raise error
     baseline = _measure(reference, args.warmup, args.iterations)
-    if is_distributed:
-        distributed.barrier()
     optimized = _measure(fused, args.warmup, args.iterations)
     result = {
         "op": label,
-        "rank": int(os.environ.get("RANK", "0")),
         "shape": shape,
         "status": "PASS",
         **accuracy,
@@ -104,27 +96,16 @@ def _report(label, shape, reference, fused, args, extra=None):
     }
     if extra:
         result.update(extra)
-    if is_distributed:
-        maxima = torch.tensor(
-            [baseline["mean_us"], optimized["mean_us"]],
-            device=actual.device,
-            dtype=torch.float32,
-        )
-        distributed.all_reduce(maxima, op=distributed.ReduceOp.MAX)
-        maximum_reference, maximum_fused = maxima.tolist()
-        result["tp_max_rank_mean_us"] = {
-            "reference": maximum_reference,
-            "fused": maximum_fused,
-            "speedup": maximum_reference / maximum_fused,
-        }
     print(json.dumps(result), flush=True)
 
 
 def _test_gelu(kernels, args, device):
     kernels.validate_gelu_runtime()
     for rows, output_width, input_width, mode in (
-        (2760, 1076, 1152, "tanh"),
-        (690, 1152, 4608, "none"),
+        (2760, 1076, 1152, "tanh"),  # TP4 FFN
+        (2760, 4304, 1152, "tanh"),  # DP / Ulysses full FFN
+        (690, 1152, 4608, "none"),  # TP4 projector
+        (690, 4608, 4608, "none"),  # DP full projector
         (3, 1076, 72, "tanh"),
         (3, 1152, 72, "none"),
     ):
@@ -183,75 +164,116 @@ def _test_add_norm(kernels, args, device):
         )
 
 
-def _test_mc2(args, device, torch_npu):
-    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
-        raise ValueError(
-            "MC2 validation requires torchrun --standalone --nproc_per_node=4"
-        )
-    distributed.init_process_group(backend="hccl")
-    try:
-        process_group = distributed.group.WORLD
-        rank = distributed.get_rank()
-        backend = process_group._get_backend(device)
-        hcom = backend.get_hccl_comm_name(process_group.rank())
-        operation = getattr(torch_npu, "npu_mm_all_reduce_base", None)
-        if not callable(operation):
-            raise RuntimeError("torch_npu.npu_mm_all_reduce_base is unavailable")
-        for rows, output_width, input_width in (
-            (2760, 1152, 288),
-            (2760, 1152, 1076),
-            (690, 2048, 1152),
-        ):
-            hidden = torch.randn(rows, input_width, device=device, dtype=torch.bfloat16)
-            weight = (
-                torch.randn(output_width, input_width, device=device)
-                / math.sqrt(input_width)
-            ).bfloat16()
-            bias = torch.linspace(-0.25, 0.25, output_width, device=device).bfloat16()
-            local_bias = bias if rank == 0 else None
+def _test_rope(kernels, args, device):
+    for tokens, heads in ((2760, 4), (2760, 16), (3, 4)):
+        dim = 72
+        qkv = torch.randn(tokens, heads, 3, dim, device=device, dtype=torch.bfloat16)
+        query, key = qkv[:, :, 0, :], qkv[:, :, 1, :]
+        angles = torch.randn(tokens, dim // 2, device=device, dtype=torch.float32)
+        for full_width in (False, True):
+            cos, sin = angles.cos(), angles.sin()
+            if full_width:
+                cos, sin = torch.cat((cos, cos), -1), torch.cat((sin, sin), -1)
 
             def reference():
-                output = F.linear(hidden, weight, local_bias)
-                distributed.all_reduce(output)
-                return output
-
-            def fused():
-                return operation(
-                    hidden,
-                    weight.transpose(0, 1),
-                    hcom,
-                    reduce_op="sum",
-                    bias=local_bias,
-                    comm_turn=0,
-                    comm_mode=args.comm_mode,
+                cosine, sine = (
+                    cos[:, : dim // 2].unsqueeze(1),
+                    sin[:, : dim // 2].unsqueeze(1),
                 )
 
-            distributed.barrier()
+                def rotate(value):
+                    lo, hi = value.float().chunk(2, dim=-1)
+                    return torch.cat(
+                        (lo * cosine - hi * sine, lo * sine + hi * cosine), -1
+                    ).bfloat16()
+
+                return rotate(query), rotate(key)
+
+            def fused():
+                return kernels.apply_rope(query, key, cos, sin)
+
+            for actual, expected in zip(fused(), reference()):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             _report(
-                "matmul_all_reduce",
-                [rows, output_width, input_width],
+                "rope_qk_head72",
+                [tokens, heads, dim],
                 reference,
                 fused,
                 args,
                 {
-                    "world_size": 4,
-                    "bias_policy": "rank0_only",
-                    "comm_mode": args.comm_mode,
+                    "full_width_coefficients": full_width,
+                    "input_is_strided": not query.is_contiguous(),
+                    "bf16_output_exact": True,
                 },
             )
-    finally:
-        distributed.destroy_process_group()
+
+
+def _probe_native_add_layer_norm(args, device, torch_npu):
+    """Diagnostic only: never selects the native operation for model execution."""
+    operation = getattr(torch_npu, "npu_add_layer_norm", None)
+    if not callable(operation):
+        print(
+            json.dumps({"op": "native_add_layer_norm_probe", "status": "UNAVAILABLE"}),
+            flush=True,
+        )
+        return
+    width = 1152
+    hidden = torch.randn(11, width, device=device, dtype=torch.bfloat16)
+    residual = torch.randn_like(hidden)
+    weight = (1 + 0.1 * torch.randn(width, device=device)).bfloat16()
+    bias = (0.1 * torch.randn(width, device=device)).bfloat16()
+    rounded_sum = hidden + residual
+    rounded = F.layer_norm(rounded_sum, (width,), weight, bias, 1e-6)
+    unrounded = F.layer_norm(
+        hidden.float() + residual.float(), (width,), weight.float(), bias.float(), 1e-6
+    ).bfloat16()
+    try:
+        normalized, _, _, summed = operation(hidden, residual, weight, bias, 1e-6, True)
+        torch.npu.synchronize()
+    except RuntimeError as exc:
+        print(
+            json.dumps(
+                {
+                    "op": "native_add_layer_norm_probe",
+                    "status": "UNSUPPORTED",
+                    "error": str(exc),
+                }
+            ),
+            flush=True,
+        )
+        return
+    print(
+        json.dumps(
+            {
+                "op": "native_add_layer_norm_probe",
+                "status": "DIAGNOSTIC_ONLY",
+                "residual_matches_bf16_sum": torch.equal(summed, rounded_sum),
+                "normalized_exactly_matches_rounded": torch.equal(normalized, rounded),
+                "max_error_vs_rounded": (normalized.float() - rounded.float())
+                .abs()
+                .max()
+                .item(),
+                "max_error_vs_unrounded": (normalized.float() - unrounded.float())
+                .abs()
+                .max()
+                .item(),
+                "rounded_and_unrounded_differ": not torch.equal(rounded, unrounded),
+                "model_uses_native_operator": False,
+            }
+        ),
+        flush=True,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--op", choices=("all", "gelu", "norm", "mc2"), default="all")
+    parser.add_argument("--op", choices=("all", "gelu", "norm", "rope"), default="all")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--rtol", type=float, default=0.02)
     parser.add_argument("--atol", type=float, default=0.02)
-    parser.add_argument("--comm-mode", choices=("ccu", "ai_cpu"), default="ccu")
+    parser.add_argument("--probe-native-add-layer-norm", action="store_true")
     args = parser.parse_args()
     if args.warmup < 1 or args.iterations < 1 or args.rtol < 0 or args.atol < 0:
         parser.error(
@@ -259,20 +281,19 @@ def main():
         )
     import torch_npu
 
-    local_rank = int(os.environ.get("LOCAL_RANK", str(args.device)))
-    torch.npu.set_device(local_rank)
-    device = torch.device(f"npu:{local_rank}")
-    torch.manual_seed(20261008 + local_rank)
-    kernels = _load_kernels() if args.op != "mc2" else None
+    torch.npu.set_device(args.device)
+    device = torch.device(f"npu:{args.device}")
+    torch.manual_seed(20261008)
+    kernels = _load_kernels()
     with torch.inference_mode():
         if args.op in ("all", "gelu"):
             _test_gelu(kernels, args, device)
         if args.op in ("all", "norm"):
             _test_add_norm(kernels, args, device)
-        if args.op == "mc2" or (
-            args.op == "all" and int(os.environ.get("WORLD_SIZE", "1")) == 4
-        ):
-            _test_mc2(args, device, torch_npu)
+        if args.op in ("all", "rope"):
+            _test_rope(kernels, args, device)
+        if args.probe_native_add_layer_norm:
+            _probe_native_add_layer_norm(args, device, torch_npu)
 
 
 if __name__ == "__main__":
