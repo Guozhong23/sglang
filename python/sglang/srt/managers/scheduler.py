@@ -3143,7 +3143,11 @@ class Scheduler(
         if not (
             self.is_mixed_chunk
             and self.model_config.hf_config.architectures[0]
-            in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration")
+            in (
+                "WeLMV4MoeForCausalLM",
+                "WeLMV4VLMForConditionalGeneration",
+                "WeLMMoonViTVLForConditionalGeneration",
+            )
         ):
             return None
         live_indices = [

@@ -5073,12 +5073,16 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        if model_arch == "WeLMV4VLMForConditionalGeneration":
+        if model_arch in (
+            "WeLMV4VLMForConditionalGeneration",
+            "WeLMMoonViTVLForConditionalGeneration",
+        ):
             self._handle_welm_vlm_adjustments()
 
         if model_arch in (
             "WeLMV4MoeForCausalLM",
             "WeLMV4VLMForConditionalGeneration",
+            "WeLMMoonViTVLForConditionalGeneration",
         ):
             import torch
 
@@ -5181,7 +5185,10 @@ class ServerArgs:
                 and self.dtype in ("auto", "bfloat16")
                 and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
                 and (
-                    model_arch != "WeLMV4VLMForConditionalGeneration"
+                    model_arch not in (
+                        "WeLMV4VLMForConditionalGeneration",
+                        "WeLMMoonViTVLForConditionalGeneration",
+                    )
                     or self.quantization is None
                 )
                 and not self.enable_lora
@@ -5958,7 +5965,10 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         architectures = getattr(hf_config, "architectures", None) or []
-        if architectures and architectures[0] == "WeLMV4VLMForConditionalGeneration":
+        if architectures and architectures[0] in (
+            "WeLMV4VLMForConditionalGeneration",
+            "WeLMMoonViTVLForConditionalGeneration",
+        ):
             self._validate_welm_vlm_parallel_config()
             return
         if not architectures or architectures[0] != "WeLMV4MoeForCausalLM":

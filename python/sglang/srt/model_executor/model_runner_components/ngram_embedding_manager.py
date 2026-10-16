@@ -121,7 +121,10 @@ class NgramEmbeddingManager:
         ngram_embedding_k = 0
         use_ngram_embedding = model_config.use_ngram_embedding
         image_token_id = None
-        if "WeLMV4VLMForConditionalGeneration" in (
+        if {
+            "WeLMV4VLMForConditionalGeneration",
+            "WeLMMoonViTVLForConditionalGeneration",
+        }.intersection(
             getattr(model_config.hf_config, "architectures", None) or []
         ):
             image_token_id = getattr(model_config.hf_config, "image_token_id", None)
@@ -163,7 +166,11 @@ class NgramEmbeddingManager:
                 is_npu()
                 and server_args.enable_mixed_chunk
                 and model_config.hf_config.architectures[0]
-                in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration")
+                in (
+                    "WeLMV4MoeForCausalLM",
+                    "WeLMV4VLMForConditionalGeneration",
+                    "WeLMMoonViTVLForConditionalGeneration",
+                )
             ),
         )
 

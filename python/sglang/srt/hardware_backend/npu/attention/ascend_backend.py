@@ -394,6 +394,7 @@ class AscendAttnBackend(AttentionBackend):
                 "WeLMV4MoeForCausalLM",
                 "WeLMV4MoeForCausalLMNextN",
                 "WeLMV4VLMForConditionalGeneration",
+                "WeLMMoonViTVLForConditionalGeneration",
             )
             for arch in architectures
         )

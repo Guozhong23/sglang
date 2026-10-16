@@ -1110,7 +1110,11 @@ class ModelRunner:
             or self.ps.moe_ep_size <= 1
             or get_parallel().moe_tp_size != 1
             or not any(
-                arch in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration")
+                arch in (
+                    "WeLMV4MoeForCausalLM",
+                    "WeLMV4VLMForConditionalGeneration",
+                    "WeLMMoonViTVLForConditionalGeneration",
+                )
                 for arch in (self.model_config.hf_config.architectures or [])
             )
         ):

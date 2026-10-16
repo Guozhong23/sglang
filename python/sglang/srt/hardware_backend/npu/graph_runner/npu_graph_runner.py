@@ -98,6 +98,7 @@ def welmv4_graph_uses_device_attention_metadata(model_runner: ModelRunner) -> bo
             "WeLMV4MoeForCausalLM",
             "WeLMV4MoeForCausalLMNextN",
             "WeLMV4VLMForConditionalGeneration",
+            "WeLMMoonViTVLForConditionalGeneration",
         )
         for arch in architectures
     ):
@@ -174,6 +175,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 "WeLMV4MoeForCausalLM",
                 "WeLMV4MoeForCausalLMNextN",
                 "WeLMV4VLMForConditionalGeneration",
+                "WeLMMoonViTVLForConditionalGeneration",
             )
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )

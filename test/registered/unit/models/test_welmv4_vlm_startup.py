@@ -68,16 +68,26 @@ def _model_helpers():
     )
 
 
-def test_real_checkpoint_multimodal_sinks_and_48_layer_windows():
-    raw = json.loads(FIXTURE.read_text())
+@pytest.mark.parametrize(
+    "architecture,fixture",
+    [
+        (ARCH, FIXTURE),
+        (
+            "WeLMMoonViTVLForConditionalGeneration",
+            FIXTURE.with_name("welm_moonvit_vl_config.json"),
+        ),
+    ],
+)
+def test_real_checkpoint_multimodal_sinks_and_48_layer_windows(architecture, fixture):
+    raw = json.loads(fixture.read_text())
     text = SimpleNamespace(**raw["text_config"])
     helpers = _model_helpers()
-    assert helpers["is_multimodal_model"]([ARCH])
-    assert helpers["is_multimodal_breakable_cuda_graph_supported"]([ARCH])
-    assert helpers["is_hybrid_swa_model"]([ARCH], text)
+    assert helpers["is_multimodal_model"]([architecture])
+    assert helpers["is_multimodal_breakable_cuda_graph_supported"]([architecture])
+    assert helpers["is_hybrid_swa_model"]([architecture], text)
     model = SimpleNamespace(hf_config=SimpleNamespace(**raw), hf_text_config=text)
     assert helpers["_detect_attention_sinks"](model)
-    swa, full = helpers["get_hybrid_layer_ids"]([ARCH], text, context_len=8192)
+    swa, full = helpers["get_hybrid_layer_ids"]([architecture], text, context_len=8192)
     assert set(swa) | set(full) == set(range(48))
     assert not set(swa) & set(full)
     assert swa == [

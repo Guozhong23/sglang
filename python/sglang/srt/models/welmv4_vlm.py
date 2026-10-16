@@ -818,6 +818,9 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             raise ValueError("image_token_id must be inside the text vocabulary")
         super().__init__(text_config, quant_config=None, prefix=prefix)
         self.vlm_config = config
+        self._init_vision_modules(vision_config, prefix)
+
+    def _init_vision_modules(self, vision_config, prefix):
         self._vision_dp_group = create_vision_dp_group(
             vision_config, max_patches=_vision_max_patches()
         )

@@ -52,6 +52,7 @@ WELMV4_MODEL_ARCHS = (
     "WeLMV4MoeForCausalLM",
     "WeLMV4MoeForCausalLMNextN",
     "WeLMV4VLMForConditionalGeneration",
+    "WeLMMoonViTVLForConditionalGeneration",
 )
 
 
@@ -1820,6 +1821,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "WeLMV4VLMForConditionalGeneration",
+    "WeLMMoonViTVLForConditionalGeneration",
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
@@ -1918,6 +1920,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5MoeForConditionalGeneration",
     # BF16 NPU text-body capture; vision and OE embeddings stay eager.
     "WeLMV4VLMForConditionalGeneration",
+    "WeLMMoonViTVLForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
