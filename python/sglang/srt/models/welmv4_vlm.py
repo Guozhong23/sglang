@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.welmv4_vision_cache import VisionMetadataCache, vision_grid_key
 from sglang.srt.layers.welmv4_vision_dp import (
+    VisionDPInputSpec,
     create_vision_dp_group,
     encode_vision_dp,
     synchronize_vision_dp_cache,
@@ -48,7 +49,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welmv4 import WeLMV4MoeForCausalLM
-from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import add_prefix, print_warning_once
 
 # Maximum number of vision-encoder patch tokens processed in a single
@@ -504,6 +504,17 @@ class WeLMV4VisionEncoder(nn.Module):
     def device(self):
         return self.patch_embed.proj.weight.device
 
+    @property
+    def vision_dp_input_spec(self):
+        config = self.config
+        return VisionDPInputSpec(
+            merge=(config.spatial_merge_size, config.spatial_merge_size),
+            pixel_tail_shape=(
+                config.in_channels * config.temporal_patch_size * config.patch_size**2,
+            ),
+            output_hidden_size=config.out_hidden_size,
+        )
+
     def clear_metadata_cache(self):
         self._metadata_cache.clear()
 
@@ -802,10 +813,6 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             raise NotImplementedError(
                 "WeLMV4 VLM encoder disaggregation is not supported"
             )
-        if get_mm().mm_enable_dp_encoder:
-            raise NotImplementedError(
-                "WeLMV4 VLM data-parallel vision encoding is not supported"
-            )
         text_config = copy.copy(_as_config(config.text_config))
         text_config._welmv4_vlm_target_only = True
         vision_config = _as_config(config.vision_config)
@@ -986,8 +993,10 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         if self._vision_dp_group is not None:
             dp_options = dict(
                 batch_encode_per_image=True,
-                synchronize_cache_misses=lambda items, hits: synchronize_vision_dp_cache(
-                    items, hits, group=self._vision_dp_group
+                synchronize_cache_misses=lambda items, hits: (
+                    synchronize_vision_dp_cache(
+                        items, hits, group=self._vision_dp_group
+                    )
                 ),
             )
         try:

@@ -239,11 +239,19 @@ def _runtime(
     graph=False,
     dp=False,
     mismatched=False,
-    attn_ranks=None
+    attn_ranks=None,
 ):
     group = SimpleNamespace(
         world_size=world, rank_in_group=0, ranks=list(range(world)), cpu_group=object()
     )
+    import runpy
+
+    policy = ModuleType("sglang.srt.layers.welmv4_vision_parallel")
+    policy.__dict__.update(
+        runpy.run_path(str(ROOT / "python/sglang/srt/layers/welmv4_vision_parallel.py"))
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.welmv4_vision_parallel", policy)
+    monkeypatch.delenv("SGLANG_VLM_VISION_USE_DP", raising=False)
     modules = {
         "sglang.srt.utils": {"is_npu": lambda: npu},
         "sglang.srt.distributed": {
@@ -295,7 +303,7 @@ def test_startup_switch_and_group(monkeypatch, value):
     [
         ({"npu": False}, "NPU"),
         ({"graph": True}, "graphs"),
-        ({"dp": True}, "encoder DP"),
+        ({"dp": True}, "mutually exclusive"),
         ({"mismatched": True}, "differ"),
         ({"attn_ranks": [0, 1]}, "identical"),
         ({"world": 3}, "divisible"),

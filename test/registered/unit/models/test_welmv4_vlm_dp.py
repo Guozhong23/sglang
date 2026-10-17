@@ -146,25 +146,16 @@ def test_owned_encoder_and_projector_match_full_image_reference(world, cap, grid
     assert all(item.feature is feature for item, feature in zip(items, features))
 
 
-@pytest.mark.parametrize("mode", ["0", "false", "1", "true", "bad"])
+@pytest.mark.parametrize("mode", [False, True])
 def test_startup_dp_switch_and_full_heads(monkeypatch, mode):
-    group = _runtime(monkeypatch)
+    group = _runtime(monkeypatch, dp=mode)
     monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "0")
-    monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", mode)
     monkeypatch.setitem(sys.modules, "sglang.srt.layers.welmv4_vision_ulysses", ULYSSES)
     config = SimpleNamespace(
         num_attention_heads=2, hidden_size=144, num_hidden_layers=27
     )
-    if mode == "bad":
-        with pytest.raises(ValueError, match="must be"):
-            DP.create_vision_dp_group(config)
-    else:
-        assert DP.create_vision_dp_group(config) is (
-            group if mode in {"1", "true"} else None
-        )
-        assert (
-            ULYSSES.create_vision_ulysses_group(config, use_data_parallel=True) is None
-        )
+    assert DP.create_vision_dp_group(config) is (group if mode else None)
+    assert ULYSSES.create_vision_ulysses_group(config, use_data_parallel=mode) is None
 
 
 @pytest.mark.parametrize(
@@ -173,15 +164,13 @@ def test_startup_dp_switch_and_full_heads(monkeypatch, mode):
         ({}, "1", "mutually exclusive"),
         ({"npu": False}, "0", "NPU"),
         ({"graph": True}, "0", "graphs"),
-        ({"dp": True}, "0", "encoder DP"),
         ({"mismatched": True}, "0", "differ"),
         ({"attn_ranks": [0, 1]}, "0", "identical"),
     ],
 )
 def test_startup_rejects_unsafe_dp_modes(monkeypatch, options, sp, message):
-    _runtime(monkeypatch, **options)
+    _runtime(monkeypatch, dp=True, **options)
     monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", sp)
-    monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", "1")
     config = SimpleNamespace(
         num_attention_heads=16, hidden_size=1152, num_hidden_layers=27
     )
@@ -262,6 +251,7 @@ class _EchoEncoder:
             patch_size=1,
             out_hidden_size=2,
         )
+        self.vision_dp_input_spec = DP.VisionDPInputSpec((2, 2), (1,), 2)
         self.dtype, self.device = torch.float32, torch.device("cpu")
         self.calls = 0
 
@@ -311,6 +301,32 @@ def _gloo_worker(rank, world, rendezvous):
             for item, output in zip(items, results):
                 expected = projector(item.feature.expand(-1, 2))
                 torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        # Real MoonViT blocks and BF16 pixels through the same four-process
+        # exchange; two images leave two ranks idle and exercise owner chunks.
+        from test_welm_moonvit_vl import tiny_vision
+
+        torch.manual_seed(425)
+        encoder, projector = tiny_vision(use_data_parallel=True, tp=world, cap=8)
+        encoder, projector = encoder.bfloat16(), projector.bfloat16()
+        grids = [[1, 2, 2], [1, 4, 4]]
+        items = [
+            SimpleNamespace(
+                hash=index,
+                image_grid_thw=torch.tensor([grid]),
+                feature=torch.randn(grid[1] * grid[2], 3, 2, 2).bfloat16(),
+            )
+            for index, grid in enumerate(grids)
+        ]
+        with torch.inference_mode():
+            result = DP.encode_vision_dp(items, encoder, projector, group)
+            expected = projector(
+                encoder(
+                    torch.cat([item.feature for item in items]), torch.tensor(grids)
+                )
+            )
+        torch.testing.assert_close(
+            torch.cat(result), expected, atol=0.015625, rtol=0.02
+        )
         assert DP.synchronize_vision_dp_cache([], [], group=group) == []
     finally:
         dist.destroy_process_group()
@@ -323,3 +339,114 @@ def test_real_four_process_dp_handles_idle_ranks_padding_and_order(tmp_path):
     mp.spawn(
         _gloo_worker, args=(4, (tmp_path / "dp-store").as_uri()), nprocs=4, join=True
     )
+
+
+@pytest.mark.parametrize("world", [1, 4])
+@pytest.mark.parametrize("cap", [0, 8])
+@pytest.mark.parametrize(
+    "grids",
+    [[[1, 2, 4]], [[1, 2, 2], [1, 4, 4], [1, 2, 6], [1, 4, 2], [1, 2, 2], [1, 2, 4]]],
+)
+def test_moonvit_dp_matches_independent_checkpoint_math(world, cap, grids):
+    from test_welm_moonvit_vl import reference_image, tiny_vision
+
+    torch.set_num_threads(1)
+    torch.manual_seed(420)
+    reference, projection = tiny_vision(use_data_parallel=True, tp=world, cap=cap)
+    items = [
+        SimpleNamespace(
+            hash=i,
+            image_grid_thw=torch.tensor([grid]),
+            feature=torch.randn(grid[1] * grid[2], 3, 2, 2),
+        )
+        for i, grid in enumerate(grids)
+    ]
+    collectives = _Collectives(world)
+    models, calls = [], [[] for _ in range(world)]
+    for rank in range(world):
+        encoder, projector = tiny_vision(use_data_parallel=True, tp=world, cap=cap)
+        encoder.load_state_dict(reference.state_dict(), strict=True)
+        projector.load_state_dict(projection.state_dict(), strict=True)
+        encoder.register_forward_pre_hook(
+            lambda model, args, rank=rank: calls[rank].append(args[1].tolist())
+        )
+        assert all(block.attn.use_data_parallel for block in encoder.encoder.blocks)
+        assert all(
+            type(block.mlp.fc0) is torch.nn.Linear for block in encoder.encoder.blocks
+        )
+        assert projector.linear_1.tp_size == projector.linear_2.tp_size == 1
+        models.append((encoder, projector))
+
+    @torch.inference_mode()
+    def run(rank):
+        return DP.encode_vision_dp(items, *models[rank], collectives.group(rank))
+
+    with torch.inference_mode():
+        expected = torch.cat(
+            [
+                reference_image(reference, projection, item.feature, grid[1], grid[2])
+                for item, grid in zip(items, grids)
+            ]
+        )
+        with ThreadPoolExecutor(max_workers=world) as pool:
+            actual = list(pool.map(run, range(world)))
+    plan = DP.VisionDPPlan(tuple(map(tuple, grids)), (2, 2), world, 0)
+    for rank, result in enumerate(actual):
+        torch.testing.assert_close(torch.cat(result), expected, atol=2e-6, rtol=1e-5)
+        assert [grid for batch in calls[rank] for grid in batch] == [
+            grids[i] for i in plan.assignments[rank]
+        ]
+        if cap:
+            assert all(
+                len(batch) == 1 or sum(t * h * w for t, h, w in batch) <= cap
+                for batch in calls[rank]
+            )
+    assert collectives.calls == (["ag"] if world > 1 else [])
+
+
+@pytest.mark.parametrize(
+    "grid,shape,message",
+    [
+        ([2, 2, 2], (8, 3, 2, 2), "t=1"),
+        ([1, 512, 2], (1024, 3, 2, 2), "RoPE"),
+        ([1, 2, 2], (4, 12), "pixel shape"),
+        ([1, 3, 2], (6, 3, 2, 2), "merge-aligned"),
+    ],
+)
+def test_moonvit_validates_non_owned_images_before_collectives(grid, shape, message):
+    from test_welm_moonvit_vl import tiny_vision
+
+    encoder, projector = tiny_vision(use_data_parallel=True, tp=4)
+    items = [
+        SimpleNamespace(image_grid_thw=torch.tensor([grid]), feature=torch.empty(shape))
+    ]
+    group = SimpleNamespace(
+        world_size=4, rank_in_group=3, all_gather_into_tensor=Mock()
+    )
+    with pytest.raises(ValueError, match=message):
+        DP.encode_vision_dp(items, encoder, projector, group)
+    group.all_gather_into_tensor.assert_not_called()
+
+
+def test_rectangular_merge_preserves_projected_token_counts():
+    plan = DP.VisionDPPlan(((1, 4, 6), (1, 2, 9)), (2, 3), 4, 0)
+    assert plan.token_counts == (4, 3)
+    assert sum(plan.rows_per_rank) == 7
+
+
+@pytest.mark.parametrize("legacy", ["0", "1", "false", "true", "bad"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_removed_dp_environment_cannot_enable_dp(monkeypatch, legacy, enabled):
+    group = _runtime(monkeypatch, dp=enabled)
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "0")
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", legacy)
+    config = SimpleNamespace(
+        num_attention_heads=2, hidden_size=144, num_hidden_layers=2
+    )
+    if legacy == "bad" or (legacy in ("1", "true") and not enabled):
+        with pytest.raises(ValueError, match="must be|removed"):
+            ULYSSES.resolve_vision_parallel_group(config)
+    else:
+        assert ULYSSES.resolve_vision_parallel_group(config) == (
+            (group, "dp") if enabled else (None, None)
+        )

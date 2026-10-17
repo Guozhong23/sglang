@@ -177,8 +177,9 @@ def _startup_policy(megamoe=False, vit_graph=False):
     )["_handle_welm_vlm_adjustments"]
 
 
-def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings():
-    args = _server_args()
+@pytest.mark.parametrize("dp", [False, True])
+def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings(dp):
+    args = _server_args(mm_enable_dp_encoder=dp)
     _startup_policy()(args)
     assert args.enable_multimodal
     assert not args.disable_radix_cache and args.chunked_prefill_size == 4096
@@ -191,7 +192,6 @@ def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings():
     [
         {"speculative_algorithm": "NEXTN"},
         {"enable_dp_attention": True},
-        {"mm_enable_dp_encoder": True},
         {"encoder_only": True},
         {"language_only": True},
         {"disaggregation_mode": "prefill"},

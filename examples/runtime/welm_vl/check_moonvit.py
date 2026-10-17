@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from check_model import check_parallel_dimensions
+
 ARCH = "WeLMMoonViTVLForConditionalGeneration"
 
 
@@ -88,9 +90,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_path", type=Path)
     parser.add_argument("--runtime", action="store_true")
+    parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--mm-enable-dp-encoder", action="store_true")
     args = parser.parse_args()
     try:
         config = check_checkpoint(args.model_path)
+        mode = check_parallel_dimensions(config, args.tp, args.mm_enable_dp_encoder)
+        print(f"MoonViT vision mode={mode}; text TP={args.tp}")
         if args.runtime:
             check_runtime(args.model_path, config)
     except (ValueError, OSError, KeyError, ImportError) as exc:

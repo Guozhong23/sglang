@@ -5888,10 +5888,6 @@ class ServerArgs:
             (self.speculative_algorithm, "speculative decoding / MTP"),
             (self.enable_dp_attention, "--enable-dp-attention"),
             (
-                self.mm_enable_dp_encoder,
-                "--mm-enable-dp-encoder (use SGLANG_VLM_VISION_USE_DP=1 for WeLM image DP)",
-            ),
-            (
                 self.encoder_only or self.language_only,
                 "encoder/language-only deployment",
             ),

@@ -2,26 +2,32 @@
 
 import argparse
 import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 
 
-def vision_parallel_mode() -> str:
-    flags = []
-    for name in ("SGLANG_VLM_VISION_USE_ULYSSES", "SGLANG_VLM_VISION_USE_DP"):
-        value = os.getenv(name, "0").strip().lower()
-        if value not in ("0", "1", "false", "true"):
-            raise ValueError(f"{name} must be 0, 1, false or true.")
-        flags.append(value in ("1", "true"))
-    ulysses, dp = flags
-    if ulysses and dp:
-        raise ValueError("Choose either ViT Ulysses or image DP, not both.")
-    return "dp" if dp else "ulysses" if ulysses else "tp"
+def vision_parallel_mode(mm_enable_dp_encoder=False, *, supports_ulysses=True) -> str:
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "python/sglang/srt/layers/welmv4_vision_parallel.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "welm_vision_parallel_preflight", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.vision_parallel_mode(
+        mm_enable_dp_encoder, supports_ulysses=supports_ulysses
+    )
 
 
-def check_parallel_dimensions(config: dict, tp: int) -> str:
-    mode = vision_parallel_mode()
+def check_parallel_dimensions(config: dict, tp: int, mm_enable_dp_encoder=False) -> str:
+    moonvit = "WeLMMoonViTVLForConditionalGeneration" in config.get("architectures", [])
+    mode = vision_parallel_mode(mm_enable_dp_encoder, supports_ulysses=not moonvit)
+    if tp <= 0:
+        raise ValueError("TP size must be positive")
     dimensions = [(config["text_config"], "num_attention_heads")]
     # DP has full heads/MLPs on each worker; Ulysses only shards heads during
     # attention, while its block MLP weights are replicated.
@@ -137,10 +143,12 @@ def check_runtime(
     base_device: int,
     chat_template: str | None,
     profile: str = "baseline",
+    mm_enable_dp_encoder: bool = False,
 ):
-    mode = vision_parallel_mode()
+    mode = vision_parallel_mode(mm_enable_dp_encoder)
     import torch
     import torch_npu  # noqa: F401
+
     from sglang.srt.layers.welmv4_vision_npu import VisionNPUFusionConfig
     from sglang.srt.utils.hf_transformers_utils import get_config, get_processor
 
@@ -233,6 +241,7 @@ def main():
     parser.add_argument("--base-device", type=int, default=0)
     parser.add_argument("--chat-template")
     parser.add_argument("--runtime", action="store_true")
+    parser.add_argument("--mm-enable-dp-encoder", action="store_true")
     parser.add_argument(
         "--profile", choices=("baseline", "optimized"), default="baseline"
     )
@@ -243,7 +252,7 @@ def main():
             raise ValueError(
                 "This checkpoint's basic TP path supports TP=1, 2, 4 or 8."
             )
-        check_parallel_dimensions(config, args.tp)
+        check_parallel_dimensions(config, args.tp, args.mm_enable_dp_encoder)
         if args.chat_template and not Path(args.chat_template).is_file():
             raise ValueError(f"Chat template does not exist: {args.chat_template}")
         if args.runtime:
@@ -253,6 +262,7 @@ def main():
                 args.base_device,
                 args.chat_template,
                 args.profile,
+                args.mm_enable_dp_encoder,
             )
     except (
         ValueError,

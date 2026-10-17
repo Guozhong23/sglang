@@ -14,6 +14,7 @@ from torch import nn
 from transformers.activations import PytorchGELUTanh
 
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.welmv4_vision_dp import VisionDPInputSpec, create_vision_dp_group
 from sglang.srt.models.kimi_vl_moonvit import (
     MoonVisionPatchEmbed,
     MoonVitEncoderLayer,
@@ -22,6 +23,8 @@ from sglang.srt.models.kimi_vl_moonvit import (
 from sglang.srt.models.welmv4_vlm import (
     WeLMV4VLMForConditionalGeneration,
     _as_config,
+    _vision_dp_tp_kwargs,
+    _vision_max_patches,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -63,15 +66,17 @@ def moonvit_apply_rope(q, k, position_embeddings, x_shape=None):
 
 
 class WeLMMoonViTEncoder(nn.Module):
-    def __init__(self, config, prefix=""):
+    def __init__(self, config, prefix="", use_data_parallel=False):
         super().__init__()
+        self.config = config
+        self.vision_dp_max_patches = _vision_max_patches()
         self.patch_size = config.patch_size
         self.merge_kernel_size = tuple(config.merge_kernel_size)
         self.head_dim = config.hidden_size // config.num_attention_heads
-        tp = get_parallel().attn_tp_size
+        tp = 1 if use_data_parallel else get_parallel().attn_tp_size
         if config.num_attention_heads % tp or config.intermediate_size % tp:
             raise ValueError("MoonViT attention heads and MLP size must divide TP size")
-        if self.head_dim % 4:
+        if config.hidden_size % config.num_attention_heads or self.head_dim % 4:
             raise ValueError("MoonViT head dimension must be divisible by 4")
         self.patch_embed = MoonVisionPatchEmbed(
             out_dim=config.hidden_size,
@@ -88,6 +93,7 @@ class WeLMMoonViTEncoder(nn.Module):
                 mlp_dim=config.intermediate_size,
                 activation=PytorchGELUTanh(),
                 attn_bias=True,
+                use_data_parallel=use_data_parallel,
                 prefix=add_prefix(f"encoder.blocks.{i}", prefix),
             )
             for i in range(config.num_hidden_layers)
@@ -95,6 +101,24 @@ class WeLMMoonViTEncoder(nn.Module):
         for block in self.encoder.blocks:
             block.attn.customized_position_embedding_applier = moonvit_apply_rope
         self.encoder.final_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
+
+    @property
+    def dtype(self):
+        return self.patch_embed.proj.weight.dtype
+
+    @property
+    def device(self):
+        return self.patch_embed.proj.weight.device
+
+    @property
+    def vision_dp_input_spec(self):
+        return VisionDPInputSpec(
+            merge=self.merge_kernel_size,
+            pixel_tail_shape=(3, self.patch_size, self.patch_size),
+            output_hidden_size=self.config.out_hidden_size,
+            image_only=True,
+            grid_limit=512,
+        )
 
     def clear_metadata_cache(self):
         self.patch_embed.pos_emb._interpolated_pos_emb_cache.clear()
@@ -134,7 +158,7 @@ class WeLMMoonViTEncoder(nn.Module):
 
 
 class WeLMMoonViTProjector(nn.Module):
-    def __init__(self, config, prefix=""):
+    def __init__(self, config, prefix="", use_data_parallel=False):
         super().__init__()
         self.hidden_size = config.hidden_size * math.prod(config.merge_kernel_size)
         self.pre_norm = nn.LayerNorm(config.hidden_size, eps=1e-5)
@@ -143,12 +167,14 @@ class WeLMMoonViTProjector(nn.Module):
             self.hidden_size,
             bias=True,
             prefix=add_prefix("linear_1", prefix),
+            **_vision_dp_tp_kwargs(use_data_parallel),
         )
         self.linear_2 = RowParallelLinear(
             self.hidden_size,
             config.out_hidden_size,
             bias=True,
             prefix=add_prefix("linear_2", prefix),
+            **_vision_dp_tp_kwargs(use_data_parallel),
         )
 
     def forward(self, hidden):
@@ -268,7 +294,6 @@ class WeLMMoonViTVLForConditionalGeneration(WeLMV4VLMForConditionalGeneration):
             flag
             for flag in (
                 "SGLANG_VLM_VISION_USE_ULYSSES",
-                "SGLANG_VLM_VISION_USE_DP",
                 "SGLANG_VLM_NPU_USE_MC2",
                 "SGLANG_VLM_NPU_FUSE_GELU",
                 "SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM",
@@ -278,7 +303,7 @@ class WeLMMoonViTVLForConditionalGeneration(WeLMV4VLMForConditionalGeneration):
         ]
         if unsupported:
             raise ValueError(
-                "MoonViT currently uses ordinary vision TP. Set these old-ViT "
+                "MoonViT supports vision TP or --mm-enable-dp-encoder. Set these old-ViT "
                 f"options to 0: {', '.join(unsupported)}"
             )
         config = copy.copy(config)
@@ -290,12 +315,19 @@ class WeLMMoonViTVLForConditionalGeneration(WeLMV4VLMForConditionalGeneration):
         super().__init__(config, quant_config=quant_config, prefix=prefix)
 
     def _init_vision_modules(self, vision_config, prefix):
-        self._vision_dp_group = None
+        self._vision_dp_group = create_vision_dp_group(
+            vision_config, max_patches=_vision_max_patches()
+        )
+        use_dp = self._vision_dp_group is not None
         self.vision_encoder = WeLMMoonViTEncoder(
-            vision_config, prefix=add_prefix("vision_encoder", prefix)
+            vision_config,
+            prefix=add_prefix("vision_encoder", prefix),
+            use_data_parallel=use_dp,
         )
         self.vision_projector = WeLMMoonViTProjector(
-            vision_config, prefix=add_prefix("vision_projector", prefix)
+            vision_config,
+            prefix=add_prefix("vision_projector", prefix),
+            use_data_parallel=use_dp,
         )
 
     def load_weights(self, weights, is_nextn=False):

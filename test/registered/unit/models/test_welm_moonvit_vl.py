@@ -165,6 +165,8 @@ def test_placeholder_expansion_preserves_native_prompt_ids():
 
 class TupleLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=True, **kwargs):
+        self.tp_size = kwargs.get("tp_size", 1)
+        self.tp_rank = kwargs.get("tp_rank", 0)
         super().__init__(in_features, out_features, bias=bias)
 
     def forward(self, x):
@@ -176,6 +178,7 @@ class CPUVisionAttention(nn.Module):
 
     def __init__(self, embed_dim, num_heads, **kwargs):
         super().__init__()
+        self.use_data_parallel = kwargs.get("use_data_parallel", False)
         self.heads = num_heads
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
         self.proj = nn.Linear(embed_dim, embed_dim)
@@ -200,7 +203,7 @@ class CPUVisionAttention(nn.Module):
         return self.proj(torch.cat(result))
 
 
-def tiny_vision():
+def tiny_vision(use_data_parallel=False, tp=1, cap=0):
     kimi = definitions(
         KIMI,
         [
@@ -217,7 +220,7 @@ def tiny_vision():
         VisionAttention=CPUVisionAttention,
         apply_rope=None,
         Sequence=(list, tuple),
-        get_parallel=lambda: SimpleNamespace(attn_tp_size=1, attn_tp_rank=0),
+        get_parallel=lambda: SimpleNamespace(attn_tp_size=tp, attn_tp_rank=0),
         add_prefix=lambda name, prefix: f"{prefix}.{name}",
         _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES=256,
     )
@@ -234,7 +237,12 @@ def tiny_vision():
         patch_merger=kimi.patch_merger,
         ColumnParallelLinear=TupleLinear,
         RowParallelLinear=TupleLinear,
-        get_parallel=lambda: SimpleNamespace(attn_tp_size=1),
+        get_parallel=lambda: SimpleNamespace(attn_tp_size=tp),
+        _vision_max_patches=lambda: cap,
+        _vision_dp_tp_kwargs=lambda dp: {"tp_size": 1, "tp_rank": 0} if dp else {},
+        VisionDPInputSpec=runpy.run_path(
+            str(ROOT / "python/sglang/srt/layers/welmv4_vision_dp.py")
+        )["VisionDPInputSpec"],
         PytorchGELUTanh=PytorchGELUTanh,
         add_prefix=lambda name, prefix: f"{prefix}.{name}",
     )
@@ -249,7 +257,10 @@ def tiny_vision():
         init_pos_emb_width=4,
         out_hidden_size=8,
     )
-    return model.WeLMMoonViTEncoder(cfg).eval(), model.WeLMMoonViTProjector(cfg).eval()
+    return (
+        model.WeLMMoonViTEncoder(cfg, use_data_parallel=use_data_parallel).eval(),
+        model.WeLMMoonViTProjector(cfg, use_data_parallel=use_data_parallel).eval(),
+    )
 
 
 def reference_image(encoder, projector, pixels, h, w):
@@ -394,8 +405,8 @@ def test_moonvit_architecture_reaches_vl_ep_validator():
     args._validate_welm_vlm_parallel_config.assert_called_once_with()
 
 
-@pytest.mark.parametrize("rank", range(4))
-def test_checkpoint_packed_vision_qkv_uses_real_tp4_loader(rank):
+@pytest.mark.parametrize("tp,rank", [(1, 0), *[(4, rank) for rank in range(4)]])
+def test_checkpoint_packed_vision_qkv_uses_real_tp_or_dp_loader(tp, rank):
     from types import MethodType
 
     path = ROOT / "python/sglang/srt/layers/linear.py"
@@ -416,10 +427,10 @@ def test_checkpoint_packed_vision_qkv_uses_real_tp4_loader(rank):
     )
     exec(compile(module, str(path), "exec"), scope)
     layer = SimpleNamespace(
-        tp_size=4,
+        tp_size=tp,
         tp_rank=rank,
-        num_heads=4,
-        num_kv_heads=4,
+        num_heads=16 // tp,
+        num_kv_heads=16 // tp,
         total_num_heads=16,
         total_num_kv_heads=16,
         head_size=4,
@@ -429,11 +440,11 @@ def test_checkpoint_packed_vision_qkv_uses_real_tp4_loader(rank):
     )
     layer.weight_loader = MethodType(scope["weight_loader"], layer)
     packed = torch.arange(192 * 8).reshape(192, 8).float()
-    param = nn.Parameter(torch.zeros(48, 8), requires_grad=False)
+    param = nn.Parameter(torch.zeros(192 // tp, 8), requires_grad=False)
     param.output_dim = 0
     layer.weight_loader(param, packed)
     expected = torch.cat(
-        [part[rank * 16 : (rank + 1) * 16] for part in packed.chunk(3)]
+        [part[rank * (64 // tp) : (rank + 1) * (64 // tp)] for part in packed.chunk(3)]
     )
     torch.testing.assert_close(param, expected, rtol=0, atol=0)
 
@@ -461,16 +472,22 @@ with open(os.environ['MOONVIT_TEST_OUTPUT'], 'a') as f:
         TP_SIZE="4",
         MOONVIT_TEST_OUTPUT=str(output),
         WELM_NPU_USE_MEGAMOE="1",
-        SGLANG_VLM_VISION_USE_ULYSSES="1",
-        SGLANG_VLM_VISION_USE_DP="1",
+        SGLANG_VLM_VISION_USE_ULYSSES="0",
+        SGLANG_VLM_VISION_USE_DP="0",
     )
     subprocess.run(
-        ["bash", str(ROOT / "examples/runtime/welm_vl/run_moonvit_950pr.sh")],
+        [
+            "bash",
+            str(ROOT / "examples/runtime/welm_vl/run_moonvit_950pr.sh"),
+            "--mm-enable-dp-encoder",
+        ],
         env=env,
         check=True,
     )
     preflight, launch = [json.loads(line) for line in output.read_text().splitlines()]
-    assert preflight["args"][-1] == "--runtime"
+    assert "--runtime" in preflight["args"]
+    assert "--mm-enable-dp-encoder" in preflight["args"]
+    assert "--mm-enable-dp-encoder" in launch["args"]
     args = launch["args"]
     assert args[args.index("--tp-size") + 1] == "4"
     assert args[args.index("--ep-size") + 1] == ep

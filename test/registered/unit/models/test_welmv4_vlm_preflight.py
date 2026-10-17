@@ -196,7 +196,7 @@ def test_cli_forwards_profile_to_runtime_with_standalone_baseline_default(
     monkeypatch.setattr(preflight.module, "check_runtime", runtime)
     preflight.module.main()
     runtime.assert_called_once_with(
-        Path("/checkpoint"), 4, 0, None, profile or "baseline"
+        Path("/checkpoint"), 4, 0, None, profile or "baseline", False
     )
 
 
@@ -210,18 +210,18 @@ def test_unknown_profile_is_rejected_before_imports(preflight):
     "flag,mode",
     [
         (None, "tp"),
-        ("SGLANG_VLM_VISION_USE_DP", "dp"),
+        ("cli", "dp"),
         ("SGLANG_VLM_VISION_USE_ULYSSES", "ulysses"),
     ],
 )
 def test_vision_parallel_mode_and_conflict(preflight, monkeypatch, flag, mode):
-    if flag:
+    if flag and flag != "cli":
         monkeypatch.setenv(flag, "true")
-    assert preflight.module.vision_parallel_mode() == mode
+    assert preflight.module.vision_parallel_mode(flag == "cli") == mode
     monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", "1")
     monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "1")
-    with pytest.raises(ValueError, match="not both"):
-        preflight.module.vision_parallel_mode()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        preflight.module.vision_parallel_mode(True)
 
 
 def test_dp_does_not_require_vision_shards_but_still_validates_llm(
@@ -233,11 +233,10 @@ def test_dp_does_not_require_vision_shards_but_still_validates_llm(
     }
     with pytest.raises(ValueError, match="num_attention_heads=5"):
         preflight.module.check_parallel_dimensions(config, 4)
-    monkeypatch.setenv("SGLANG_VLM_VISION_USE_DP", "1")
-    assert preflight.module.check_parallel_dimensions(config, 4) == "dp"
+    assert preflight.module.check_parallel_dimensions(config, 4, True) == "dp"
     config["text_config"]["num_attention_heads"] = 7
     with pytest.raises(ValueError, match="num_attention_heads=7"):
-        preflight.module.check_parallel_dimensions(config, 4)
+        preflight.module.check_parallel_dimensions(config, 4, True)
 
 
 def test_ulysses_does_not_shard_mlp_but_requires_divisible_heads(

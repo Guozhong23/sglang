@@ -69,6 +69,9 @@ def _load_definitions(*names, **extra):
         SimpleNamespace=SimpleNamespace,
         vision_grid_key=CACHE.vision_grid_key,
         VisionMetadataCache=CACHE.VisionMetadataCache,
+        VisionDPInputSpec=runpy.run_path(
+            str(ROOT / "python/sglang/srt/layers/welmv4_vision_dp.py")
+        )["VisionDPInputSpec"],
         create_vision_ulysses_group=lambda *args, **kwargs: None,
         create_vision_dp_group=lambda *args, **kwargs: None,
         _vision_max_patches=lambda: 0,

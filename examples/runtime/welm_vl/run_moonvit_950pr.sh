@@ -11,8 +11,11 @@ TP_SIZE=${TP_SIZE:-4}
 MOE_A2A_BACKEND=${MOE_A2A_BACKEND:-none}
 
 # First establish an eager correctness baseline; no old WeLM ViT kernels.
-export SGLANG_VLM_VISION_USE_ULYSSES=0
-export SGLANG_VLM_VISION_USE_DP=0
+source "${script_dir}/vision_parallel_args.sh" "$@"
+if [[ ${SGLANG_VLM_VISION_USE_ULYSSES} == 1 ]]; then
+    echo 'MoonViT does not support SGLANG_VLM_VISION_USE_ULYSSES.' >&2
+    exit 2
+fi
 export SGLANG_VLM_NPU_USE_MC2=0
 export SGLANG_VLM_NPU_FUSE_GELU=0
 export SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM=0
@@ -38,7 +41,7 @@ case "${MOE_A2A_BACKEND}" in
     *) echo 'MOE_A2A_BACKEND must be none or deepep' >&2; exit 2 ;;
 esac
 
-"${PYTHON_BIN}" "${script_dir}/check_moonvit.py" "${MODEL_PATH}" --runtime
+"${PYTHON_BIN}" "${script_dir}/check_moonvit.py" "${MODEL_PATH}" --runtime --tp "${TP_SIZE}" "${vision_dp_args[@]}"
 exec "${PYTHON_BIN}" -m sglang.launch_server \
     --model-path "${MODEL_PATH}" --trust-remote-code \
     --device npu --dtype bfloat16 --kv-cache-dtype bfloat16 \
@@ -50,7 +53,7 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
     --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
     --context-length "${CONTEXT_LENGTH:-8192}" \
     --max-prefill-tokens "${MAX_PREFILL_TOKENS:-8192}" \
-    --max-running-requests 1 --chunked-prefill-size -1 \
+    --max-running-requests "${MAX_RUNNING_REQUESTS:-1}" --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:--1}" \
     --page-size "${PAGE_SIZE:-64}" \
     --disable-prefill-cuda-graph --disable-cuda-graph \
     --disable-overlap-schedule --disable-radix-cache \

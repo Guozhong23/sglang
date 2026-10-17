@@ -150,7 +150,7 @@ def test_default_profile_uses_optimized_tp4(invoke_launcher):
             assert call["env"][flag] == "1"
         assert call["env"]["SGLANG_VLM_VISION_METADATA_CACHE"] == "1"
         assert call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "0"
-        assert call["env"]["SGLANG_VLM_VISION_USE_DP"] == "0"
+        assert call["env"]["SGLANG_VLM_VISION_USE_DP"] is None
         assert call["env"]["WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT"] == "0"
         for flag in PERFORMANCE_FLAGS[-4:]:
             assert call["env"][flag] == "0"
@@ -194,26 +194,26 @@ def test_optimized_preserves_shared_megamoe_opt_in(invoke_launcher):
     )
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE"])
-def test_image_dp_preserves_llm_tp_and_removes_inherited_mc2(invoke_launcher, value):
+def test_image_dp_preserves_llm_tp_and_removes_inherited_mc2(invoke_launcher):
     result, calls = invoke_launcher(
-        SGLANG_VLM_VISION_USE_DP=value, SGLANG_VLM_NPU_USE_MC2="1"
+        "--mm-enable-dp-encoder", SGLANG_VLM_NPU_USE_MC2="1"
     )
     _, launch = _successful_calls(result, calls)
     _assert_optimized(launch, 4)
-    assert "--mm-enable-dp-encoder" not in launch["argv"]
+    assert "--mm-enable-dp-encoder" in launch["argv"]
     for call in calls:
-        assert call["env"]["SGLANG_VLM_VISION_USE_DP"] == "1"
+        assert "--mm-enable-dp-encoder" in call["argv"]
+        assert call["env"]["SGLANG_VLM_VISION_USE_DP"] is None
         assert call["env"]["SGLANG_VLM_VISION_USE_ULYSSES"] == "0"
         assert call["env"]["SGLANG_VLM_NPU_USE_MC2"] == "0"
 
 
 def test_conflicting_vision_modes_fail_before_loading_checkpoint(invoke_launcher):
     result, calls = invoke_launcher(
-        SGLANG_VLM_VISION_USE_DP="true", SGLANG_VLM_VISION_USE_ULYSSES="1"
+        "--mm-enable-dp-encoder", SGLANG_VLM_VISION_USE_ULYSSES="1"
     )
     assert result.returncode == 2
-    assert "cannot be enabled together" in result.stderr
+    assert "mutually exclusive" in result.stderr
     assert calls == []
 
 
@@ -238,7 +238,12 @@ def test_baseline_disables_optimizations_and_inherited_flags(invoke_launcher, tp
         CUDA_GRAPH_MAX_BS="64",
         WELM_VL_PREFILL_GRAPH="1",
         WELM_VL_MIXED_CHUNK="1",
-        **dict.fromkeys(PERFORMANCE_FLAGS, "1"),
+        **{
+            flag: "0"
+            if flag in ("SGLANG_VLM_VISION_USE_DP", "SGLANG_VLM_VISION_USE_ULYSSES")
+            else "1"
+            for flag in PERFORMANCE_FLAGS
+        },
     )
     preflight, launch = _successful_calls(result, calls)
     argv = launch["argv"]

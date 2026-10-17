@@ -64,19 +64,39 @@ def synchronize_vision_dp_cache(items, cached_mask, *, group):
 
 
 @dataclass(frozen=True)
+class VisionDPInputSpec:
+    merge: tuple[int, int]
+    pixel_tail_shape: tuple[int, ...]
+    output_hidden_size: int
+    image_only: bool = False
+    grid_limit: int | None = None
+
+    def validate(self, item, grid, count):
+        t, h, w = grid
+        if self.image_only and t != 1:
+            raise ValueError("MoonViT image DP requires t=1")
+        if self.grid_limit is not None and max(h, w) >= self.grid_limit:
+            raise ValueError("MoonViT image DP grid exceeds RoPE limit")
+        if tuple(item.feature.shape) != (count, *self.pixel_tail_shape):
+            raise ValueError("Image DP pixel shape does not match its grid")
+
+
+@dataclass(frozen=True)
 class VisionDPPlan:
     grids: tuple[tuple[int, int, int], ...]
-    merge: int
+    merge: int | tuple[int, int]
     world_size: int
     rank: int
 
     def __post_init__(self):
         if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
             raise ValueError("Invalid image DP communication group")
-        if not self.grids or self.merge <= 0:
+        if isinstance(self.merge, int):
+            object.__setattr__(self, "merge", (self.merge, self.merge))
+        if not self.grids or len(self.merge) != 2 or min(self.merge) <= 0:
             raise ValueError("Image DP requires nonempty grids and positive merge size")
         if any(
-            t <= 0 or h <= 0 or w <= 0 or h % self.merge or w % self.merge
+            t <= 0 or h <= 0 or w <= 0 or h % self.merge[0] or w % self.merge[1]
             for t, h, w in self.grids
         ):
             raise ValueError("Image DP grids must be positive and merge-aligned")
@@ -87,7 +107,9 @@ class VisionDPPlan:
 
     @cached_property
     def token_counts(self):
-        return tuple(count // self.merge**2 for count in self.patch_counts)
+        return tuple(
+            count // (self.merge[0] * self.merge[1]) for count in self.patch_counts
+        )
 
     @cached_property
     def assignments(self):
@@ -139,37 +161,45 @@ class VisionDPPlan:
 
 
 def encode_vision_dp(items, encoder, projector, group):
-    """Only owner pixels cross to the device, via the encoder's normal cast."""
+    """Validate on all ranks, transfer only owned images, gather after projection."""
+    spec = encoder.vision_dp_input_spec
     plan = VisionDPPlan(
         tuple(_image_grid(item) for item in items),
-        encoder.config.spatial_merge_size,
+        spec.merge,
         group.world_size,
         group.rank_in_group,
     )
-    expected_width = (
-        encoder.config.in_channels
-        * encoder.config.temporal_patch_size
-        * encoder.config.patch_size**2
-    )
-    # All ranks validate the full inexpensive shape manifest before any rank
-    # starts the model. Invalid non-owned input cannot strand its peers in AG.
-    for item, count in zip(items, plan.patch_counts):
-        if tuple(item.feature.shape) != (count, expected_width):
-            raise ValueError("Image DP pixel shape does not match its grid")
+    # Validate every image before any rank starts device computation/collectives.
+    for item, grid, count in zip(items, plan.grids, plan.patch_counts):
+        spec.validate(item, grid, count)
     indices = plan.assignments[plan.rank]
     if indices:
-        # Deferred mm_utils transfer keeps the common CPU storage intact.
-        pixels = torch.cat([items[index].feature for index in indices], dim=0)
-        grids = torch.tensor(
-            [plan.grids[index] for index in indices], dtype=torch.int64
-        )
-        local = projector(encoder(pixels, grids))
+        # A cap limits owner activation memory, never splits a single image's
+        # attention. Outputs retain original order and use one final AllGather.
+        cap = getattr(encoder, "vision_dp_max_patches", 0)
+        batches, batch, patches = [], [], 0
+        for index in indices:
+            if cap and batch and patches + plan.patch_counts[index] > cap:
+                batches.append(batch)
+                batch, patches = [], 0
+            batch.append(index)
+            patches += plan.patch_counts[index]
+        batches.append(batch)
+        outputs = []
+        for batch in batches:
+            pixels = torch.cat([items[index].feature for index in batch], dim=0)
+            grids = torch.tensor(
+                [plan.grids[index] for index in batch], dtype=torch.int64
+            )
+            outputs.append(projector(encoder(pixels, grids)))
+        local = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
     else:
-        # Do not send an empty image through FIA/position embedding. Idle ranks
-        # still enter the same AllGather with the same positive buffer extent.
+        # Idle ranks enter the same AllGather without running empty attention.
         local = torch.empty(
-            (0, encoder.config.out_hidden_size),
-            dtype=encoder.dtype,
-            device=encoder.device,
+            (0, spec.output_hidden_size), dtype=encoder.dtype, device=encoder.device
+        )
+    if local.ndim != 2 or local.shape[1] != spec.output_hidden_size:
+        raise ValueError(
+            "Image DP projector output width does not match text hidden size"
         )
     return plan.gather(local, group)
