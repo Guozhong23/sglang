@@ -875,6 +875,7 @@ class WelmDpAttentionExecutor:
 
             max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
             oproj_rs_pipeline_chunks = 0
+            use_fused_oproj_rs = False
             # MAX_LEN may represent a logical decode shard as EXTEND. Only a
             # real target prefill may replace this shard's original OProj path.
             local_forward_mode = (
@@ -904,15 +905,21 @@ class WelmDpAttentionExecutor:
                 actual_chunks = min(max_chunks, local_rows // min_local_rows)
                 if actual_chunks >= 2:
                     oproj_rs_pipeline_chunks = actual_chunks
-            # Below the chunk threshold, ordinary OProj returns partial rows;
-            # _finish_attention_and_norm performs the existing attn-TP RS.
-            oproj_output_is_reduce_scattered = oproj_rs_pipeline_chunks > 0
+                else:
+                    use_fused_oproj_rs = (
+                        envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
+                    )
+            # Both pipeline and fused OProj already perform the attn-TP RS.
+            oproj_output_is_reduce_scattered = (
+                oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
+            )
             attn_output = layer.self_attn(
                 positions=positions,
                 hidden_states=state.hidden_states,
                 forward_batch=forward_batch,
                 skip_o_norm=True,
                 skip_o_proj_all_reduce=plan.o_proj_returns_partial,
+                use_o_proj_matmul_reduce_scatter=use_fused_oproj_rs,
                 o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
                 o_proj_rs_group=(
                     plan.attn_tp_group if oproj_output_is_reduce_scattered else None

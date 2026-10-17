@@ -4129,9 +4129,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and hidden_states.dtype == torch.bfloat16
             and self.self_attn.o_proj.weight.dtype == torch.bfloat16
         ):
-            # The manual pipeline owns this target path. If fewer than two
-            # chunks fit, use ordinary OProj and let finish_attention do RS.
-            use_fused_oproj_rs = False
+            # Prefer the manual pipeline when at least two chunks fit;
+            # otherwise keep the fallback selected by the fusion switch.
             min_chunk_tokens = max(
                 1, envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get()
             )
@@ -4140,6 +4139,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             actual_chunks = min(max_chunks, local_rows // min_local_rows)
             if actual_chunks >= 2:
                 oproj_rs_pipeline_chunks = actual_chunks
+                use_fused_oproj_rs = False
         oproj_output_is_reduce_scattered = (
             oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
         )

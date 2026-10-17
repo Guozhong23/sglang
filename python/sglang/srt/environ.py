@@ -773,8 +773,9 @@ class Envs:
         EnvInt(None)
     )
     SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = EnvBool(False)
-    # An enabled pipeline with fewer than two chunks uses ordinary MM + RS,
-    # regardless of the fusion switch above. MAX_CHUNKS < 2 keeps the old path.
+    # An enabled pipeline with fewer than two chunks follows the fusion switch
+    # above: fused MM+RS when enabled, ordinary MM + RS otherwise.
+    # MAX_CHUNKS < 2 keeps the existing non-pipeline path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
     # BF16/MXFP8 QKV AG settings apply to Full and, unless overridden, SWA.
