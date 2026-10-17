@@ -648,7 +648,8 @@ class Envs:
     # Fuse shared experts on selected MegaMoE calls, including prefill BCG.
     WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT = EnvBool(False)
     # With MegaMoE enabled, require padded prefill rows before attention-TP
-    # scattering to exceed this threshold. Zero keeps the existing selection.
+    # scattering to meet or exceed this threshold. Non-positive values disable
+    # this threshold check.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2

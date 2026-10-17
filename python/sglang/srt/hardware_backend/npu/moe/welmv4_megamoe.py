@@ -104,7 +104,7 @@ class WelmPrefillMegaMoE:
         # per-rank MoE rows or the sequence length including cached prefixes.
         return (
             self.prefill_token_threshold <= 0
-            or num_tokens > self.prefill_token_threshold
+            or num_tokens >= self.prefill_token_threshold
         )
 
     def can_run(self, num_rows: int) -> bool:
