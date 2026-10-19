@@ -129,6 +129,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
+    configure_gc_logger,
     configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
@@ -701,7 +702,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if self.server_args.gc_warning_threshold_secs > 0.0:
+        if self.log_d_output and envs.SGLANG_LOG_GC.get():
+            # Use the bounded PD writer instead of the heap-scanning warning.
+            configure_gc_logger(
+                pd_diagnostics=dict(role="decode", component="tokenizer")
+            )
+        elif self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",

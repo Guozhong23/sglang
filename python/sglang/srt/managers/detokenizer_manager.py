@@ -42,7 +42,12 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizer
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.pd_time_stats import emit_output_timing
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils import (
+    configure_gc_logger,
+    configure_logger,
+    freeze_gc,
+    kill_itself_when_parent_died,
+)
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -160,6 +165,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         if server_args.enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+
+        if self.log_d_output and envs.SGLANG_LOG_GC.get():
+            configure_gc_logger(
+                pd_diagnostics=dict(role="decode", component="detokenizer")
+            )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

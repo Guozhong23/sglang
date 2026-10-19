@@ -123,7 +123,7 @@ def _ensure_writer():
 
 
 def enable_gc_diagnostics(fields):
-    """Initialize output before registering GC; called once during P startup."""
+    """Initialize the shared PD writer before registering GC at process startup."""
     global _gc_diagnostics
     from sglang.srt.observability.pd_gc_diagnostics import PDGCDiagnostics
 
