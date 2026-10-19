@@ -83,11 +83,12 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability.pd_time_stats import emit, identity
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_observability, get_parallel
 from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -2323,6 +2324,9 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        log_queue = get_observability().enable_request_time_stats_logging
+        if log_queue:
+            queue_enter_ns = time.perf_counter_ns()
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
@@ -2343,13 +2347,56 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
+            if log_queue:
+                prealloc_begin_ns = time.perf_counter_ns()
+                prealloc_count = len(self.disagg_decode_prealloc_queue.queue)
+                transfer_count = len(self.disagg_decode_transfer_queue.queue)
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            if log_queue:
+                prealloc_end_ns = time.perf_counter_ns()
             self.disagg_decode_transfer_queue.extend(req_conns)
+            if log_queue:
+                poll_begin_ns = time.perf_counter_ns()
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            if log_queue:
+                poll_end_ns = time.perf_counter_ns()
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
+            if log_queue:
+                queue_end_ns = time.perf_counter_ns()
+                if transferred_reqs or queue_end_ns - queue_enter_ns >= 10_000_000:
+                    emit(
+                        "PDDecodeQueueStats ",
+                        identity(
+                            "decode",
+                            None,
+                            tp_rank=self.disagg_decode_transfer_queue.tp_rank,
+                            queue_enter_ns=queue_enter_ns,
+                            prealloc_begin_ns=prealloc_begin_ns,
+                            prealloc_end_ns=prealloc_end_ns,
+                            poll_begin_ns=poll_begin_ns,
+                            poll_end_ns=poll_end_ns,
+                            queue_end_ns=queue_end_ns,
+                            previous_poll_begin_ns=getattr(
+                                self, "_pd_previous_poll_begin_ns", None
+                            ),
+                            previous_poll_end_ns=getattr(
+                                self, "_pd_previous_poll_end_ns", None
+                            ),
+                            prealloc_count=prealloc_count,
+                            transfer_count=transfer_count,
+                            new_transfers=len(req_conns),
+                            completed=[
+                                (req.rid, req.bootstrap_room)
+                                for req in transferred_reqs
+                            ],
+                        ),
+                    )
+                # Constant-size history, including fast polls with no output log.
+                self._pd_previous_poll_begin_ns = poll_begin_ns
+                self._pd_previous_poll_end_ns = poll_end_ns
