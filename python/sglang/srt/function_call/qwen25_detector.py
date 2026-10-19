@@ -3,9 +3,8 @@ import logging
 import re
 from typing import List
 
-import json_repair
-
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -71,6 +70,12 @@ class Qwen25Detector(BaseFormatDetector):
                 logger.warning(
                     f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
                 )
+                if not envs.SGLANG_ENABLE_WELM_SERVICE_PATCH.get():
+                    continue
+
+                # The legacy path must not require the optional repair import.
+                import json_repair
+
                 try:
                     parsed_call = json_repair.loads(match_result.strip())
                     calls.extend(self.parse_base_json(parsed_call, tools))

@@ -2,6 +2,8 @@ import json
 import os
 
 import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 
 # Each worker has a fixed model, device and exclusion config until restart.
@@ -54,6 +56,29 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
+        # Startup setting, cached per penalizer to avoid per-token env lookups.
+        self.welm_service_patch_enabled = envs.SGLANG_ENABLE_WELM_SERVICE_PATCH.get()
+        if self.welm_service_patch_enabled:
+            self._prepare_welm_service_patch()
+
+        self.cumulated_frequency_penalties = torch.zeros(
+            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
+            dtype=torch.float32,
+            device=self.orchestrator.device,
+        )
+
+        self.frequency_penalties = (
+            torch.tensor(
+                data=[
+                    req.sampling_params.frequency_penalty
+                    for req in self.orchestrator.reqs()
+                ],
+                dtype=torch.float32,
+                device=self.orchestrator.device,
+            )
+        ).unsqueeze_(1)
+
+    def _prepare_welm_service_patch(self):
         global _token_penalty_mask, _token_penalty_mask_initialized
 
         self.frequency_penalty_factor_start = _read_int_env(
@@ -92,39 +117,24 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             dtype=torch.long,
             device=self.orchestrator.device,
         )
-        self.cumulated_frequency_penalties = torch.zeros(
-            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
-            dtype=torch.float32,
-            device=self.orchestrator.device,
-        )
-
-        self.frequency_penalties = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.frequency_penalty
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.float32,
-                device=self.orchestrator.device,
-            )
-        ).unsqueeze_(1)
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         penalties = self.frequency_penalties
-        if self.token_penalty_mask is not None:
-            penalties = penalties * self.token_penalty_mask[output_ids].unsqueeze(1)
+        if self.welm_service_patch_enabled:
+            if self.token_penalty_mask is not None:
+                penalties = penalties * self.token_penalty_mask[output_ids].unsqueeze(1)
 
-        if (
-            self.frequency_penalty_factor_start is not None
-            and self.frequency_penalty_factor_offset is not None
-        ):
-            self.generation_lengths.add_(1)
-            factor = (
-                self.generation_lengths - self.frequency_penalty_factor_start
-            ).clamp_min(0).div(
-                self.frequency_penalty_factor_offset, rounding_mode="floor"
-            ) + 1
-            penalties = penalties * factor
+            if (
+                self.frequency_penalty_factor_start is not None
+                and self.frequency_penalty_factor_offset is not None
+            ):
+                self.generation_lengths.add_(1)
+                factor = (
+                    self.generation_lengths - self.frequency_penalty_factor_start
+                ).clamp_min(0).div(
+                    self.frequency_penalty_factor_offset, rounding_mode="floor"
+                ) + 1
+                penalties = penalties * factor
 
         self.cumulated_frequency_penalties.scatter_add_(
             dim=1,
@@ -136,16 +146,18 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         logits.sub_(self.cumulated_frequency_penalties)
 
     def _filter(self, keep_indices: torch.Tensor):
-        self.generation_lengths = self.generation_lengths[keep_indices]
+        if self.welm_service_patch_enabled:
+            self.generation_lengths = self.generation_lengths[keep_indices]
         self.frequency_penalties = self.frequency_penalties[keep_indices]
         self.cumulated_frequency_penalties = self.cumulated_frequency_penalties[
             keep_indices
         ]
 
     def _merge(self, their: "BatchedFrequencyPenalizer"):
-        self.generation_lengths = torch.cat(
-            [self.generation_lengths, their.generation_lengths], dim=0
-        )
+        if self.welm_service_patch_enabled:
+            self.generation_lengths = torch.cat(
+                [self.generation_lengths, their.generation_lengths], dim=0
+            )
         self.frequency_penalties = torch.cat(
             [self.frequency_penalties, their.frequency_penalties], dim=0
         )

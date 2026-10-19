@@ -22,6 +22,7 @@ class Batch:
 @pytest.fixture(autouse=True)
 def clear_settings(monkeypatch):
     # Each test represents a fresh worker process with fixed startup settings.
+    monkeypatch.setenv("SGLANG_ENABLE_WELM_SERVICE_PATCH", "1")
     monkeypatch.setattr(frequency_module, "_token_penalty_mask", None)
     monkeypatch.setattr(frequency_module, "_token_penalty_mask_initialized", False)
     for name in (
@@ -228,3 +229,56 @@ def test_invalid_config_has_actionable_error(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         make_penalizer([1.0])
+
+
+@pytest.mark.parametrize("patch", [None, "0"])
+@pytest.mark.parametrize("invalid_config", [False, True])
+def test_disabled_patch_preserves_legacy_penalties_and_lifecycle(
+    monkeypatch, patch, invalid_config
+):
+    if patch is None:
+        monkeypatch.delenv("SGLANG_ENABLE_WELM_SERVICE_PATCH")
+    else:
+        monkeypatch.setenv("SGLANG_ENABLE_WELM_SERVICE_PATCH", patch)
+    monkeypatch.setenv(
+        "FREQUENCY_PENALTY_EXCLUDE_TOKENS", "bad" if invalid_config else "[2]"
+    )
+    monkeypatch.setenv(
+        "FREQUENCY_PENALTY_FACTOR_START", "bad" if invalid_config else "0"
+    )
+    monkeypatch.setenv(
+        "FREQUENCY_PENALTY_FACTOR_OFFSET", "0" if invalid_config else "2"
+    )
+
+    def fail_extension(*args, **kwargs):
+        raise AssertionError(
+            "disabled patch must not read config or build/upload a mask"
+        )
+
+    monkeypatch.setattr(frequency_module, "_read_int_env", fail_extension)
+    monkeypatch.setattr(frequency_module, "_read_exclude_tokens", fail_extension)
+    monkeypatch.setattr(torch.Tensor, "index_fill_", fail_extension)
+    monkeypatch.setattr(torch.Tensor, "to", fail_extension)
+    old_batch, old_orch, old = make_penalizer([0.5])
+    for _ in range(3):
+        old_orch.cumulate_output_tokens(torch.tensor([2]))
+    new_batch, new_orch, new = make_penalizer([-0.5, 0.0])
+    old_orch.merge(new_orch)
+    old_batch.reqs.extend(new_batch.reqs)
+    old_orch.cumulate_output_tokens(torch.tensor([2, 3, 4]))
+    old_batch.reqs = [old_batch.reqs[1], old_batch.reqs[0]]
+    old_orch.filter(torch.tensor([1, 0]))
+    old_orch.cumulate_output_tokens(torch.tensor([3, 2]))
+    expected = torch.zeros(2, 8)
+    expected[0, 3], expected[1, 2] = 1.0, -2.5
+    logits = torch.zeros(2, 8)
+    old_orch.apply(logits)
+    assert torch.equal(logits, expected)
+    for pen in (old, new):
+        assert not hasattr(pen, "generation_lengths")
+        assert not hasattr(pen, "token_penalty_mask")
+    assert not frequency_module._token_penalty_mask_initialized
+    assert frequency_module._token_penalty_mask is None
+    old_orch.release()
+    new_orch.release()
+    assert not hasattr(old, "cumulated_frequency_penalties")

@@ -1,3 +1,5 @@
+import builtins
+import importlib
 import json
 
 import pytest
@@ -11,13 +13,25 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+@pytest.fixture(autouse=True)
+def enable_service_patch(monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_WELM_SERVICE_PATCH", "1")
+
+
 @pytest.fixture
 def tools():
     return [Tool(function=Function(name="weather", parameters={"type": "object"}))]
 
 
 @pytest.mark.parametrize("forward", [False, True])
-def test_unknown_tool_forwarding_stream_and_nonstream(tools, forward):
+@pytest.mark.parametrize("patch", [None, "0", "1"])
+def test_unknown_tool_forwarding_stream_and_nonstream(
+    tools, forward, patch, monkeypatch
+):
+    if patch is None:
+        monkeypatch.delenv("SGLANG_ENABLE_WELM_SERVICE_PATCH")
+    else:
+        monkeypatch.setenv("SGLANG_ENABLE_WELM_SERVICE_PATCH", patch)
     text = (
         '<tool_call>\n{"name":"unregistered","arguments":{"city":"北京"}}\n</tool_call>'
     )
@@ -34,7 +48,7 @@ def test_unknown_tool_forwarding_stream_and_nonstream(tools, forward):
         for char in text:
             _, delta = parser.parse_stream_chunk(char)
             streamed.extend(delta)
-        if forward:
+        if forward and patch == "1":
             assert [call.name for call in streamed if call.name] == ["unregistered"]
             assert {call.tool_index for call in streamed} == {0}
             assert json.loads("".join(call.parameters for call in streamed)) == {
@@ -112,3 +126,62 @@ def test_registry_retains_structural_tag_interfaces(tools):
     assert constraint_type == "structural_tag"
     assert constraint.at_least_one
     assert not parser.detector.parses_required_natively()
+
+
+@pytest.mark.parametrize("patch", [None, "0"])
+def test_disabled_patch_never_imports_json_repair(monkeypatch, tools, patch):
+    if patch is None:
+        monkeypatch.delenv("SGLANG_ENABLE_WELM_SERVICE_PATCH")
+    else:
+        monkeypatch.setenv("SGLANG_ENABLE_WELM_SERVICE_PATCH", patch)
+    original_import = builtins.__import__
+
+    def reject_repair(name, *args, **kwargs):
+        if name == "json_repair":
+            raise AssertionError("disabled patch must not import json_repair")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_repair)
+    from sglang.srt.function_call import qwen25_detector
+
+    importlib.reload(qwen25_detector)
+    for payload in (
+        "{'name':'weather','arguments':{}}",
+        '{"name":"weather","arguments":{"city":"北京",}}',
+        '{"name":"weather","arguments":{"city":"北京"}',
+    ):
+        result = qwen25_detector.Qwen25Detector().detect_and_parse(
+            f"<tool_call>\n{payload}\n</tool_call>", tools
+        )
+        assert result.calls == []
+    result = qwen25_detector.Qwen25Detector().detect_and_parse(
+        '<tool_call>\n{"name":"weather","arguments":{}}\n</tool_call>', tools
+    )
+    assert [call.name for call in result.calls] == ["weather"]
+
+
+@pytest.mark.parametrize("patch", ["0", "1"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_qwen3_reasoning_then_qwen25_known_tool(monkeypatch, tools, patch, stream):
+    from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+    monkeypatch.setenv("SGLANG_ENABLE_WELM_SERVICE_PATCH", patch)
+    reasoning = ReasoningParser("qwen3", stream_reasoning=stream)
+    parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
+    text = (
+        "<think>thinking</think><tool_call>\n"
+        '{"name":"weather","arguments":{"city":"北京"}}\n</tool_call>\n'
+    )
+    if not stream:
+        reason, content = reasoning.parse_non_stream(text)
+        _, calls = parser.parse_non_stream(content)
+    else:
+        reason, calls = "", []
+        for char in text:
+            reason_delta, content = reasoning.parse_stream_chunk(char)
+            reason += reason_delta or ""
+            _, delta = parser.parse_stream_chunk(content or "")
+            calls.extend(delta)
+    assert reason == "thinking"
+    assert [call.name for call in calls if call.name] == ["weather"]
+    assert json.loads("".join(call.parameters for call in calls)) == {"city": "北京"}

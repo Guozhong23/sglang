@@ -497,6 +497,9 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Opt in to the WeLM service patch (98105d14dc) and worker mask reuse.
+    # Set before worker startup; changing this at runtime is unsupported.
+    SGLANG_ENABLE_WELM_SERVICE_PATCH = EnvBool(False)
 
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
