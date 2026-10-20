@@ -215,6 +215,7 @@ class TestWeLMVLMNgramHistory(unittest.TestCase):
         for architecture in (
             "WeLMV4MoeForCausalLM",
             "WeLMV4VLMForConditionalGeneration",
+            "WeLMMoonViTVLForConditionalGeneration",
             "OtherForCausalLM",
         ):
             for npu, mixed in ((True, True), (False, True), (True, False)):
@@ -243,7 +244,11 @@ class TestWeLMVLMNgramHistory(unittest.TestCase):
                     self.assertEqual(
                         manager.image_token_id,
                         154752
-                        if architecture == "WeLMV4VLMForConditionalGeneration"
+                        if architecture
+                        in (
+                            "WeLMV4VLMForConditionalGeneration",
+                            "WeLMMoonViTVLForConditionalGeneration",
+                        )
                         else None,
                     )
 
@@ -257,6 +262,59 @@ class TestWeLMVLMNgramHistory(unittest.TestCase):
         self.assertEqual(self.table[1, :5].tolist(), [11, 154752, 154752, 31, 32])
         self.assertFalse(req.ngram_token_table_needs_init)
         self.assertEqual(list(req.origin_input_ids), [11, 999001, 999001])
+
+    def test_pd_prebuilt_handoff_matches_chunked_combined_then_decode_and_slot_reuse(
+        self,
+    ):
+        # Image span crosses prefill chunks and ends immediately before the
+        # handoff token. Reconstructing raw hash-pad IDs would corrupt the first
+        # real D forward's n-gram context.
+        tokens = [11, 999001, 999001, 12, 999002, 999002, 999002]
+        p = _request(tokens, row=1, pads=[999001, 999002], length=3)
+        self.manager.prepare_for_forward(self._batch(p), chunked_req=p)
+        p.prefix_indices = [0, 1, 2]
+        p.extend_range.length = 4
+        self.manager.prepare_for_forward(self._batch(p), chunked_req=None)
+
+        def sample(manager, row, position, token):
+            manager.update_after_decode(
+                torch.tensor([token]),
+                SimpleNamespace(
+                    ngram_embedding_info=SimpleNamespace(
+                        token_table=self.table,
+                        skip_token_table_update=None,
+                        out_column_starts=torch.empty(1, dtype=torch.int32),
+                        out_req_lens=torch.empty(1, dtype=torch.int32),
+                    ),
+                    req_pool_indices=torch.tensor([row]),
+                    seq_lens=torch.tensor([position]),
+                    batch_size=1,
+                ),
+            )
+
+        sample(self.manager, 1, len(tokens), 42)  # P's handoff token.
+        d = _request(tokens, row=2, pads=[999001, 999002])
+        d.output_ids = array("q", [42])
+        d.ngram_token_table_needs_init = True
+        self.table[2].fill_(888)  # A newly allocated D slot can contain old history.
+        self.manager.prepare_for_forward(
+            self._batch(d, mode="prebuilt"), chunked_req=None
+        )
+        self.assertTrue(torch.equal(self.table[1, :8], self.table[2, :8]))
+        for position, token in ((8, 71), (9, 72)):
+            sample(self.manager, 1, position, token)
+            sample(self.manager, 2, position, token)
+            d.output_ids.append(token)
+        self.assertTrue(torch.equal(self.table[1, :10], self.table[2, :10]))
+        # A memory-pressure retraction allocates another D row; rebuild from
+        # normalized prompt + generated tokens, retaining the handoff.
+        d.req_pool_idx = 3
+        d.ngram_token_table_needs_init = True
+        self.manager.prepare_for_forward(
+            self._batch(d, mode="decode"), chunked_req=None
+        )
+        self.assertTrue(torch.equal(self.table[1, :10], self.table[3, :10]))
+        self.assertEqual(list(d.origin_input_ids), tokens)
 
     def test_text_manager_keeps_current_placeholder_behavior(self):
         manager = manager_module.NgramEmbeddingManager(

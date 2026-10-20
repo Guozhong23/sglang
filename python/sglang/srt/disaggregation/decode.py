@@ -60,6 +60,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.disaggregation.welm_vlm import (
+    build_welm_vlm_pd_contract,
+    init_welm_vlm_pd_request,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -488,6 +492,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.welm_vlm_contract = build_welm_vlm_pd_contract(self.scheduler, kv_args)
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -526,6 +531,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """
         if self._check_if_req_exceed_kv_capacity(req):
             return
+        init_welm_vlm_pd_request(req, self.scheduler.model_config)
 
         if is_retracted:
             req.retraction_mb_id = None

@@ -104,6 +104,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    welm_vlm_contract: Optional[dict] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -553,6 +554,12 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
+        from sglang.srt.disaggregation.welm_vlm import validate_welm_vlm_pd_contract
+
+        validate_welm_vlm_pd_contract(
+            info.welm_vlm_contract,
+            getattr(self.kv_args, "welm_vlm_contract", None),
+        )
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -710,6 +717,8 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
         }
+        if (contract := getattr(self.kv_args, "welm_vlm_contract", None)) is not None:
+            payload["welm_vlm_contract"] = contract
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -1542,6 +1551,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.welm_vlm_contract: Optional[dict] = None
+        self._welm_vlm_contract_registered = False
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1594,6 +1605,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
+        from sglang.srt.disaggregation.welm_vlm import validate_welm_vlm_pd_contract
+
+        contract = data.get("welm_vlm_contract")
+        if self._welm_vlm_contract_registered:
+            try:
+                validate_welm_vlm_pd_contract(self.welm_vlm_contract, contract)
+            except ValueError as exc:
+                return web.Response(text=str(exc), status=400)
         attn_tp_size = data["attn_tp_size"]
         attn_tp_rank = data["attn_tp_rank"]
         attn_cp_size = data["attn_cp_size"]
@@ -1609,6 +1628,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+
+        if not self._welm_vlm_contract_registered:
+            self.welm_vlm_contract = contract
+            self._welm_vlm_contract_registered = True
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1707,8 +1730,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                welm_vlm_contract=self.welm_vlm_contract,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if info.welm_vlm_contract is None:
+                # Preserve the old bootstrap schema for unrelated models.
+                payload.pop("welm_vlm_contract")
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(

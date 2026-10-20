@@ -49,6 +49,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.disaggregation.welm_vlm import (
+    build_welm_vlm_pd_contract,
+    init_welm_vlm_pd_request,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -263,6 +267,7 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.compression_ratios
             )
 
+        kv_args.welm_vlm_contract = build_welm_vlm_pd_contract(self.scheduler, kv_args)
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -292,6 +297,7 @@ class PrefillBootstrapQueue:
         Returns False if the request exceeds KV capacity."""
         if self._check_if_req_exceed_kv_capacity(req):
             return False
+        init_welm_vlm_pd_request(req, self.scheduler.model_config)
 
         backend = (
             TransferBackend.FAKE

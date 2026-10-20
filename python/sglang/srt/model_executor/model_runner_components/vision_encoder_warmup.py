@@ -166,6 +166,8 @@ def maybe_warmup_vision_encoder(runner):
     reason = None
     if runner.is_draft_worker:
         reason = "draft_worker"
+    elif getattr(args, "disaggregation_mode", "null") == "decode":
+        reason = "pd_decode_worker"
     elif args.is_ep_scale_joiner:
         reason = "elastic_joiner"
     elif runner.device != "npu" or runner.dtype != torch.bfloat16:

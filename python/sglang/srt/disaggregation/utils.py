@@ -22,6 +22,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.welm_vlm import PROMPT_SIGNATURE_SLICE
 from sglang.srt.environ import envs
 from sglang.srt.observability.pd_time_stats import mark_poll
 from sglang.srt.utils import is_hip, is_npu
@@ -157,6 +158,19 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            elif (signature := getattr(decode_req.req, "welm_vlm_pd_signature", None)):
+                received = metadata_buffers.cached_tokens[
+                    decode_req.metadata_buffer_index, PROMPT_SIGNATURE_SLICE
+                ].tolist()
+                if received != list(signature):
+                    # Before TP consensus: one bad rank fails the whole request.
+                    # Never admit a first decode using KV for another prompt.
+                    polls[i] = int(KVPoll.Failed)
+                    decode_req.kv_receiver.kv_mgr.record_failure(
+                        decode_req.req.bootstrap_room,
+                        "WeLM-VL PD expanded prompt/image signature mismatch; "
+                        "check P/D tokenizer, processor and image content",
+                    )
             timing = getattr(decode_req.kv_receiver, "pd_timing", None)
             if timing is not None:
                 timing.mark(
@@ -441,7 +455,7 @@ class MetadataBuffers:
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # WeLM-VL uses slots 7-15 for its expanded prompt/image signature.
         # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
@@ -457,6 +471,18 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        signature = getattr(req, "welm_vlm_pd_signature", None)
+        signature_row = self.cached_tokens[req.metadata_buffer_index][
+            PROMPT_SIGNATURE_SLICE
+        ]
+        if signature is None:
+            signature_row.zero_()
+        else:
+            signature_row.copy_(
+                torch.tensor(
+                    signature, dtype=signature_row.dtype, device=signature_row.device
+                )
+            )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

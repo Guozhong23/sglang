@@ -134,6 +134,11 @@ def _server_args(**changes):
         encoder_only=False,
         language_only=False,
         disaggregation_mode="null",
+        disaggregation_transfer_backend="ascend",
+        disaggregation_decode_enable_radix_cache=False,
+        enable_hierarchical_cache=False,
+        nnodes=1,
+        dp_size=1,
         enable_pdmux=False,
         pp_size=1,
         ep_size=1,
@@ -162,15 +167,17 @@ def _server_args(**changes):
     return args
 
 
-def _startup_policy(megamoe=False, vit_graph=False):
+def _startup_policy(megamoe=False, vit_graph=False, npu=True, random_hash=False):
     return _definitions(
         SRT / "server_args.py",
         {"_handle_welm_vlm_adjustments"},
         {
             "Backend": SimpleNamespace(DISABLED="disabled"),
+            "is_npu": lambda: npu,
             "envs": SimpleNamespace(
                 WELM_NPU_USE_MEGAMOE=SimpleNamespace(get=lambda: megamoe),
                 SGLANG_VIT_ENABLE_CUDA_GRAPH=SimpleNamespace(get=lambda: vit_graph),
+                SGLANG_MM_SKIP_COMPUTE_HASH=SimpleNamespace(get=lambda: random_hash),
             ),
             "logger": logging.getLogger(__name__),
         },
@@ -194,7 +201,6 @@ def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings(dp):
         {"enable_dp_attention": True},
         {"encoder_only": True},
         {"language_only": True},
-        {"disaggregation_mode": "prefill"},
         {"enable_pdmux": True},
         {"pp_size": 2},
         {"moe_a2a_backend": "megamoe"},
@@ -206,6 +212,44 @@ def test_startup_keeps_requested_decode_graph_chunk_and_cache_settings(dp):
 def test_basic_startup_rejects_unsupported_combinations(changes):
     with pytest.raises(ValueError, match="WeLM-VL"):
         _startup_policy()(_server_args(**changes))
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize("vision_dp", [False, True])
+def test_ascend_pd_is_accepted_without_changing_multimodal_or_vision_mode(
+    mode, vision_dp
+):
+    args = _server_args(disaggregation_mode=mode, mm_enable_dp_encoder=vision_dp)
+    _startup_policy()(args)
+    assert args.enable_multimodal
+    assert args.mm_enable_dp_encoder == vision_dp
+    assert args.disaggregation_mode == mode
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"disaggregation_transfer_backend": "mooncake"},
+        {"disaggregation_transfer_backend": "fake"},
+        {"nnodes": 2},
+        {"dp_size": 2},
+        {"attn_cp_size": 2},
+        {"dcp_size": 2},
+        {"kv_cache_dtype": "fp8_e4m3"},
+        {"enable_lora": True},
+        {"enable_hierarchical_cache": True},
+        {"disaggregation_decode_enable_radix_cache": True},
+    ],
+)
+def test_pd_rejects_unimplemented_layouts(changes):
+    with pytest.raises(ValueError, match="WeLM-VL PD"):
+        _startup_policy()(_server_args(disaggregation_mode="prefill", **changes))
+
+
+@pytest.mark.parametrize("options", [{"npu": False}, {"random_hash": True}])
+def test_pd_requires_npu_and_deterministic_image_hashes(options):
+    with pytest.raises(ValueError, match="WeLM-VL PD"):
+        _startup_policy(**options)(_server_args(disaggregation_mode="decode"))
 
 
 def test_startup_defers_ep_validation_until_deepep_resolution():

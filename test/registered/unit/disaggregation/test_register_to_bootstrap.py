@@ -278,6 +278,7 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
+        mgr.kv_args.welm_vlm_contract = None
         # Resolved per-runner value threaded through KVArgs (the payload field).
         mgr.kv_cache_dtype_str = "auto"
 

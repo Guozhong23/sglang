@@ -36,6 +36,8 @@ class KVTransferMetric:
 
 
 class KVArgs:
+    # Optional model contract, checked through bootstrap before address exchange.
+    welm_vlm_contract: Optional[dict] = None
     engine_rank: int
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]

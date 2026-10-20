@@ -5891,7 +5891,6 @@ class ServerArgs:
                 self.encoder_only or self.language_only,
                 "encoder/language-only deployment",
             ),
-            (self.disaggregation_mode != "null", "PD disaggregation"),
             (self.enable_pdmux, "--enable-pdmux"),
             (self.pp_size != 1, "pipeline parallelism"),
             (
@@ -5909,6 +5908,48 @@ class ServerArgs:
                 "WeLM-VL supports BF16 combined vision/language serving with "
                 "ordinary attention TP, optional DeepEP and WeLM prefill MegaMoE. "
                 "Not yet supported: " + ", ".join(unsupported) + "."
+            )
+        if self.disaggregation_mode != "null":
+            unsupported_pd = [
+                option
+                for enabled, option in (
+                    (not is_npu(), "non-NPU runtime"),
+                    (
+                        self.disaggregation_transfer_backend != "ascend",
+                        "transfer backends other than ascend",
+                    ),
+                    (self.nnodes != 1, "multi-node workers"),
+                    (self.dp_size != 1, "language DP"),
+                    (self.attn_cp_size != 1 or self.dcp_size != 1, "CP/DCP"),
+                    (
+                        self.kv_cache_dtype not in ("auto", "bfloat16"),
+                        "non-BF16 KV cache",
+                    ),
+                    (self.enable_lora, "LoRA"),
+                    (self.enable_hierarchical_cache, "HiCache"),
+                    (
+                        envs.SGLANG_MM_SKIP_COMPUTE_HASH.get(),
+                        "random image hashes (SGLANG_MM_SKIP_COMPUTE_HASH)",
+                    ),
+                    (
+                        self.disaggregation_decode_enable_radix_cache,
+                        "decode-side radix cache",
+                    ),
+                )
+                if enabled
+            ]
+            if unsupported_pd:
+                raise ValueError(
+                    "WeLM-VL PD supports Ascend BF16 with matching P/D TP and "
+                    "full/SWA KV layouts. Not yet supported: "
+                    + ", ".join(unsupported_pd)
+                    + "."
+                )
+            logger.info(
+                "WeLM-VL PD: P computes vision and prefill; D retains image "
+                "metadata for prompt validation and OE history, and decodes "
+                "from transferred full/SWA KV. Both workers must use matching "
+                "weights, tokenizer and processor."
             )
         if self.enable_multimodal is False:
             raise ValueError("WeLM-VL requires --enable-multimodal.")

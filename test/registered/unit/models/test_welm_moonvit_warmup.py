@@ -238,6 +238,7 @@ def test_bad_profiles_fail_before_encoding(profile):
         ("device", "cuda"),
         ("dtype", torch.float32),
         ("server_args.is_ep_scale_joiner", True),
+        ("server_args.disaggregation_mode", "decode"),
         ("server_args.nnodes", 2),
         ("server_args.mm_enable_dp_encoder", False),
         ("server_args.skip_server_warmup", True),

@@ -1868,6 +1868,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        if obj.mode == "retract" and self.server_args.disaggregation_mode == "decode":
+            from sglang.srt.disaggregation.welm_vlm import is_welm_vlm
+
+            if is_welm_vlm(self.model_config.hf_config):
+                # The generic rebootstrap payload only carries input_ids. It
+                # would silently discard image inputs when recomputing P KV.
+                raise ValueError(
+                    "WeLM-VL PD does not support pause_generation(mode='retract'); "
+                    "use mode='abort' before weight updates. Ordinary memory "
+                    "pressure retraction with CPU KV restore is unchanged."
+                )
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":

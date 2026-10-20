@@ -1049,6 +1049,7 @@ class Req(ReqDllmMixin):
         # once from origin_input_ids + the prefill handoff token before their
         # first decode forward.
         self.ngram_token_table_needs_init: bool = False
+        self.welm_vlm_pd_signature: Optional[tuple[int, ...]] = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
