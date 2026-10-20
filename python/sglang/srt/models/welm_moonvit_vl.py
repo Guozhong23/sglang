@@ -340,5 +340,51 @@ class WeLMMoonViTVLForConditionalGeneration(WeLMV4VLMForConditionalGeneration):
             is_nextn=is_nextn,
         )
 
+    def _build_vision_warmup_items(self, grids):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        encoder = self.vision_encoder
+        spec = encoder.vision_dp_input_spec
+        templates = {}
+        items = []
+        for grid in grids:
+            if grid not in templates:
+                # Bounded, deterministic, and independent of the global RNG.
+                # Repeated grids share a read-only CPU template, not an embedding.
+                templates[grid] = torch.full(
+                    (math.prod(grid), *spec.pixel_tail_shape),
+                    (len(templates) + 1) / 16,
+                    dtype=encoder.dtype,
+                    device="cpu",
+                )
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=templates[grid],
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor(
+                            [grid], dtype=torch.int64, device="cpu"
+                        )
+                    },
+                )
+            )
+        return items
+
+    def warmup_vision_encoder(self, profiles, device_module, launch_id, digest):
+        from sglang.srt.model_executor.model_runner_components.vision_encoder_warmup import (
+            run_vision_dp_warmup,
+        )
+
+        run_vision_dp_warmup(
+            self.vision_encoder,
+            self.vision_projector,
+            self._vision_dp_group,
+            profiles,
+            self._build_vision_warmup_items,
+            device_module,
+            launch_id,
+            digest,
+        )
+
 
 EntryClass = WeLMMoonViTVLForConditionalGeneration

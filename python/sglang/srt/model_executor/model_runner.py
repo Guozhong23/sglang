@@ -624,6 +624,22 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        self.maybe_warmup_vision_encoder()
+
+    def maybe_warmup_vision_encoder(self):
+        from sglang.srt.model_executor.model_runner_components.vision_encoder_warmup import (
+            maybe_warmup_vision_encoder,
+        )
+
+        maybe_warmup_vision_encoder(self)
+
+    def log_vision_warmup_memory(self, stage):
+        if getattr(self, "_vision_encoder_warmup_done", False):
+            from sglang.srt.model_executor.model_runner_components.vision_encoder_warmup import (
+                log_warmup_memory,
+            )
+
+            log_warmup_memory(self, stage)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -777,6 +793,7 @@ class ModelRunner:
         self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
+        self.log_vision_warmup_memory("after_kv_allocation")
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
@@ -937,6 +954,7 @@ class ModelRunner:
         self.prefill_cuda_graph_runner = capture.prefill_runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_mem_usage = capture.decode.graph_mem_usage
+        self.log_vision_warmup_memory("after_graph_initialization")
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
