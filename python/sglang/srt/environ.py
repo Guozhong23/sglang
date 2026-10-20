@@ -651,6 +651,10 @@ class Envs:
     # scattering must exceed this threshold; nonpositive values impose no limit.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Fuse the attention output gate's matmul + sigmoid into one CANN kernel
+    # (FusedMatMul with the sigmoid epilogue). Ascend 950 / arch35 only; the
+    # operator is still WIP in CANN, so this is opt-in and falls back silently.
+    SGLANG_NPU_USE_FUSED_MM_SIGMOID = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2

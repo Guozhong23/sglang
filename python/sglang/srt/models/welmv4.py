@@ -39,6 +39,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hardware_backend.npu.fused_matmul import matmul_sigmoid
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -77,7 +78,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
-    inplace_sigmoid_mul,
     mmq_style_expert_bias_topk,
     mmq_style_k_rms_norm,
     mmq_style_norm_after_attn,
@@ -119,7 +119,6 @@ if is_npu():
     )
     from sglang.srt.layers.welmv4_npu_op import (
         build_welmv4_rope_segment_tile_starts,
-        inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_explicit_history_4way_npu,
@@ -2767,7 +2766,7 @@ class Qwen2MoeAttention(nn.Module):
             current_stream = device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
             with device_module.stream(self.alt_stream):
-                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+                gate = matmul_sigmoid(self.gate_proj, hidden_states).unsqueeze(-1)
 
         if fused_qkv is None:
             q_shape = q.shape
@@ -2908,7 +2907,7 @@ class Qwen2MoeAttention(nn.Module):
                             self.alt_stream
                         )
                     gate_input = prefill_gate_hidden_states
-                gate = self.gate_proj(gate_input)[0].unsqueeze(-1)
+                gate = matmul_sigmoid(self.gate_proj, gate_input).unsqueeze(-1)
                 if prefill_ag_qkv_slices is not None:
                     # One BF16 Gate MM over the whole chunk-major receive arena.
                     # Restore only [M, local_heads, 1] (6 heads at TP4), not
@@ -2929,10 +2928,8 @@ class Qwen2MoeAttention(nn.Module):
                 # Normal inference first consumes gate in sigmoid_mul. Joining
                 # here lets gate projection overlap the complete attention op.
                 current_stream.wait_stream(self.alt_stream)
-            if _is_npu:
-                inplace_sigmoid_mul_npu(gate, attn_output)
-            else:
-                inplace_sigmoid_mul(gate, attn_output)
+            # gate already holds sigmoid(gate_proj(x)); only the mul remains.
+            attn_output.mul_(gate)
             attn_output = attn_output.view(attn_shape)
 
         if o_proj_rs_pipeline_chunks:
