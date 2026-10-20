@@ -31,12 +31,23 @@ def _semantic_config(value):
     if hasattr(value, "to_dict"):
         value = value.to_dict()
     if isinstance(value, dict):
-        return {
-            key: _semantic_config(item)
-            for key, item in value.items()
-            if not key.startswith("_")
-            and key not in ("transformers_version", "torch_dtype", "dtype")
-        }
+        normalized = {}
+        for key, item in value.items():
+            if isinstance(key, str) and (
+                key.startswith("_")
+                or key in ("transformers_version", "torch_dtype", "dtype")
+            ):
+                continue
+            # HF turns JSON id2label keys into integers, including in nested
+            # configs. Canonicalize before sort_keys=True so runtime and JSON
+            # configs hash identically, even with mixed int/string keys.
+            json_key = str(key)
+            if json_key in normalized:
+                raise ValueError(
+                    f"WeLM-VL PD config has duplicate normalized key {json_key!r}"
+                )
+            normalized[json_key] = _semantic_config(item)
+        return normalized
     if isinstance(value, (tuple, list)):
         return [_semantic_config(item) for item in value]
     return value

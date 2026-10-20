@@ -1,8 +1,9 @@
 """CPU tests of production WeLM VL PD contracts, metadata and KV address paths.
 
 Only serving imports and the physical transfer engine are isolated. NPU buffer
-export, Ascend/Mooncake address planning, padding, metadata and OE run from the
-production sources with real CPU tensors. These tests do not certify HCCL.
+export, Ascend address planning (including inherited SWA helpers), padding,
+metadata and OE run from production sources with real CPU tensors. These tests
+do not certify the MemFabric/HCCL transport.
 """
 
 import ast
@@ -25,6 +26,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 ROOT = Path(__file__).resolve().parents[4]
 SRT = ROOT / "python/sglang/srt"
@@ -262,6 +264,59 @@ def test_config_digest_ignores_paths_but_preserves_mirror_oe_and_rope():
     assert PD._digest(PD._semantic_config(config)) != PD._digest(
         PD._semantic_config(other)
     )
+
+
+@pytest.mark.parametrize("arch", PD.WELM_VLM_ARCHITECTURES)
+def test_contract_hashes_real_hf_configs_with_nested_integer_keys(arch):
+    raw = fixture(arch).to_dict()
+
+    # The JSON-only fixtures miss HF's conversion of id2label keys to int.
+    # Exercise actual HF objects for the root and both nested configs.
+    def hf_config(data):
+        config = PretrainedConfig(id2label=data.get("id2label"))
+        # Set model-specific fields after base init: generic HF config does
+        # not implement WeLM's RoPE initialization, unlike its real subclass.
+        config.update({key: value for key, value in data.items() if key != "id2label"})
+        return config
+
+    raw["text_config"] = hf_config(raw["text_config"])
+    raw["vision_config"] = hf_config(raw["vision_config"])
+    config = hf_config(raw)
+    before = config.to_dict()
+    assert all(isinstance(key, int) for key in before["text_config"]["id2label"])
+    json_config = json.loads(json.dumps(before))
+    p, pkv, _ = runtime(arch)
+    d, dkv, _ = runtime(arch)
+    p.model_config.hf_config = config
+    d.model_config.hf_config = NS(
+        architectures=json_config["architectures"],
+        to_dict=lambda: json_config,
+    )
+    contract = PD.build_welm_vlm_pd_contract(p, pkv)
+    PD.validate_welm_vlm_pd_contract(contract, PD.build_welm_vlm_pd_contract(d, dkv))
+    assert config.to_dict() == before  # Hashing must not mutate HF config.
+    config.text_config.hidden_size += 1
+    with pytest.raises(ValueError, match="config_digest"):
+        PD.validate_welm_vlm_pd_contract(
+            contract, PD.build_welm_vlm_pd_contract(p, pkv)
+        )
+
+
+def test_config_digest_canonicalizes_mixed_keys_without_losing_semantics():
+    config = {
+        "nested": [{2: "two", "1": "one", "_name_or_path": "/local/model"}],
+        "id2label": {0: "LABEL_0", 1: "LABEL_1"},
+    }
+    expected = {
+        "id2label": {"1": "LABEL_1", "0": "LABEL_0"},
+        "nested": [{"1": "one", "2": "two"}],
+    }
+    assert PD._semantic_config(config) == expected
+    assert PD._digest(PD._semantic_config(config)) == PD._digest(expected)
+    expected["id2label"]["1"] = "different"
+    assert PD._digest(PD._semantic_config(config)) != PD._digest(expected)
+    with pytest.raises(ValueError, match="duplicate normalized key"):
+        PD._semantic_config({"nested": {1: "int", "1": "string"}})
 
 
 def request(count=2, duplicate=False):
