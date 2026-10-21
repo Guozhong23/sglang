@@ -497,6 +497,9 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Opt in to the WeLM service patch (98105d14dc) and worker mask reuse.
+    # Set before worker startup; changing this at runtime is unsupported.
+    SGLANG_ENABLE_WELM_SERVICE_PATCH = EnvBool(False)
 
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
@@ -694,7 +697,8 @@ class Envs:
     # Fuse shared experts on selected MegaMoE calls, including prefill BCG.
     WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT = EnvBool(False)
     # With MegaMoE enabled, require padded prefill rows before attention-TP
-    # scattering to exceed this threshold. Zero keeps the existing selection.
+    # scattering to meet or exceed this threshold. Non-positive values disable
+    # this threshold check.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
@@ -818,8 +822,9 @@ class Envs:
         EnvInt(None)
     )
     SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = EnvBool(False)
-    # An enabled pipeline with fewer than two chunks uses ordinary MM + RS,
-    # regardless of the fusion switch above. MAX_CHUNKS < 2 keeps the old path.
+    # An enabled pipeline with fewer than two chunks follows the fusion switch
+    # above: fused MM+RS when enabled, ordinary MM + RS otherwise.
+    # MAX_CHUNKS < 2 keeps the existing non-pipeline path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
     # BF16/MXFP8 QKV AG settings apply to Full and, unless overridden, SWA.

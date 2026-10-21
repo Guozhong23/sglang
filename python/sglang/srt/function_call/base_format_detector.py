@@ -168,6 +168,11 @@ class BaseFormatDetector(ABC):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # Non-streaming forwarding predates the WeLM patch and stays independent.
+        forward_unknown_tools = (
+            envs.SGLANG_ENABLE_WELM_SERVICE_PATCH.get()
+            and envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+        )
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
         try:
@@ -219,7 +224,7 @@ class BaseFormatDetector(ABC):
                 if (
                     "name" in obj
                     and obj["name"] not in self._tool_indices
-                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                    and not forward_unknown_tools
                 ):
                     # Invalid tool name - reset state
                     self._buffer = ""
@@ -251,8 +256,7 @@ class BaseFormatDetector(ABC):
                 function_name = current_tool_call.get("name")
 
                 if function_name and (
-                    function_name in self._tool_indices
-                    or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                    function_name in self._tool_indices or forward_unknown_tools
                 ):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:

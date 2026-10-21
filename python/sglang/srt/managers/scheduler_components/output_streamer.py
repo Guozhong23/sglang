@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -27,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability.pd_time_stats import emit_output_timing
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -176,10 +178,26 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
+            log_d_output = (
+                get_observability().enable_request_time_stats_logging
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.ps.attn_tp_rank == 0
+                and self.rust_server is None
+            )
+            if log_d_output:
+                send_begin_ns = time.perf_counter_ns()
             if self.rust_server is not None:
                 self.rust_server.push_generation(payload)
             else:
                 self.send_to_detokenizer.send_output(payload)
+            if log_d_output:
+                emit_output_timing(
+                    payload,
+                    "scheduler_send",
+                    send_begin_ns,
+                    send_begin_ns,
+                    time.perf_counter_ns(),
+                )
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (

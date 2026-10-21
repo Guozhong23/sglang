@@ -27,6 +27,7 @@ import pickle
 import signal
 import sys
 import threading
+import time
 import zlib
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
@@ -61,6 +62,7 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.pd_time_stats import emit_output_timing
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -404,8 +406,12 @@ class MultiHttpWorkerDetokenizerMixin:
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
+            if self.log_d_output:
+                received_ns = time.perf_counter_ns()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
+                if self.log_d_output:
+                    send_begin_ns = time.perf_counter_ns()
                 # Fan out the output back to the originating tokenizer worker(s).
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
@@ -422,6 +428,14 @@ class MultiHttpWorkerDetokenizerMixin:
                 else:
                     raise ValueError(
                         f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                    )
+                if self.log_d_output:
+                    emit_output_timing(
+                        output,
+                        "detokenizer_fanout",
+                        received_ns,
+                        send_begin_ns,
+                        time.perf_counter_ns(),
                     )
             self.soft_watchdog.feed()
 

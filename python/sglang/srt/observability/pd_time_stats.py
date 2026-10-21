@@ -123,7 +123,7 @@ def _ensure_writer():
 
 
 def enable_gc_diagnostics(fields):
-    """Initialize output before registering GC; called once during P startup."""
+    """Initialize the shared PD writer before registering GC at process startup."""
     global _gc_diagnostics
     from sglang.srt.observability.pd_gc_diagnostics import PDGCDiagnostics
 
@@ -170,6 +170,44 @@ def identity(role, room, **fields):
 
 def interval_ms(start, end):
     return (end - start) / 1e6 if start is not None and end is not None else None
+
+
+def emit_output_timing(payload, stage, begin_ns, send_begin_ns, end_ns):
+    """D output hops: first-token batches and host work taking at least 10 ms.
+
+    Call only under enable_request_time_stats_logging. Inspect CPU metadata,
+    never token payloads/tensors. No per-RID history or IPC fields are needed.
+    completion_tokens == 1 identifies the normal PD prebuilt first output;
+    tokenizer_first_output remains authoritative for other streaming policies.
+    """
+    counts = getattr(payload, "completion_tokens", None)
+    if counts is None:
+        return
+    if 1 not in counts and end_ns - begin_ns < 10_000_000:
+        return
+    rows = [i for i, count in enumerate(counts) if count == 1]
+    first_output_batch = bool(rows)
+    if not rows:
+        rows = range(min(len(counts), 16))
+    emit(
+        "PDOutputStats ",
+        identity(
+            "decode",
+            None,
+            stage=stage,
+            begin_ns=begin_ns,
+            send_begin_ns=send_begin_ns,
+            end_ns=end_ns,
+            work_ms=interval_ms(begin_ns, send_begin_ns),
+            send_ms=interval_ms(send_begin_ns, end_ns),
+            total_ms=interval_ms(begin_ns, end_ns),
+            batch_size=len(counts),
+            first_output_batch=first_output_batch,
+            # Copy only identifiers/counts; do not retain mutable IPC payloads.
+            rids=[payload.rids[i] for i in rows],
+            completion_tokens=[counts[i] for i in rows],
+        ),
+    )
 
 
 class RequestTiming:

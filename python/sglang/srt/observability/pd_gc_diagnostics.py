@@ -1,4 +1,4 @@
-"""Opt-in CPython GC attribution for PD send preparation (no device access).
+"""Opt-in CPython GC timing for PD host processes and send preparation.
 
 The callback never logs or takes an application lock. The PD log writer drains
 completed events. A bounded deque is used on GIL-enabled CPython; this collector
@@ -138,8 +138,8 @@ class PDGCDiagnostics:
             del frame
 
     def _callback(self, phase, info):
-        # Registered only in the scheduler process. Never acquire the writer's
-        # queue mutex here: GC can run while that mutex is already held.
+        # Never acquire the writer's queue mutex here: GC can run in any thread
+        # of this process while that mutex is already held.
         try:
             if os.getpid() != self.pid:
                 return

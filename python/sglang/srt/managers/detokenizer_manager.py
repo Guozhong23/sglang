@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -39,8 +40,14 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.pd_time_stats import emit_output_timing
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils import (
+    configure_gc_logger,
+    configure_logger,
+    freeze_gc,
+    kill_itself_when_parent_died,
+)
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -91,6 +98,8 @@ class DecodeStatus:
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
+    log_d_output: bool = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -139,6 +148,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
     def init_running_status(self, server_args: ServerArgs):
+        self.log_d_output = (
+            server_args.enable_request_time_stats_logging
+            and server_args.disaggregation_mode == "decode"
+        )
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
@@ -152,6 +165,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         if server_args.enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+
+        if self.log_d_output and envs.SGLANG_LOG_GC.get():
+            configure_gc_logger(
+                pd_diagnostics=dict(role="decode", component="detokenizer")
+            )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -168,9 +186,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
+            if self.log_d_output:
+                received_ns = time.perf_counter_ns()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
+                if self.log_d_output:
+                    send_begin_ns = time.perf_counter_ns()
                 sock_send(self.send_to_tokenizer, output)
+                if self.log_d_output:
+                    emit_output_timing(
+                        output,
+                        "detokenizer",
+                        received_ns,
+                        send_begin_ns,
+                        time.perf_counter_ns(),
+                    )
             self.soft_watchdog.feed()
 
     def trim_matched_stop(

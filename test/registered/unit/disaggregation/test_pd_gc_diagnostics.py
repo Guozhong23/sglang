@@ -217,7 +217,7 @@ class TestGCConfiguration(unittest.TestCase):
         writer.queue.get.assert_called_once_with(timeout=None)
         writer._flush_gc.assert_not_called()
 
-    def test_scheduler_switches_enable_enhanced_only_for_prefill_stats(self):
+    def test_scheduler_switches_enable_enhanced_only_for_pd_stats(self):
         # Execute the actual startup GC branch without constructing a scheduler
         # or touching torch/NPU. In particular LOG_GC=0 must do no setup at all.
         path = SRT / "managers/scheduler.py"
@@ -250,7 +250,7 @@ class TestGCConfiguration(unittest.TestCase):
             exec(code, ns)
             if not enabled:
                 configure.assert_not_called()
-            elif mode == "prefill" and stats:
+            elif mode in ("prefill", "decode") and stats:
                 self.assertEqual(
                     configure.call_args.kwargs["pd_diagnostics"]["tp_rank"], 1
                 )

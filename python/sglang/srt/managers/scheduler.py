@@ -1226,11 +1226,12 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             pd_diagnostics = None
             if (
-                get_disagg().disaggregation_mode == "prefill"
+                get_disagg().disaggregation_mode in ("prefill", "decode")
                 and self.server_args.enable_request_time_stats_logging
             ):
                 pd_diagnostics = dict(
-                    role="prefill",
+                    role=get_disagg().disaggregation_mode,
+                    component="scheduler",
                     tp_rank=self.ps.attn_tp_rank,
                     dp_rank=self.ps.attn_dp_rank,
                     cp_rank=self.ps.attn_cp_rank,

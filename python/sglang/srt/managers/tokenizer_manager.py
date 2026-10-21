@@ -111,7 +111,7 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
-from sglang.srt.observability.pd_time_stats import emit, identity
+from sglang.srt.observability.pd_time_stats import emit, emit_output_timing, identity
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -129,6 +129,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
+    configure_gc_logger,
     configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
@@ -209,6 +210,8 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+    # Host-only first notification stamp, populated only by opt-in D diagnostics.
+    pd_first_notify_ns: int = dataclasses.field(default=0, kw_only=True)
 
     # For streaming output
     last_output_offset: int = 0
@@ -373,6 +376,8 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    log_d_output: bool = False
+
     @property
     def serving_chat_class(self):
         """Return the serving chat class for OpenAI API.
@@ -392,6 +397,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.log_d_output = (
+            server_args.enable_request_time_stats_logging
+            and server_args.disaggregation_mode == "decode"
+        )
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
         self.elastic_pending_ep_size = None
@@ -693,7 +702,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if self.server_args.gc_warning_threshold_secs > 0.0:
+        if self.log_d_output and envs.SGLANG_LOG_GC.get():
+            # Use the bounded PD writer instead of the heap-scanning warning.
+            configure_gc_logger(
+                pd_diagnostics=dict(role="decode", component="tokenizer")
+            )
+        elif self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
@@ -1628,6 +1642,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state[obj.rid]
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        log_first_yield = self.log_d_output
         while True:
             try:
                 await asyncio.wait_for(
@@ -1647,6 +1662,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 continue
 
+            if log_first_yield:
+                wake_ns = time.perf_counter_ns()
             # Drain all pending outputs atomically.
             out_list = state.out_list
             state.out_list = []
@@ -1703,6 +1720,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield abort_out
                         break
 
+                if log_first_yield:
+                    self._log_first_output_yield(state, out, wake_ns)
+                    log_first_yield = False
                 yield out
                 break
 
@@ -1713,6 +1733,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                if log_first_yield:
+                    self._log_first_output_yield(state, out, wake_ns)
+                    log_first_yield = False
                 yield out
             else:
                 if (
@@ -2082,11 +2105,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
+            received_ns = time.perf_counter_ns() if self.log_d_output else None
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
             ):
-                await self._handle_batch_output(recv_obj)
+                await self._handle_batch_output(recv_obj, received_ns=received_ns)
+                if self.log_d_output:
+                    emit_output_timing(
+                        recv_obj,
+                        "tokenizer_batch",
+                        received_ns,
+                        None,
+                        time.perf_counter_ns(),
+                    )
             else:
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
@@ -2099,6 +2131,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
         ],
+        received_ns: Optional[int] = None,
     ):
         recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
@@ -2118,6 +2151,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
+            row_begin_ns = (
+                time.perf_counter_ns()
+                if self.log_d_output and state.time_stats.first_token_time == 0.0
+                else None
+            )
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -2341,8 +2379,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             getattr(state.obj, "bootstrap_room", None),
                             event="tokenizer_first_output",
                             rid=rid,
+                            received_ns=received_ns,
+                            row_begin_ns=row_begin_ns,
                             api_received_ns=(
                                 int(state.time_stats.created_time * 1e9) or None
+                            ),
+                            # Reuse tokenizer-local stamps; no extra clocks or IPC.
+                            tokenize_finish_ns=(
+                                int(state.time_stats.tokenize_finish_time * 1e9) or None
+                            ),
+                            api_server_dispatch_ns=(
+                                int(state.time_stats.api_server_dispatch_time * 1e9)
+                                or None
+                            ),
+                            api_server_dispatch_finish_ns=(
+                                int(state.time_stats.api_server_dispatch_finish_time * 1e9)
+                                or None
                             ),
                             first_output_ns=int(state.time_stats.first_token_time * 1e9),
                             api_first_output_ms=(
@@ -2391,6 +2443,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if len(pending_notify) >= batch_notify_size:
                     for s in pending_notify.values():
+                        if self.log_d_output and not s.pd_first_notify_ns:
+                            s.pd_first_notify_ns = time.perf_counter_ns()
                         s.event.set()
                     pending_notify = {}
                     await asyncio.sleep(0)
@@ -2404,7 +2458,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
+            if self.log_d_output and not s.pd_first_notify_ns:
+                s.pd_first_notify_ns = time.perf_counter_ns()
             s.event.set()
+
+    def _log_first_output_yield(self, state: ReqState, out: dict, wake_ns: int):
+        # The async generator yield is not the HTTP/socket/client receive time.
+        yield_ns = time.perf_counter_ns()
+        emit(
+            "PDRequestStats ",
+            identity(
+                "decode",
+                getattr(state.obj, "bootstrap_room", None),
+                event="tokenizer_first_yield",
+                rid=state.obj.rid,
+                first_output_ns=int(state.time_stats.first_token_time * 1e9),
+                notified_ns=state.pd_first_notify_ns or None,
+                wake_ns=wake_ns,
+                yield_ns=yield_ns,
+                stream=getattr(state.obj, "stream", False),
+                completion_tokens=out["meta_info"].get("completion_tokens", 0),
+            ),
+        )
 
     def add_logprob_to_meta_info(
         self,

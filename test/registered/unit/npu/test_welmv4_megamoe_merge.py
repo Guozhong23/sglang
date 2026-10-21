@@ -81,11 +81,12 @@ def test_buffer_combines_custom_capacity_and_upstream_quant_contract(monkeypatch
     assert runtime.max_local_rows == 2048
 
 
-def test_threshold_uses_strict_global_row_boundary_and_keeps_layer_admission(monkeypatch):
+def test_threshold_uses_inclusive_global_row_boundary_and_keeps_layer_admission(monkeypatch):
     _, runtime, _ = _runtime(
         monkeypatch, env=_env(SGLANG_NPU_MEGAMOE_ACTUAL_LAYERS="0-3,7")
     )
-    assert not runtime.meets_prefill_threshold(1024)
+    assert not runtime.meets_prefill_threshold(1023)
+    assert runtime.meets_prefill_threshold(1024)
     assert runtime.meets_prefill_threshold(1025)
     # Threshold is a global OProj-row decision; local shard capacity is separate.
     assert runtime.meets_prefill_threshold(512 * 4)
