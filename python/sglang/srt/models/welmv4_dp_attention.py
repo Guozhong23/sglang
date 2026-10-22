@@ -694,7 +694,19 @@ class WelmDpAttentionExecutor:
             and plan.first_mirror_consumer is not None
         )
         requirements = []
-        if plan.role is WelmRunnerRole.DRAFT:
+        graph = getattr(forward_batch, "welm_prefill_graph", None)
+        if (
+            getattr(graph, "is_dp", False)
+            and forward_batch.welm_prefill_graph_phase == "mirror"
+        ):
+            # Mirror[Bcap] never executes the scattered T-row prefix. Its
+            # physical request capacity need not be divisible by attention TP.
+            if row_layout.request is None:
+                raise RuntimeError("WeLM DP mirror graph requires request slots")
+            requirements.append(
+                (row_layout.request, WelmMoeTransport.EXPLICIT_AG_LOCAL_SORT_EP_AR)
+            )
+        elif plan.role is WelmRunnerRole.DRAFT:
             active_view = (
                 row_layout.request
                 if forward_batch.is_extend_in_batch
@@ -801,11 +813,22 @@ class WelmDpAttentionExecutor:
             enable_kv_mirror=enable_kv_mirror,
         )
 
+        graph = getattr(forward_batch, "welm_prefill_graph", None)
+        is_dp_graph = bool(getattr(graph, "is_dp", False))
         mirror_transition = self._is_first_target_mirror_transition(
             layer_id=layer.layer_id,
             has_ordinary_prefill=has_ordinary_prefill,
             enable_kv_mirror=enable_kv_mirror,
         )
+        split_first_mirror = bool(
+            is_dp_graph
+            and forward_batch.welm_prefill_graph_phase == "mirror"
+            and mirror_transition
+        )
+        if split_first_mirror:
+            # Prompt normalized/gathered hidden rows and selected Bmax tails.
+            # Its partial residual already has B rows, never T/TP rows.
+            input_is_scattered = False
         # Source/imitated layers execute ordinary full attention and only
         # publish extra K/V.  Consumer layers alone keep the mirror-specific
         # query/layout path and are excluded from FP8 hidden-row transport.
@@ -813,7 +836,8 @@ class WelmDpAttentionExecutor:
             layer.layer_id not in layer.kv_mirror_layers
         )
         reuse_prefill_mxfp8_input = bool(
-            plan.role is WelmRunnerRole.TARGET_DP
+            not is_dp_graph
+            and plan.role is WelmRunnerRole.TARGET_DP
             and has_ordinary_prefill
             and is_non_consumer_attention_layer
             and layer.self_attn.can_reuse_prefill_mxfp8_input()
@@ -831,8 +855,8 @@ class WelmDpAttentionExecutor:
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
         mirror_row_indices = None
-        if active_view.local_real_rows > 0:
-            if later_mirror_prefill:
+        if is_dp_graph or active_view.local_real_rows > 0:
+            if later_mirror_prefill and not is_dp_graph:
                 # Trim before input norm: after the first mirror transition the
                 # MoE hidden output occupies the fixed request slot, while the
                 # FP32 residual deliberately stays at real B rows.
@@ -848,13 +872,14 @@ class WelmDpAttentionExecutor:
                 )
                 hidden_states = pre_norm_state.hidden_states
                 residual = pre_norm_state.residual
-            hidden_states, residual = self._prepare_attention_input(
-                layer=layer,
-                hidden_states=hidden_states,
-                residual=residual,
-                input_is_scattered=input_is_scattered,
-                defer_hidden_all_gather=defer_hidden_all_gather,
-            )
+            if not split_first_mirror:
+                hidden_states, residual = self._prepare_attention_input(
+                    layer=layer,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_is_scattered=input_is_scattered,
+                    defer_hidden_all_gather=defer_hidden_all_gather,
+                )
             state = WelmDpLayerState(
                 hidden_states=hidden_states,
                 residual=residual,
@@ -866,7 +891,7 @@ class WelmDpAttentionExecutor:
                 ),
                 row_layout=row_layout,
             )
-            if mirror_transition:
+            if mirror_transition and not split_first_mirror:
                 state, mirror_row_indices = self._prepare_first_mirror_query(
                     state=state,
                     forward_batch=forward_batch,
@@ -883,7 +908,8 @@ class WelmDpAttentionExecutor:
                 or forward_batch.forward_mode
             )
             if (
-                max_chunks >= 2
+                not is_dp_graph
+                and max_chunks >= 2
                 and plan.role is WelmRunnerRole.TARGET_DP
                 and local_forward_mode.is_extend_without_speculative()
                 and is_non_consumer_attention_layer
@@ -943,6 +969,9 @@ class WelmDpAttentionExecutor:
                 mirror_transition=mirror_transition,
                 mirror_row_indices=mirror_row_indices,
                 input_is_reduce_scattered=oproj_output_is_reduce_scattered,
+                graph_mirror_residual_partial=(
+                    split_first_mirror and graph.mirror_residual_is_partial
+                ),
             )
         else:
             # Eager idle only.  Skip norm/attention entirely and reuse the
@@ -972,7 +1001,8 @@ class WelmDpAttentionExecutor:
             active_view=active_view,
         )
         if (
-            layer.is_final_layer
+            not is_dp_graph
+            and layer.is_final_layer
             and forward_batch.forward_mode.is_extend_without_speculative()
             and active_view is row_layout.request
         ):
@@ -1117,6 +1147,78 @@ class WelmDpAttentionExecutor:
             )
         return hidden_states, residual
 
+    def prepare_graph_mirror_handoff(
+        self,
+        *,
+        layer: Any,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: "ForwardBatch",
+        tail_indices: torch.Tensor,
+        request_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Normalize Prompt[Tcap] once and publish a fixed Bmax handoff.
+
+        Request masks and tail indices are live graph inputs. In particular,
+        neither selection nor residual shape depends on capture-time real B.
+        Partial FP32 residuals are reduced by the first Mirror consumer after
+        its OProj, preserving the eager normalization/collective ordering.
+        """
+        plan = self.runner_plan
+        graph = getattr(forward_batch, "welm_prefill_graph", None)
+        row_layout = forward_batch.welm_dp_moe_row_layout
+        if (
+            not plan.finalized
+            or not getattr(graph, "is_dp", False)
+            or forward_batch.welm_prefill_graph_phase != "prompt"
+            or row_layout is None
+            or row_layout.request is None
+            or layer.layer_id != plan.first_mirror_consumer
+        ):
+            raise RuntimeError("Invalid WeLM DP graph mirror handoff")
+        capacity = int(row_layout.current.local_slot_rows)
+        if tail_indices.numel() != request_valid_mask.numel():
+            raise RuntimeError("WeLM DP mirror handoff mask/indices disagree")
+        input_is_scattered = self._input_is_scattered(
+            layer_id=layer.layer_id,
+            has_ordinary_prefill=True,
+            enable_kv_mirror=True,
+        )
+        hidden_states, residual = self._prepare_attention_input(
+            layer=layer,
+            hidden_states=hidden_states,
+            residual=residual,
+            input_is_scattered=input_is_scattered,
+            defer_hidden_all_gather=False,
+        )
+        if hidden_states.shape[0] != capacity:
+            raise RuntimeError("WeLM DP handoff hidden rows do not match prompt slots")
+        assert residual is not None
+        self._assert_fp32_residual(residual)
+        indices = tail_indices.to(torch.long)
+        valid = request_valid_mask.to(torch.bool)
+        # Dummy tails must select legal memory even if the previous replay left
+        # a stale index there. masked_fill (not multiplication) also erases NaN.
+        indices = torch.where(valid, indices, torch.zeros_like(indices))
+        hidden_states = hidden_states.index_select(0, indices)
+        hidden_states.masked_fill_(~valid[:, None], 0)
+        if input_is_scattered:
+            if capacity % plan.attn_tp_size:
+                raise RuntimeError("WeLM DP prompt capacity must divide attention TP")
+            shard_rows = capacity // plan.attn_tp_size
+            if residual.shape[0] != shard_rows:
+                raise RuntimeError("WeLM DP handoff residual is not an attention shard")
+            owner = torch.div(indices, shard_rows, rounding_mode="floor")
+            owned = valid & (owner == plan.attn_tp_rank)
+            offsets = indices - plan.attn_tp_rank * shard_rows
+            offsets = torch.where(owned, offsets, torch.zeros_like(offsets))
+            residual = residual.index_select(0, offsets)
+            residual.masked_fill_(~owned[:, None], 0)
+        else:
+            residual = residual.index_select(0, indices)
+            residual.masked_fill_(~valid[:, None], 0)
+        return hidden_states, residual, input_is_scattered
+
     def _prepare_first_mirror_query(
         self,
         *,
@@ -1228,6 +1330,7 @@ class WelmDpAttentionExecutor:
         mirror_transition: bool,
         mirror_row_indices: Optional[torch.Tensor],
         input_is_reduce_scattered: bool = False,
+        graph_mirror_residual_partial: bool = False,
     ) -> WelmDpLayerState:
         plan = self.runner_plan
         if (
@@ -1276,7 +1379,12 @@ class WelmDpAttentionExecutor:
                     attn_output, attn_tp_group=plan.attn_tp_group
                 )
             residual = state.residual
-            if mirror_transition and state.residual_layout is WelmDpLayout.EP_SCATTERED:
+            if graph_mirror_residual_partial:
+                # Fixed Bcap partials have a unique owner per real request.
+                # Keep this reduction after OProj and before post-attn norm.
+                assert residual is not None
+                residual = plan.attn_tp_group.all_reduce(residual.contiguous())
+            elif mirror_transition and state.residual_layout is WelmDpLayout.EP_SCATTERED:
                 assert residual is not None
                 if mirror_row_indices is not None:
                     residual = welm_reconstruct_attn_scattered_residual_rows(
@@ -1351,6 +1459,9 @@ class WelmDpAttentionExecutor:
 
         plan = self.runner_plan
         transport = batch_plan.moe_transport
+        is_dp_graph = bool(
+            getattr(getattr(forward_batch, "welm_prefill_graph", None), "is_dp", False)
+        )
         layer.final_mlp_experts_output = None
         layer.final_mlp_shared_output = None
 
@@ -1377,7 +1488,10 @@ class WelmDpAttentionExecutor:
                 and megamoe.meets_prefill_threshold(active_view.local_slot_rows)
             )
             use_megamoe = (
-                megamoe_length_matched
+                # The DP graph captures the ordinary BF16 NORMAL path. Keep
+                # MegaMoE's CPU row-dependent slicing on eager forwards only.
+                not is_dp_graph
+                and megamoe_length_matched
                 and forward_batch.welm_dp_all_active_ordinary_prefill
                 and megamoe.can_run(active_view.local_slot_rows // plan.attn_tp_size)
             )

@@ -101,6 +101,7 @@ class MLPSyncBatchInfo:
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     welm_dp_all_active_ordinary_prefill: bool = False
+    welm_dp_prefill_graph_candidate: bool = False
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -199,6 +200,17 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(cpu_data[:, 2].min().item())
         self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
         self.can_run_prefill_cuda_graph = bool(cpu_data[:, 6].min().item())
+        # Preserve the original per-group modes before MAX padding can turn
+        # an idle/decode shard into a fabricated EXTEND. Unlike the MegaMoE
+        # eager predicate, graph admission requires every group to be active.
+        self.welm_dp_prefill_graph_candidate = (
+            self.can_run_prefill_cuda_graph
+            and all(x > 0 for x in self.global_num_tokens)
+            and all(x > 0 for x in self.global_num_requests)
+            and all(
+                mode == ForwardMode.EXTEND.value for mode in cpu_data[:, 5].tolist()
+            )
+        )
         if _ENABLE_WELM_MEGAMOE:
             # Reuse the existing CPU payload; OR(is_extend) cannot distinguish
             # prefill+idle from prefill+decode. No additional collective/D2H.
@@ -211,9 +223,7 @@ class MLPSyncBatchInfo:
                 mode == ForwardMode.EXTEND.value for mode in active_modes
             )
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(
-                cpu_data[:, 5].tolist()
-            )
+            self.dp_cooperation_info = DPCooperationInfo.create(cpu_data[:, 5].tolist())
 
 
 def _update_gather_batch(
@@ -224,6 +234,9 @@ def _update_gather_batch(
 ):
     batch.welm_dp_all_active_ordinary_prefill = (
         not skip_all_gather and mlp_sync_info.welm_dp_all_active_ordinary_prefill
+    )
+    batch.welm_dp_prefill_graph_candidate = (
+        not skip_all_gather and mlp_sync_info.welm_dp_prefill_graph_candidate
     )
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:

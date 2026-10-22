@@ -7,7 +7,7 @@ import logging
 import os
 import runpy
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -140,6 +140,8 @@ def _server_args(**changes):
         nnodes=1,
         dp_size=1,
         enable_pdmux=False,
+        enable_two_batch_overlap=False,
+        elastic_ep_backend=None,
         pp_size=1,
         ep_size=1,
         tp_size=4,
@@ -163,14 +165,18 @@ def _server_args(**changes):
     values.update(changes)
     args = SimpleNamespace(**values)
     args._resolved = lambda: args
-    args.get_model_config = lambda: SimpleNamespace(dtype=torch.bfloat16)
+    args.get_model_config = lambda: SimpleNamespace(
+        dtype=torch.bfloat16, hf_text_config=SimpleNamespace(scale_seq_times=0)
+    )
     return args
 
 
-def _startup_policy(megamoe=False, vit_graph=False, npu=True, random_hash=False):
-    return _definitions(
+def _startup_policy(
+    megamoe=False, vit_graph=False, npu=True, random_hash=False, skip_all_gather=False
+):
+    methods = _definitions(
         SRT / "server_args.py",
-        {"_handle_welm_vlm_adjustments"},
+        {"_handle_welm_vlm_adjustments", "_validate_welm_vlm_attention_dp_config"},
         {
             "Backend": SimpleNamespace(DISABLED="disabled"),
             "is_npu": lambda: npu,
@@ -178,10 +184,21 @@ def _startup_policy(megamoe=False, vit_graph=False, npu=True, random_hash=False)
                 WELM_NPU_USE_MEGAMOE=SimpleNamespace(get=lambda: megamoe),
                 SGLANG_VIT_ENABLE_CUDA_GRAPH=SimpleNamespace(get=lambda: vit_graph),
                 SGLANG_MM_SKIP_COMPUTE_HASH=SimpleNamespace(get=lambda: random_hash),
+                SGLANG_SCHEDULER_SKIP_ALL_GATHER=SimpleNamespace(
+                    get=lambda: skip_all_gather
+                ),
             ),
             "logger": logging.getLogger(__name__),
         },
-    )["_handle_welm_vlm_adjustments"]
+    )
+
+    def apply(args):
+        args._validate_welm_vlm_attention_dp_config = MethodType(
+            methods["_validate_welm_vlm_attention_dp_config"], args
+        )
+        return methods["_handle_welm_vlm_adjustments"](args)
+
+    return apply
 
 
 @pytest.mark.parametrize("dp", [False, True])
@@ -260,16 +277,30 @@ def test_startup_defers_ep_validation_until_deepep_resolution():
 
 
 def _parallel_policy(megamoe=False):
-    return _definitions(
+    methods = _definitions(
         SRT / "server_args.py",
-        {"_validate_welm_vlm_parallel_config"},
+        {
+            "_validate_welm_vlm_parallel_config",
+            "_validate_welm_vlm_attention_dp_config",
+        },
         {
             "resolved_view": lambda args: args,
+            "Backend": SimpleNamespace(DISABLED="disabled"),
+            "is_npu": lambda: True,
             "envs": SimpleNamespace(
-                WELM_NPU_USE_MEGAMOE=SimpleNamespace(get=lambda: megamoe)
+                WELM_NPU_USE_MEGAMOE=SimpleNamespace(get=lambda: megamoe),
+                SGLANG_SCHEDULER_SKIP_ALL_GATHER=SimpleNamespace(get=lambda: False),
             ),
         },
-    )["_validate_welm_vlm_parallel_config"]
+    )
+
+    def apply(args):
+        args._validate_welm_vlm_attention_dp_config = MethodType(
+            methods["_validate_welm_vlm_attention_dp_config"], args
+        )
+        return methods["_validate_welm_vlm_parallel_config"](args)
+
+    return apply
 
 
 @pytest.mark.parametrize("megamoe", [False, True])
@@ -450,3 +481,111 @@ def test_graph_and_mixed_require_native_npu_flash(monkeypatch, native_flash, npu
     _apply_shared_welm_prefill_policy(args, monkeypatch, native_flash, npu)
     assert args.cuda_graph_config.prefill.backend == "disabled"
     assert not args.enable_mixed_chunk
+
+
+def _attention_dp_args(**changes):
+    values = dict(
+        enable_dp_attention=True,
+        tp_size=4,
+        dp_size=2,
+        ep_size=4,
+        mm_enable_dp_encoder=True,
+        moe_a2a_backend="deepep",
+    )
+    values.update(changes)
+    return _server_args(**values)
+
+
+@pytest.mark.parametrize("dtype", ["auto", "bfloat16"])
+@pytest.mark.parametrize("kv_dtype", ["auto", "bf16", "bfloat16"])
+def test_attention_tp2_dp2_ep4_accepts_bf16_and_keeps_eager_optimizations(
+    dtype, kv_dtype
+):
+    args = _attention_dp_args(dtype=dtype, kv_cache_dtype=kv_dtype)
+    _startup_policy(megamoe=True)(args)
+    _parallel_policy(megamoe=True)(args)
+    assert args.enable_dp_attention and args.mm_enable_dp_encoder
+    assert args.moe_a2a_backend == "deepep" and args.ep_size == 4
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tp_size": 8},
+        {"dp_size": 4},
+        {"nnodes": 2},
+        {"attn_cp_size": 2},
+        {"dcp_size": 2},
+        {"moe_a2a_backend": "none"},
+        {"moe_dp_size": 2},
+        {"mm_enable_dp_encoder": False},
+        {"kv_cache_dtype": "fp8_e4m3"},
+        {"disaggregation_mode": "prefill"},
+        {"disaggregation_mode": "decode"},
+        {"enable_lora": True},
+        {"enable_two_batch_overlap": True},
+        {"elastic_ep_backend": "mooncake"},
+    ],
+)
+def test_attention_dp_precise_profile_rejects_unimplemented_combinations(changes):
+    with pytest.raises(ValueError, match="WeLM-VL attention DP"):
+        _startup_policy()(_attention_dp_args(**changes))
+
+
+def test_attention_dp_requires_npu_and_rejects_scale_seq():
+    with pytest.raises(ValueError, match="non-NPU"):
+        _startup_policy(npu=False)(_attention_dp_args())
+    args = _attention_dp_args()
+    args.get_model_config = lambda: SimpleNamespace(
+        hf_text_config=SimpleNamespace(scale_seq_times=1)
+    )
+    with pytest.raises(ValueError, match="scale-seq"):
+        _startup_policy()(args)
+
+
+def test_attention_dp_validates_ep_after_deepep_resolution():
+    args = _attention_dp_args(ep_size=1)
+    _startup_policy()(args)
+    with pytest.raises(ValueError, match="resolved EP=4"):
+        _parallel_policy()(args)
+    args.ep_size = 4
+    _parallel_policy()(args)
+
+
+def test_attention_dp_keeps_breakable_prefill_but_not_mixed_chunk(monkeypatch):
+    args = _attention_dp_args()
+    _startup_policy()(args)
+    _apply_shared_welm_prefill_policy(args, monkeypatch)
+    assert args.cuda_graph_config.prefill.backend == "breakable"
+    assert not args.enable_mixed_chunk
+
+
+def test_attention_dp_requires_scheduler_counts_but_ordinary_tp_is_unchanged():
+    with pytest.raises(ValueError, match="SGLANG_SCHEDULER_SKIP_ALL_GATHER"):
+        _startup_policy(skip_all_gather=True)(_attention_dp_args())
+    _startup_policy(skip_all_gather=True)(_server_args())
+
+
+@pytest.mark.parametrize("field", ["max_bs", "bs"])
+def test_attention_dp_graph_capacity_uses_resolved_per_group_chunk(field):
+    args = _attention_dp_args(chunked_prefill_size=8192)
+    setattr(
+        args.cuda_graph_config.prefill,
+        field,
+        16512 if field == "max_bs" else [512, 16512],
+    )
+    # Early validation precedes DP division and must defer this check.
+    _startup_policy()(args)
+    with pytest.raises(ValueError, match="8192 after DP division"):
+        _parallel_policy()(args)
+    setattr(
+        args.cuda_graph_config.prefill,
+        field,
+        8192 if field == "max_bs" else [512, 8192],
+    )
+    _parallel_policy()(args)
+    args.cuda_graph_config.prefill.backend = "disabled"
+    setattr(
+        args.cuda_graph_config.prefill, field, 16512 if field == "max_bs" else [16512]
+    )
+    _parallel_policy()(args)

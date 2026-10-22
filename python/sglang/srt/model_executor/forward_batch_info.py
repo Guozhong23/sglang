@@ -248,6 +248,8 @@ def build_welm_dp_moe_row_layout(
     current_width: int = 1,
     current_real_rows_gpu: Optional[torch.Tensor] = None,
     current_slot_rows_cpu: Optional[List[int]] = None,
+    request_real_rows_gpu: Optional[torch.Tensor] = None,
+    request_slot_rows_cpu: Optional[List[int]] = None,
     current_slot_alignment: int = 1,
     request_slot_alignment: int = 1,
 ) -> WelmDpMoeRowLayout:
@@ -279,9 +281,7 @@ def build_welm_dp_moe_row_layout(
         if current_slot_rows_cpu is None
         else [int(x) * current_width for x in current_slot_rows_cpu]
     )
-    current_slots = [
-        ceil_align(x, current_slot_alignment) for x in current_slot_basis
-    ]
+    current_slots = [ceil_align(x, current_slot_alignment) for x in current_slot_basis]
     current = _welm_build_row_view(
         real_rows_cpu=current_rows,
         local_dp_rank=local_dp_rank,
@@ -297,15 +297,19 @@ def build_welm_dp_moe_row_layout(
             raise ValueError(
                 "WeLM DP raw/request row metadata must have the same DP size"
             )
-        request_slot_basis = _welm_slot_rows(request_rows_cpu, padding_mode)
+        request_slot_basis = (
+            _welm_slot_rows(request_rows_cpu, padding_mode)
+            if request_slot_rows_cpu is None
+            else list(request_slot_rows_cpu)
+        )
         request = _welm_build_row_view(
             real_rows_cpu=request_rows_cpu,
             local_dp_rank=local_dp_rank,
             device=device,
             padding_mode=padding_mode,
+            real_rows_gpu=request_real_rows_gpu,
             slot_rows_cpu=[
-                ceil_align(x, request_slot_alignment)
-                for x in request_slot_basis
+                ceil_align(x, request_slot_alignment) for x in request_slot_basis
             ],
         )
     return WelmDpMoeRowLayout(current=current, request=request)
@@ -836,6 +840,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     welm_dp_all_active_ordinary_prefill: bool = False
+    welm_dp_prefill_graph_candidate: bool = False
+    welm_prefill_graph_ticket: Optional[Any] = None
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -1191,6 +1197,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 and not model_runner.is_draft_worker
                 and batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.IDLE)
             ),
+            welm_dp_prefill_graph_candidate=(
+                batch.welm_dp_prefill_graph_candidate
+                and use_welm_dp_row_layout
+                and not model_runner.is_draft_worker
+            ),
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
@@ -1210,7 +1221,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
-            enable_kv_mirror=getattr(model_runner.server_args, "enable_kv_mirror", False),
+            enable_kv_mirror=getattr(
+                model_runner.server_args, "enable_kv_mirror", False
+            ),
             welm_dp_raw_rows_cpu=(
                 list(batch.welm_dp_raw_rows)
                 if use_welm_dp_row_layout and batch.welm_dp_raw_rows is not None

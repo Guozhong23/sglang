@@ -178,6 +178,7 @@ def runner():
         server_args=SimpleNamespace(
             is_ep_scale_joiner=False,
             mm_enable_dp_encoder=True,
+            enable_dp_attention=False,
             nnodes=1,
             skip_server_warmup=False,
             checkpoint_engine_wait_weights_before_ready=False,
@@ -193,6 +194,7 @@ def runner():
         load_config=SimpleNamespace(load_format=LoadFormat.AUTO),
         loader=DefaultLoader(),
         tp_group=group(),
+        attention_tp_group=group(),
         forward_stream=object(),
     )
 
@@ -604,9 +606,16 @@ def _distributed_warmup_worker(rank, world, rendezvous, output_dir, mismatch):
     )
     obj = cpu_model(rank=rank)
     obj._vision_dp_group.cpu_group = dist.group.WORLD
-    obj._vision_dp_group.all_gather_into_tensor = lambda output, local: (
-        dist.all_gather_into_tensor(output, local)
-    )
+
+    def gloo_device_gather(output, local):
+        # Gloo writes on its worker thread, outside inference mode. Stage its
+        # CPU result in a normal tensor while exercising the real DP payload.
+        with torch.inference_mode(False):
+            staging = torch.empty(output.shape, dtype=output.dtype)
+            dist.all_gather_into_tensor(staging, local)
+        output.copy_(staging)
+
+    obj._vision_dp_group.all_gather_into_tensor = gloo_device_gather
     result = {}
     try:
         try:
@@ -678,3 +687,45 @@ def test_real_four_process_warmup_and_manifest_agreement(tmp_path, mismatch):
                 "projector_calls": 4,
                 "completed_syncs": 4,
             }
+
+
+@pytest.mark.parametrize("ranks", [[0, 1], [2, 3]])
+def test_attention_dp_warmup_manifest_stays_in_request_group(monkeypatch, ranks):
+    current = runner()
+    current.server_args.enable_dp_attention = True
+    current.ps.dp_size = 2
+    current.ps.attn_tp_size = 2
+    attention_group = group(world=2)
+    attention_group.ranks = ranks
+    current.model._vision_dp_group = attention_group
+    current.attention_tp_group = attention_group
+    device = Device()
+    monkeypatch.setattr(torch, "get_device_module", lambda _: device)
+    observed = []
+
+    def gather(peers, status, *, group):
+        assert group is attention_group.cpu_group
+        assert group is not current.tp_group.cpu_group
+        assert len(peers) == 2
+        observed.append(status)
+        peers[:] = [dict(copy.deepcopy(status), rank=rank) for rank in range(2)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    WARM.maybe_warmup_vision_encoder(current)
+    assert current._vision_encoder_warmup_done
+    current.model.warmup_vision_encoder.assert_called_once()
+    manifest = observed[0]["manifest"]
+    assert manifest["ranks"] == ranks and manifest["world_size"] == 2
+    assert len(manifest["grids"][0]) == 2
+
+
+def test_attention_dp_warmup_rejects_outer_world_group(monkeypatch):
+    current = runner()
+    current.server_args.enable_dp_attention = True
+    current.ps.dp_size = current.ps.attn_tp_size = 2
+    current.attention_tp_group = group(world=2)
+    gather = Mock(side_effect=AssertionError("no collective on wrong group"))
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="attention-TP group"):
+        WARM.maybe_warmup_vision_encoder(current)
+    gather.assert_not_called()

@@ -1339,10 +1339,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and forward_batch is not None
             and forward_batch.welm_prefill_graph is not None
             and forward_batch.welm_prefill_graph.pad_mirror
+            and not getattr(forward_batch.welm_prefill_graph, "is_dp", False)
             and forward_batch.welm_prefill_graph_phase == "mirror"
         ):
-            # Both MoE TP and local EP process all physical Bcap rows with
-            # legal routes. Prompt's TP-local token count is not a request
+            # Pure-TP MoE TP/local EP process all physical Bcap rows with
+            # legal routes. DP keeps the executor's segmented request mask:
+            # one scalar cannot describe holes between different DP slots.
+            # Prompt's TP-local token count is not a request
             # mask (Bcap can even exceed Tcap). Dummy outputs are trimmed
             # before the eager LM head; Flash has its own request mask.
             num_token_non_padded = None

@@ -1,6 +1,6 @@
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0
-"""Whole-image WeLM vision DP over the text TP group.
+"""Whole-image WeLM vision DP within one request's attention-TP group.
 
 Each owner runs a replicated encoder and projector, without layer collectives.
 Only projected embeddings are gathered. Padding belongs to communication buffers
@@ -23,11 +23,12 @@ def create_vision_dp_group(config, max_patches=0):
     if mode != "dp":
         return None
     logging.getLogger(__name__).info(
-        "WeLM image DP enabled: DP=%d rank=%d; encoder and projector replicated, "
+        "WeLM image DP enabled: DP=%d rank=%d ranks=%s; encoder and projector replicated, "
         "whole images assigned to owners, projected embeddings gathered once. "
         "A single image uses one rank. BF16 eager only.",
         group.world_size,
         group.rank_in_group,
+        list(group.ranks),
     )
     return group
 
@@ -57,7 +58,10 @@ def synchronize_vision_dp_cache(items, cached_mask, *, group):
     peers = [state]
     if group.world_size > 1:
         peers = [None] * group.world_size
-        torch.distributed.all_gather_object(peers, state, group=group.cpu_group)
+        # CPU Gloo writes its temporary receive tensors from a worker thread.
+        # They must not be inference tensors even during model.forward.
+        with torch.inference_mode(False):
+            torch.distributed.all_gather_object(peers, state, group=group.cpu_group)
     if any(peer[0] != manifest or len(peer[1]) != len(items) for peer in peers):
         raise ValueError("WeLM image DP image order/grids differ across TP ranks")
     return [any(not peer[1][index] for peer in peers) for index in range(len(items))]

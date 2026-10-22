@@ -146,6 +146,7 @@ class WelmMXFP8GraphWorkspace:
 
 
 class WelmPrefillGraphAdapter:
+    is_dp = False
     # VL composes base/OE/vision eagerly for both image and text-only requests.
     # A fixed capture boundary prevents replay from applying OE to image rows.
     eager_input_embeddings = False
@@ -179,7 +180,9 @@ class WelmPrefillGraphAdapter:
         ):
             raise ValueError("WeLM VL prefill graph requires an input embedding buffer")
         if self.eager_input_embeddings and runner.quant_config is not None:
-            raise ValueError("WeLM VL prefill graph currently requires unquantized BF16")
+            raise ValueError(
+                "WeLM VL prefill graph currently requires unquantized BF16"
+            )
         self.backend = runner.model_runner.attn_backend
         self.max_tokens = runner.max_num_tokens
         self.device = runner.device
@@ -189,9 +192,11 @@ class WelmPrefillGraphAdapter:
             runner.model_runner.dtype != torch.bfloat16
             or runner.model_runner.kv_cache_dtype != torch.bfloat16
         ):
-            raise ValueError("WeLM breakable prefill requires BF16 compute and KV cache")
+            raise ValueError(
+                "WeLM breakable prefill requires BF16 compute and KV cache"
+            )
         if (
-            parallel.enable_dp_attention
+            (parallel.enable_dp_attention and not self.is_dp)
             or parallel.pp_size != 1
             or parallel.attn_cp_size != 1
             or args.dcp_size != 1
@@ -200,22 +205,29 @@ class WelmPrefillGraphAdapter:
                 "WeLM breakable prefill requires DP attention off and PP=CP=DCP=1"
             )
         if not getattr(self.backend, "use_welm_flash_attn", False):
-            raise ValueError("WeLM breakable prefill requires WELM_NPU_USE_FLASH_ATTN=1")
+            raise ValueError(
+                "WeLM breakable prefill requires WELM_NPU_USE_FLASH_ATTN=1"
+            )
         if getattr(self.model, "is_nextn_model", False) or args.enable_lora:
-            raise ValueError("WeLM breakable prefill supports the target model without LoRA")
+            raise ValueError(
+                "WeLM breakable prefill supports the target model without LoRA"
+            )
         if self.model.scale_seq_times > 0:
-            raise ValueError("WeLM breakable prefill does not capture scale-seq expansion")
+            raise ValueError(
+                "WeLM breakable prefill does not capture scale-seq expansion"
+            )
         self.prune = bool(args.enable_kv_mirror)
         self.mixed_chunk = bool(args.enable_mixed_chunk)
         # Keep the validated exact-B path, including its capture topology,
         # unchanged unless mixed chunk was explicitly enabled.
-        self.pad_mirror = self.prune and self.mixed_chunk
+        self.pad_mirror = self.prune and (self.mixed_chunk or self.is_dp)
         # Pure BF16 never enters the MXFP8 helpers and owns no AG workspace.
         # Keep strong references here for every captured bucket's lifetime;
         # capture_inputs also retains this adapter via the private batch.
         self.mxfp8_ag_workspace = (
             WelmMXFP8GraphWorkspace()
-            if any(
+            if not self.is_dp
+            and any(
                 layer.self_attn.can_reuse_prefill_mxfp8_input()
                 for layer in self.model.layers
             )
@@ -266,7 +278,9 @@ class WelmPrefillGraphAdapter:
             dtype=torch.int32,
             device=self.device,
         )
-        self.valid_rows = torch.zeros(self.max_tokens, dtype=torch.bool, device=self.device)
+        self.valid_rows = torch.zeros(
+            self.max_tokens, dtype=torch.bool, device=self.device
+        )
         self.local_valid_rows = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.full_write_locs = torch.zeros(
             self.max_tokens, dtype=torch.int64, device=self.device
@@ -354,7 +368,10 @@ class WelmPrefillGraphAdapter:
             return self.reject("mirror setting differs from the captured profile")
         if self.key(capacity) not in self.capture_keys:
             return self.reject("prompt token bucket was not captured")
-        if self.prune and self.select_mirror_key(batch.batch_size) not in self.capture_keys:
+        if (
+            self.prune
+            and self.select_mirror_key(batch.batch_size) not in self.capture_keys
+        ):
             return self.reject("mirror request bucket was not captured")
         if not 0 < batch.batch_size <= self.max_requests:
             return self.reject("request count exceeds fixed metadata capacity")
@@ -457,7 +474,9 @@ class WelmPrefillGraphAdapter:
         offsets = padded_flash_cu_seqlens(
             batch.extend_seq_lens_cpu, capacity, self.max_requests
         )
-        staging = torch.tensor(offsets, dtype=torch.int32, device="cpu", pin_memory=True)
+        staging = torch.tensor(
+            offsets, dtype=torch.int32, device="cpu", pin_memory=True
+        )
         metadata.welm_flash_cu_seqlens_q.copy_(staging, non_blocking=True)
 
     def _prepare_tiles(self, batch: ForwardBatch, capacity: int):
@@ -549,7 +568,9 @@ class WelmPrefillGraphAdapter:
             # normalizes them and computes OE once in the eager outer wrapper.
             ids = self.model._compute_oe_hashed_ids(live.input_ids[:real_rows], live)
             if ids is None or ids.shape != (len(self.model.oe_grams), real_rows):
-                raise RuntimeError("WeLM prepared OE IDs do not match the real request rows")
+                raise RuntimeError(
+                    "WeLM prepared OE IDs do not match the real request rows"
+                )
             self.oe_ids[:, :real_rows].copy_(ids)
         if static.num_token_non_padded is not None:
             self.local_valid_rows.copy_(static.num_token_non_padded)
@@ -601,8 +622,8 @@ class WelmPrefillGraphAdapter:
             )
 
         first = self.model.layers[self.first_mirror]
-        hidden_states, residual, partial = first.prepare_graph_mirror_input(
-            hidden_states, residual, batch, self.tail_indices
+        hidden_states, residual, partial = self._prepare_mirror_handoff(
+            first, hidden_states, residual, batch
         )
         # Allocated on the first warmup, held strongly for every T and B graph.
         if self.mirror_hidden is None:
@@ -648,6 +669,11 @@ class WelmPrefillGraphAdapter:
         # output buffer is allocated only when capturing Mirror[Bmax] later.
         return None
 
+    def _prepare_mirror_handoff(self, first, hidden_states, residual, batch):
+        return first.prepare_graph_mirror_input(
+            hidden_states, residual, batch, self.tail_indices
+        )
+
     def begin_mirror(self, batch):
         # This is the private capture batch: bs is the graph's physical Bcap.
         # All rows do legal MoE work; the helper's legacy "real rows" fields
@@ -655,9 +681,9 @@ class WelmPrefillGraphAdapter:
         # live batch to Bcap. Output is trimmed before the eager LM head.
         bs = batch.batch_size
         if self.ep:
-            self.model.layers[self.first_mirror]._update_pure_tp_kv_mirror_full_metadata(
-                batch, mirror_num_real_rows=bs
-            )
+            self.model.layers[
+                self.first_mirror
+            ]._update_pure_tp_kv_mirror_full_metadata(batch, mirror_num_real_rows=bs)
         # Residual/norm kernels must not mutate the shared handoff input.
         return (
             self.mirror_hidden[:bs].clone(),
@@ -705,3 +731,14 @@ class WelmPrefillGraphAdapter:
             mirror_prefill=mirror,
             graph_metadata=self.current_flash_metadata,
         )
+
+
+def create_welm_prefill_graph_adapter(runner):
+    """Select a separate DP contract; the pure-TP capture path stays unchanged."""
+    if get_parallel().enable_dp_attention:
+        from sglang.srt.model_executor.runner.welm_dp_prefill_graph import (
+            WelmDpPrefillGraphAdapter,
+        )
+
+        return WelmDpPrefillGraphAdapter(runner)
+    return WelmPrefillGraphAdapter(runner)

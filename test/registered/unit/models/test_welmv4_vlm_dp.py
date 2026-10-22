@@ -165,7 +165,6 @@ def test_startup_dp_switch_and_full_heads(monkeypatch, mode):
         ({"npu": False}, "0", "NPU"),
         ({"graph": True}, "0", "graphs"),
         ({"mismatched": True}, "0", "differ"),
-        ({"attn_ranks": [0, 1]}, "0", "identical"),
     ],
 )
 def test_startup_rejects_unsafe_dp_modes(monkeypatch, options, sp, message):
@@ -270,13 +269,20 @@ def _gloo_worker(rank, world, rendezvous):
         timeout=timedelta(seconds=45),
     )
     try:
+
+        def gloo_device_gather(output, value):
+            # CPU Gloo's worker must write normal tensors, including when the
+            # real MoonViT call below runs under inference mode.
+            with torch.inference_mode(False):
+                staging = torch.empty(output.shape, dtype=output.dtype)
+                dist.all_gather_into_tensor(staging, value)
+            output.copy_(staging)
+
         group = SimpleNamespace(
             world_size=world,
             rank_in_group=rank,
             cpu_group=dist.group.WORLD,
-            all_gather_into_tensor=lambda output, value: dist.all_gather_into_tensor(
-                output, value
-            ),
+            all_gather_into_tensor=gloo_device_gather,
         )
         for grids in (
             [[1, 2, 2]],
@@ -450,3 +456,99 @@ def test_removed_dp_environment_cannot_enable_dp(monkeypatch, legacy, enabled):
         assert ULYSSES.resolve_vision_parallel_group(config) == (
             (group, "dp") if enabled else (None, None)
         )
+
+
+@pytest.mark.parametrize("ranks", [[0, 1], [2, 3]])
+def test_attention_dp_vision_selects_request_group_for_settings(monkeypatch, ranks):
+    outer = _runtime(monkeypatch, dp=True, attn_ranks=ranks)
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "0")
+    attention = sys.modules["sglang.srt.distributed"].get_attn_tp_group()
+    calls = []
+
+    def gather(peers, settings, *, group):
+        assert group is attention.cpu_group
+        assert group is not outer.cpu_group
+        assert len(peers) == 2
+        calls.append(group)
+        peers[:] = [settings, settings]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    config = SimpleNamespace(
+        num_attention_heads=16, hidden_size=1152, num_hidden_layers=27
+    )
+    selected, mode = ULYSSES.resolve_vision_parallel_group(config)
+    assert selected is attention and mode == "dp"
+    assert selected.ranks == ranks
+    assert len(calls) == 1
+
+
+def test_attention_dp_rejects_legacy_vision_tp_before_collectives(monkeypatch):
+    _runtime(monkeypatch, dp=False, attn_ranks=[0, 1])
+    monkeypatch.setenv("SGLANG_VLM_VISION_USE_ULYSSES", "0")
+    gather = Mock(side_effect=AssertionError("no unsupported collective"))
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    config = SimpleNamespace(
+        num_attention_heads=16, hidden_size=1152, num_hidden_layers=27
+    )
+    with pytest.raises(ValueError, match="requires --mm-enable-dp-encoder"):
+        ULYSSES.resolve_vision_parallel_group(config)
+    gather.assert_not_called()
+
+
+def _gloo_two_request_groups_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=45),
+    )
+    try:
+        groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+        dp_rank, local_rank = divmod(rank, 2)
+        process_group = groups[dp_rank]
+        group = SimpleNamespace(
+            ranks=[dp_rank * 2, dp_rank * 2 + 1],
+            world_size=2,
+            rank_in_group=local_rank,
+            cpu_group=process_group,
+            all_gather_into_tensor=lambda output, value: dist.all_gather_into_tensor(
+                output, value, group=process_group
+            ),
+        )
+        grids = [[1, 2, 2]] if dp_rank == 0 else [[1, 2, 4], [1, 4, 4]]
+        items = _items(grids, width=1, dtype=torch.float32)
+        for index, item in enumerate(items):
+            item.hash += dp_rank * 1000
+            item.feature.fill_(dp_rank * 100 + index + 1)
+        for active_dp in (None, 1, 0):
+            # One group can skip device encoding while the other gathers a
+            # different image manifest. No cross-request collective is allowed.
+            missing = active_dp is None or active_dp == dp_rank
+            hits = [not (missing and local_rank == 0)] * len(items)
+            with torch.inference_mode():
+                misses = DP.synchronize_vision_dp_cache(items, hits, group=group)
+            assert misses == [missing] * len(items)
+            if missing:
+                encoder = _EchoEncoder()
+                projector = lambda hidden: hidden.reshape(-1, 4, 2).sum(1)
+                outputs = DP.encode_vision_dp(items, encoder, projector, group)
+                for item, output in zip(items, outputs):
+                    expected = projector(item.feature.expand(-1, 2))
+                    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(), reason="Gloo unavailable"
+)
+def test_two_attention_groups_keep_different_images_and_cache_hits_isolated(tmp_path):
+    mp.spawn(
+        _gloo_two_request_groups_worker,
+        args=((tmp_path / "two-request-groups").as_uri(),),
+        nprocs=4,
+        join=True,
+    )

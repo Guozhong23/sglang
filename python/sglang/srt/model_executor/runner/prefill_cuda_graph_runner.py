@@ -530,15 +530,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and hasattr(self.layer_model, "_compute_oe_hashed_ids")
         ):
             from sglang.srt.model_executor.runner.welm_prefill_graph import (
-                WelmPrefillGraphAdapter,
+                create_welm_prefill_graph_adapter,
             )
 
-            self.welm_adapter = WelmPrefillGraphAdapter(self)
+            self.welm_adapter = create_welm_prefill_graph_adapter(self)
+            self._validate_welm_dp_manifest()
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
         self.capture()
+        self._validate_welm_dp_manifest()
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
@@ -663,9 +665,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         can spuriously track gradients.
         """
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        local_dp_slots = num_tokens
+        if getattr(self.welm_adapter, "is_dp", False):
+            local_dp_slots = (
+                forward_batch.welm_dp_moe_row_layout.current.local_slot_rows
+            )
         set_dp_buffer_len(
             forward_batch.global_dp_buffer_len,
-            num_tokens,
+            local_dp_slots,
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
         )
@@ -1123,7 +1130,103 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         return True
 
+    def _validate_welm_dp_manifest(self) -> None:
+        adapter = self.welm_adapter
+        if not getattr(adapter, "is_dp", False):
+            return
+        manifest = {
+            **adapter.manifest(),
+            "configured_token_buckets": list(self.capture_num_tokens),
+            "configured_request_buckets": list(adapter.batch_sizes),
+        }
+        manifests = [None] * self.model_runner.tp_group.world_size
+        with torch.inference_mode(False):
+            torch.distributed.all_gather_object(
+                manifests, manifest, group=self.model_runner.tp_group.cpu_group
+            )
+        if len(manifests) != 4 or any(item != manifest for item in manifests):
+            raise ValueError(
+                "WeLM TP2DP2EP4 prefill capture manifests differ across ranks: "
+                f"{manifests}"
+            )
+
+    def prepare_welm_dp_graph_ticket(self, batch: ForwardBatch) -> None:
+        """Unanimous pre-dispatch admission, including local IDLE participants.
+
+        ModelRunner calls this before its EXTEND-only branch. No graph or KV
+        write happens until all four ranks have agreed on both graph keys.
+        """
+        adapter = self.welm_adapter
+        if not getattr(adapter, "is_dp", False):
+            return
+        from sglang.srt.model_executor.runner.welm_dp_graph_contract import (
+            agree_welm_dp_prefill_ticket,
+            select_welm_dp_prefill_ticket,
+        )
+
+        ticket = select_welm_dp_prefill_ticket(
+            token_rows=batch.welm_dp_raw_rows_cpu,
+            request_rows=batch.global_num_requests_cpu,
+            all_extend=batch.welm_dp_prefill_graph_candidate,
+            token_buckets=self.capture_num_tokens,
+            request_buckets=adapter.batch_sizes,
+            token_alignment=adapter.attn_tp_size,
+        )
+        local_allowed = False
+        if ticket.allowed:
+            dp_rank = adapter.dp_rank
+            lengths = batch.extend_seq_lens_cpu
+            rows_match = (
+                lengths is not None
+                and sum(lengths) == ticket.token_rows[dp_rank]
+                and batch.batch_size == ticket.request_rows[dp_rank]
+            )
+            local_allowed = (
+                rows_match
+                and self.can_replay_locally(
+                    batch_size=batch.batch_size,
+                    num_tokens=len(batch.input_ids),
+                    input_embeds=batch.input_embeds,
+                    replace_embeds=batch.replace_embeds,
+                    prefix_lens=batch.extend_prefix_lens_cpu,
+                    is_target_verify=batch.forward_mode.is_target_verify(),
+                    capture_hidden_mode=batch.capture_hidden_mode,
+                    return_logprob=batch.return_logprob,
+                    lora_ineligible=self.enable_lora,
+                )
+                and adapter.local_can_run(
+                    batch, ticket.token_capacity, ticket.request_capacity
+                )
+            )
+        # Gloo's worker writes output outside the calling inference context.
+        # These tiny CPU control tensors must therefore be ordinary tensors.
+        with torch.inference_mode(False):
+            vote = torch.tensor(ticket.vote_record(local_allowed), dtype=torch.int64)
+            votes = torch.empty(4 * vote.numel(), dtype=torch.int64)
+            torch.distributed.all_gather_into_tensor(
+                votes, vote, group=self.model_runner.tp_group.cpu_group
+            )
+            vote_records = votes.view(4, -1).tolist()
+        batch.welm_prefill_graph_ticket = agree_welm_dp_prefill_ticket(
+            ticket, vote_records
+        )
+        decision = batch.welm_prefill_graph_ticket
+        logger.debug(
+            "WeLM DP prefill admission allowed=%s reason=%s T=%s B=%s slots=%s/%s",
+            decision.allowed,
+            decision.reason,
+            decision.token_rows,
+            decision.request_rows,
+            decision.token_capacity,
+            decision.request_capacity,
+        )
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if getattr(self.welm_adapter, "is_dp", False):
+            ticket = forward_batch.welm_prefill_graph_ticket
+            # The shared hook already checked every local failure condition.
+            # Never add a rank-local fallback after another rank can replay.
+            return bool(ticket is not None and ticket.allowed)
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1468,6 +1571,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if getattr(self.welm_adapter, "is_dp", False):
+            ticket = forward_batch.welm_prefill_graph_ticket
+            if ticket is None or not ticket.allowed:
+                raise RuntimeError("WeLM DP graph load requires unanimous admission")
+            static_num_tokens = ticket.token_capacity
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
@@ -1576,6 +1684,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
+            is_extend_in_batch=forward_batch.is_extend_in_batch,
+            welm_dp_raw_rows_cpu=forward_batch.welm_dp_raw_rows_cpu,
+            global_num_requests_cpu=forward_batch.global_num_requests_cpu,
+            welm_dp_prefill_graph_candidate=forward_batch.welm_dp_prefill_graph_candidate,
+            welm_prefill_graph_ticket=forward_batch.welm_prefill_graph_ticket,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
@@ -1693,13 +1806,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if ie is None and ie_idx is not None and len(args) > ie_idx:
                     ie = args[ie_idx]
                 if ie is not None:
-                    self.buffer_registry.get_slot("input_embeds").slice_for(
-                        1, static_num_tokens
-                    )[: ie.shape[0]].copy_(ie)
+                    embed_buffer = self.buffer_registry.get_slot(
+                        "input_embeds"
+                    ).slice_for(1, static_num_tokens)
+                    embed_buffer[: ie.shape[0]].copy_(ie)
+                    if getattr(self.welm_adapter, "is_dp", False):
+                        real_rows = (
+                            static_forward_batch.welm_prefill_graph_ticket.token_rows[
+                                self.welm_adapter.dp_rank
+                            ]
+                        )
+                        embed_buffer[real_rows:static_num_tokens].zero_()
             if self.welm_adapter is not None:
-                hs = self.welm_adapter.replay(
-                    shape_key, static_forward_batch, **kwargs
-                )
+                hs = self.welm_adapter.replay(shape_key, static_forward_batch, **kwargs)
                 if self.welm_adapter.pad_mirror:
                     # Mirror produces Bcap rows, while the eager LM head and
                     # sampler must see only Breal. raw_num_tokens is R, not B.

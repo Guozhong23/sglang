@@ -5179,13 +5179,27 @@ class ServerArgs:
             welm_bf16_breakable = (
                 is_npu()
                 and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-                and not self.enable_dp_attention
+                and (
+                    not self.enable_dp_attention
+                    or (
+                        model_arch
+                        in (
+                            "WeLMV4VLMForConditionalGeneration",
+                            "WeLMMoonViTVLForConditionalGeneration",
+                        )
+                        and self.tp_size == 4
+                        and self.dp_size == 2
+                        and self.moe_a2a_backend == "deepep"
+                        and self.mm_enable_dp_encoder
+                    )
+                )
                 and self._resolved().attn_cp_size == 1
                 and self.dcp_size == 1
                 and self.dtype in ("auto", "bfloat16")
                 and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
                 and (
-                    model_arch not in (
+                    model_arch
+                    not in (
                         "WeLMV4VLMForConditionalGeneration",
                         "WeLMMoonViTVLForConditionalGeneration",
                     )
@@ -5200,11 +5214,18 @@ class ServerArgs:
             ):
                 logger.warning(
                     "WeLMv4 prefill graph requires NPU breakable, BF16 compute/KV, "
-                    "DP attention off, CP=DCP=1, no LoRA and "
+                    "ordinary TP or WeLM-VL TP2 x DP2 x EP4, CP=DCP=1, no LoRA and "
                     "WELM_NPU_USE_FLASH_ATTN=1. Disabling this unsupported "
                     "prefill profile; decode graph settings are unchanged."
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if welm_bf16_breakable and self.enable_dp_attention:
+                logger.info(
+                    "WeLM-VL TP2 x DP2 x EP4 prefill graphs use ordinary BF16 "
+                    "OProj and DeepEP NORMAL kernels; eager MegaMoE/fused "
+                    "settings are preserved. Idle or mixed-phase DP rounds "
+                    "fall back to eager together."
+                )
             if is_npu() and self.cuda_graph_config.decode.backend != Backend.DISABLED:
                 logger.info(
                     "Decode NPU Graph is enabled for WeLMv4. Spec V2 MTP "
@@ -5867,11 +5888,7 @@ class ServerArgs:
         draft_config = get_config(
             draft_path,
             trust_remote_code=self.trust_remote_code,
-            revision=(
-                self.speculative_draft_model_revision
-                or self.revision
-                or "main"
-            ),
+            revision=(self.speculative_draft_model_revision or self.revision or "main"),
             model_override_args=json.loads(self.json_model_override_args),
             model_config_parser=self.model_config_parser,
             **kwargs,
@@ -5886,7 +5903,6 @@ class ServerArgs:
         unsupported = []
         for enabled, option in (
             (self.speculative_algorithm, "speculative decoding / MTP"),
-            (self.enable_dp_attention, "--enable-dp-attention"),
             (
                 self.encoder_only or self.language_only,
                 "encoder/language-only deployment",
@@ -5906,9 +5922,12 @@ class ServerArgs:
         if unsupported:
             raise ValueError(
                 "WeLM-VL supports BF16 combined vision/language serving with "
-                "ordinary attention TP, optional DeepEP and WeLM prefill MegaMoE. "
+                "ordinary attention TP or NPU TP2 x DP2 x EP4, with optional "
+                "DeepEP and WeLM prefill MegaMoE. "
                 "Not yet supported: " + ", ".join(unsupported) + "."
             )
+        if self.enable_dp_attention:
+            self._validate_welm_vlm_attention_dp_config()
         if self.disaggregation_mode != "null":
             unsupported_pd = [
                 option
@@ -5962,9 +5981,81 @@ class ServerArgs:
             "mixed chunk and radix cache follow the supported server settings."
         )
 
+    def _validate_welm_vlm_attention_dp_config(self, *, resolved=False) -> None:
+        """Bound the first VL attention-DP implementation to TP2 x DP2 x EP4.
+
+        DeepEP resolves EP later, so validate the final EP group only in the
+        post-resolution pass. Module layout and resolved BF16 dtype are checked
+        again by the model runner and graph adapter before capture.
+        """
+        view = resolved_view(self) if resolved else self
+        text_config = self.get_model_config().hf_text_config
+        unsupported = [
+            option
+            for enabled, option in (
+                (not is_npu(), "non-NPU runtime"),
+                (
+                    view.tp_size != 4 or self.dp_size != 2,
+                    "requires --tp-size 4 --dp-size 2",
+                ),
+                (self.nnodes != 1, "multi-node workers"),
+                (
+                    self.pp_size != 1 or view.attn_cp_size != 1 or self.dcp_size != 1,
+                    "PP/CP/DCP other than 1",
+                ),
+                (
+                    view.moe_a2a_backend != "deepep" or self.moe_dp_size != 1,
+                    "requires DeepEP and moe-dp-size=1",
+                ),
+                (resolved and view.ep_size != 4, "requires resolved EP=4"),
+                (
+                    not self.mm_enable_dp_encoder,
+                    "requires --mm-enable-dp-encoder within each attention-TP group",
+                ),
+                (self.dtype not in ("auto", "bfloat16"), "non-BF16 compute"),
+                (
+                    self.kv_cache_dtype not in ("auto", "bf16", "bfloat16"),
+                    "non-BF16 KV cache",
+                ),
+                (self.quantization is not None, "quantized weights"),
+                (self.disaggregation_mode != "null", "P/D disaggregation"),
+                (self.speculative_algorithm is not None, "speculative decoding / MTP"),
+                (self.enable_lora, "LoRA"),
+                (self.enable_two_batch_overlap, "two-batch overlap"),
+                (self.enable_pdmux, "PDMux"),
+                (getattr(text_config, "scale_seq_times", 0) > 0, "scale-seq expansion"),
+                (self.elastic_ep_backend is not None, "elastic EP"),
+                (
+                    envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get(),
+                    "SGLANG_SCHEDULER_SKIP_ALL_GATHER=1 (raw per-DP token/request counts are required)",
+                ),
+            )
+            if enabled
+        ]
+        if resolved and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            prefill = self.cuda_graph_config.prefill
+            capacities = [getattr(prefill, "max_bs", None)] + list(
+                getattr(prefill, "bs", None) or []
+            )
+            if self.chunked_prefill_size <= 0 or any(
+                capacity is not None and capacity > self.chunked_prefill_size
+                for capacity in capacities
+            ):
+                unsupported.append(
+                    "prefill graph max_bs/bs must not exceed the positive per-DP "
+                    f"chunked-prefill-size ({self.chunked_prefill_size} after DP division)"
+                )
+        if unsupported:
+            raise ValueError(
+                "WeLM-VL attention DP supports single-node NPU BF16 TP2 x DP2 x EP4. "
+                "Not yet supported: " + ", ".join(unsupported) + "."
+            )
+
     def _validate_welm_vlm_parallel_config(self) -> None:
         """Validate after DeepEP has resolved its EP size to the TP size."""
         view = resolved_view(self)
+        if view.enable_dp_attention:
+            self._validate_welm_vlm_attention_dp_config(resolved=True)
         if view.moe_a2a_backend not in ("none", "deepep"):
             raise ValueError(
                 "WeLM-VL requires the resolved MoE backend to be none or deepep; "
@@ -5992,7 +6083,8 @@ class ServerArgs:
 
         Group coverage, local-EP kernels, module sharding, and OProj reduction
         are runner/model facts and are deliberately left to plan finalization.
-        This validator contains no TP/DP/EP numeric topology whitelist.
+        The text executor uses capability checks; VL additionally keeps its
+        first implementation within the explicit TP2 x DP2 x EP4 topology.
         """
         if (
             not is_npu()
@@ -6007,8 +6099,7 @@ class ServerArgs:
             "WeLMMoonViTVLForConditionalGeneration",
         ):
             self._validate_welm_vlm_parallel_config()
-            return
-        if not architectures or architectures[0] != "WeLMV4MoeForCausalLM":
+        elif not architectures or architectures[0] != "WeLMV4MoeForCausalLM":
             return
 
         view = resolved_view(self)

@@ -244,6 +244,16 @@ def _runtime(
     group = SimpleNamespace(
         world_size=world, rank_in_group=0, ranks=list(range(world)), cpu_group=object()
     )
+    attention_group = (
+        group
+        if attn_ranks is None
+        else SimpleNamespace(
+            world_size=len(attn_ranks),
+            rank_in_group=0,
+            ranks=attn_ranks,
+            cpu_group=object(),
+        )
+    )
     import runpy
 
     policy = ModuleType("sglang.srt.layers.welmv4_vision_parallel")
@@ -256,9 +266,7 @@ def _runtime(
         "sglang.srt.utils": {"is_npu": lambda: npu},
         "sglang.srt.distributed": {
             "get_tp_group": lambda: group,
-            "get_attn_tp_group": lambda: SimpleNamespace(
-                ranks=attn_ranks or list(range(world))
-            ),
+            "get_attn_tp_group": lambda: attention_group,
         },
         "sglang.srt.environ": {
             "envs": SimpleNamespace(
@@ -275,7 +283,7 @@ def _runtime(
         monkeypatch.setitem(sys.modules, name, module)
 
     def gather(output, value, **kwargs):
-        output[:] = [value] * world
+        output[:] = [value] * len(output)
         if mismatched:
             output[-1] = ("different",)
 
@@ -305,7 +313,7 @@ def test_startup_switch_and_group(monkeypatch, value):
         ({"graph": True}, "graphs"),
         ({"dp": True}, "mutually exclusive"),
         ({"mismatched": True}, "differ"),
-        ({"attn_ranks": [0, 1]}, "identical"),
+        ({"attn_ranks": [0, 1]}, "requires --mm-enable-dp-encoder"),
         ({"world": 3}, "divisible"),
     ],
 )

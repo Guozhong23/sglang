@@ -1003,7 +1003,13 @@ class ModelRunner:
             self.is_draft_worker
             or self.device != "npu"
             or not self.server_args.enable_dp_attention
-            or "WeLMV4MoeForCausalLM" not in architectures
+            or not set(architectures).intersection(
+                {
+                    "WeLMV4MoeForCausalLM",
+                    "WeLMV4VLMForConditionalGeneration",
+                    "WeLMMoonViTVLForConditionalGeneration",
+                }
+            )
         ):
             return None
 
@@ -1019,7 +1025,9 @@ class ModelRunner:
 
             moe_ep_normal_group = get_moe_ep_normal_comm_group()
 
-        hf_config = self.model_config.hf_config
+        # VLM wrappers inherit the language model, but their outer config
+        # contains vision fields rather than the target/Mirror layer geometry.
+        hf_config = self.model_config.hf_text_config
         num_target_layers = int(
             getattr(hf_config, "num_target_hidden_layers", hf_config.num_hidden_layers)
         )
@@ -1686,6 +1694,17 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            # An EXTEND on either DP group must keep every participant out of
+            # the early decode return so they reach the same prefill vote.
+            prefill_adapter = getattr(
+                self.prefill_cuda_graph_runner, "welm_adapter", None
+            )
+            if (
+                getattr(prefill_adapter, "is_dp", False)
+                and forward_batch.is_extend_in_batch
+            ):
+                can_run_graph = False
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
@@ -1701,6 +1720,13 @@ class ModelRunner:
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+            if (
+                getattr(prefill_adapter, "is_dp", False)
+                and forward_batch.is_extend_in_batch
+            ):
+                self.prefill_cuda_graph_runner.prepare_welm_dp_graph_ticket(
+                    forward_batch
+                )
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.

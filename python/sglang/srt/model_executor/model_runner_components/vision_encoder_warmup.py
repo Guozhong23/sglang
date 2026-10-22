@@ -86,7 +86,8 @@ def checked_profile_plan(profile, spec, group):
 
 def _gather_status(group, status):
     peers = [None] * group.world_size
-    torch.distributed.all_gather_object(peers, status, group=group.cpu_group)
+    with torch.inference_mode(False):
+        torch.distributed.all_gather_object(peers, status, group=group.cpu_group)
     if [peer["rank"] for peer in peers] != list(range(group.world_size)):
         raise ValueError("Vision warmup status does not cover the vision group")
     return peers
@@ -143,6 +144,10 @@ def log_warmup_memory(runner, stage):
         pid=os.getpid(),
         device=str(runner.model.vision_encoder.device),
         rank=runner.model._vision_dp_group.rank_in_group,
+        global_rank=runner.model._vision_dp_group.ranks[
+            runner.model._vision_dp_group.rank_in_group
+        ],
+        group_ranks=list(runner.model._vision_dp_group.ranks),
         allocated_bytes=device.memory_allocated(),
         reserved_bytes=device.memory_reserved(),
         peak_allocated_bytes=device.max_memory_allocated(),
@@ -177,7 +182,15 @@ def maybe_warmup_vision_encoder(runner):
     elif (
         args.nnodes != 1
         or ps.pp_size != 1
-        or ps.dp_size != 1
+        or (
+            ps.dp_size != 1
+            and not (
+                args.enable_dp_attention
+                and ps.tp_size == 4
+                and ps.dp_size == 2
+                and ps.attn_tp_size == 2
+            )
+        )
         or ps.attn_cp_size != 1
         or ps.dcp_size != 1
     ):
@@ -192,13 +205,14 @@ def maybe_warmup_vision_encoder(runner):
     if group.world_size == 1:
         logger.info("Vision DP warmup skipped: single_rank")
         return
+    attention_group = runner.attention_tp_group
     if (
-        group.world_size != ps.tp_size
-        or group.world_size != ps.attn_tp_size
-        or list(group.ranks) != list(runner.tp_group.ranks)
+        group.world_size != ps.attn_tp_size
+        or list(group.ranks) != list(attention_group.ranks)
+        or group.rank_in_group != attention_group.rank_in_group
     ):
         raise ValueError(
-            "Vision warmup requires the complete single-node text TP group"
+            "Vision warmup requires the request's complete attention-TP group"
         )
     encoder, projector = model.vision_encoder, model.vision_projector
     spec = encoder.vision_dp_input_spec
@@ -358,6 +372,8 @@ def run_vision_dp_warmup(
                 profile=profile.name,
                 iteration=iteration,
                 rank=group.rank_in_group,
+                global_rank=group.ranks[group.rank_in_group],
+                group_ranks=list(group.ranks),
                 pid=os.getpid(),
                 device=str(encoder.device),
                 images=len(owned_grids),

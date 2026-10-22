@@ -39,7 +39,17 @@ def resolve_vision_parallel_group(config, use_data_parallel=False, max_patches=0
     from sglang.srt.distributed import get_attn_tp_group, get_tp_group
     from sglang.srt.environ import envs
 
-    group = get_tp_group()
+    tp_group = get_tp_group()
+    attn_group = get_attn_tp_group()
+    mode = vision_parallel_mode(dp)
+    if list(attn_group.ranks) != list(tp_group.ranks) and mode != "dp":
+        raise ValueError(
+            "WeLM attention DP requires --mm-enable-dp-encoder; "
+            "vision TP and Ulysses across different request groups are unsupported"
+        )
+    # Each attention-DP shard owns different requests. Settings, cache consensus,
+    # ownership and embedding gather must all stay within that request's group.
+    group = attn_group if mode == "dp" else tp_group
     graph = envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
     settings = (
         raw_sp,
@@ -59,17 +69,11 @@ def resolve_vision_parallel_group(config, use_data_parallel=False, max_patches=0
         )
         if any(peer != settings for peer in peer_settings):
             raise ValueError("WeLM vision parallel settings differ across TP ranks")
-    mode = vision_parallel_mode(dp)
     if mode == "tp":
         return None, None
     if graph or (mode == "ulysses" and use_data_parallel):
         raise ValueError(
             "Vision parallel modes do not support vision graphs or Ulysses with replicated encoder DP"
-        )
-    attn_group = get_attn_tp_group()
-    if list(attn_group.ranks) != list(group.ranks):
-        raise ValueError(
-            "Vision parallel modes require identical attention-TP and TP ranks"
         )
     if config.hidden_size % config.num_attention_heads:
         raise ValueError("Vision hidden_size must be divisible by attention heads")

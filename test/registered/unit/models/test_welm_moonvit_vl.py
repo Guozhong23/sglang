@@ -390,10 +390,12 @@ def test_moonvit_architecture_reaches_vl_ep_validator():
             "is_npu": lambda: True,
             "parse_connector_type": lambda path: "local",
             "ConnectorType": SimpleNamespace(INSTANCE="instance"),
+            "resolved_view": lambda args: args,
         },
     )["_validate_welm_dp_attention_capabilities"]
     args = SimpleNamespace(
         model_path="checkpoint",
+        enable_dp_attention=False,
         get_model_config=lambda: SimpleNamespace(
             hf_config=SimpleNamespace(
                 architectures=["WeLMMoonViTVLForConditionalGeneration"]
@@ -405,7 +407,9 @@ def test_moonvit_architecture_reaches_vl_ep_validator():
     args._validate_welm_vlm_parallel_config.assert_called_once_with()
 
 
-@pytest.mark.parametrize("tp,rank", [(1, 0), *[(4, rank) for rank in range(4)]])
+@pytest.mark.parametrize(
+    "tp,rank", [(1, 0), *[(tp, rank) for tp in (2, 4) for rank in range(tp)]]
+)
 def test_checkpoint_packed_vision_qkv_uses_real_tp_or_dp_loader(tp, rank):
     from types import MethodType
 
