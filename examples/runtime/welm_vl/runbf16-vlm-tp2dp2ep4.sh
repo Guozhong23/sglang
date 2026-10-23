@@ -78,7 +78,7 @@ export TRITON_DEBUG=0
 
 export DEEP_USE_MODE="default"
 export SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=1
-export SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER=1
+export SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER="${SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER:-0}"
 
 export SGLANG_NPU_WELMV4_FUSED_QKV=1
 
@@ -88,8 +88,8 @@ export WELM_NPU_USE_MEGAMOE=1
 export WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT=1
 export WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD=512
 
-export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS=1024
-export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS=2
+export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS="${SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS:-1024}"
+export SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS="${SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS:-2}"
 
 export SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS=512
 export SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS=4
@@ -105,15 +105,25 @@ export SGLANG_VLM_VISION_METADATA_CACHE=1
 
 MODEL_PATH="${MODEL_PATH:-/data2/hw_zjw/sys_vlm/00_weights/welm_vlm_v1_1015/}"
 
+GLOBAL_CHUNK_TOKENS="${GLOBAL_CHUNK_TOKENS:-16384}"
+PREFILL_GRAPH_MAX_TOKENS="${PREFILL_GRAPH_MAX_TOKENS:-8192}"
+PREFILL_GRAPH_BUCKETS="${PREFILL_GRAPH_BUCKETS:-64,128,256,512,1024,1536,2048,2560,3072,4096,5120,6144,7168,8192}"
+# Each new device path is opt-in until four-rank correctness is verified.
+export SGLANG_NPU_WELMV4_DP_FUSED_QKV="${SGLANG_NPU_WELMV4_DP_FUSED_QKV:-0}"
+export SGLANG_WELMV4_DP_FUSED_PACK="${SGLANG_WELMV4_DP_FUSED_PACK:-0}"
+export SGLANG_WELMV4_DP_REPLICA_ALLGATHER="${SGLANG_WELMV4_DP_REPLICA_ALLGATHER:-0}"
+export SGLANG_WELMV4_DP_PREFILL_IDLE_GRAPH="${SGLANG_WELMV4_DP_PREFILL_IDLE_GRAPH:-0}"
+export SGLANG_WELMV4_DP_SCRATCH_CACHE="${SGLANG_WELMV4_DP_SCRATCH_CACHE:-0}"
+export SGLANG_WELMV4_DP_PROFILE_RANGES="${SGLANG_WELMV4_DP_PROFILE_RANGES:-0}"
 # Capture token buckets are per attention-DP group.
 # 16384 / DP2 = 8192, divisible by page-size 128.
-# A single active DP group uses eager prefill; concurrent nonempty EXTEND
-# groups use the common captured token/request buckets.
+# Enable SGLANG_WELMV4_DP_PREFILL_IDLE_GRAPH for mask01/10 captures;
+# mask11 stays enabled with PREFILL_GRAPH=1.
 export SGLANG_SCHEDULER_SKIP_ALL_GATHER=0
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=0
 export SGLANG_DEEPEP_NORMAL_USE_ALLTOALL=0
 if [[ "${PREFILL_GRAPH}" == "1" ]]; then
-    GRAPH_CONFIG='{"prefill":{"backend":"breakable","max_bs":8192,"bs":[64,128,256,512,1024,1536,2048,2560,3072,4096,5120,6144,7168,8192]}}'
+    GRAPH_CONFIG="{\"prefill\":{\"backend\":\"breakable\",\"max_bs\":${PREFILL_GRAPH_MAX_TOKENS},\"bs\":[${PREFILL_GRAPH_BUCKETS}]}}"
 elif [[ "${PREFILL_GRAPH}" == "0" ]]; then
     GRAPH_CONFIG='{"prefill":{"backend":"disabled"}}'
 else
@@ -121,6 +131,9 @@ else
     exit 2
 fi
 
+printf 'WeLM TP2DP2EP4: global_chunk=%s per_dp_chunk=%s graph_max=%s MC2=%s pipeline=%s\n' \
+    "${GLOBAL_CHUNK_TOKENS}" "$((GLOBAL_CHUNK_TOKENS / 2))" "${PREFILL_GRAPH_MAX_TOKENS}" \
+    "${SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER}" "${SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS}"
 python -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --device npu \
@@ -145,7 +158,7 @@ python -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --enable-multimodal \
     --enable-kv-mirror \
-    --chunked-prefill-size 16384 \
+    --chunked-prefill-size "${GLOBAL_CHUNK_TOKENS}" \
     --enable-over-encoding \
     --max-running-requests 128 \
     --swa-full-tokens-ratio 0.8 \

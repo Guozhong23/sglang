@@ -123,6 +123,9 @@ class WelmDpRowView:
     _attn_scattered_invalid_mask: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
+    _replica_gather_input: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _replicate_gather_buffer: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -841,6 +844,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     welm_dp_all_active_ordinary_prefill: bool = False
     welm_dp_prefill_graph_candidate: bool = False
+    welm_dp_forward_modes_cpu: Optional[List[int]] = None
     welm_prefill_graph_ticket: Optional[Any] = None
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
@@ -1197,6 +1201,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 and not model_runner.is_draft_worker
                 and batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.IDLE)
             ),
+            welm_dp_forward_modes_cpu=batch.welm_dp_forward_modes_cpu,
             welm_dp_prefill_graph_candidate=(
                 batch.welm_dp_prefill_graph_candidate
                 and use_welm_dp_row_layout

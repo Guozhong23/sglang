@@ -6,6 +6,7 @@ This checks tensor aliasing and staging, not device graphs, Flash, or HCCL.
 """
 
 import copy
+from contextlib import nullcontext
 import dataclasses
 import logging
 import sys
@@ -71,9 +72,11 @@ namespace = load_nodes(
     {
         "torch": T,
         "WelmPrefillGraphAdapter": base["WelmPrefillGraphAdapter"],
+        "copy": copy,
         "ShapeKey": ShapeKey,
         "logger": logging.getLogger(__name__),
-        "ForwardMode": types.SimpleNamespace(EXTEND=1),
+        "ForwardMode": types.SimpleNamespace(EXTEND=1, IDLE=4),
+        "nullcontext": nullcontext,
         "DpPaddingMode": types.SimpleNamespace(MAX_LEN=MAX_LEN),
         "build_welm_dp_moe_row_layout": rows["build_welm_dp_moe_row_layout"],
     },
@@ -125,6 +128,8 @@ class CpuBackend:
 
 def make_adapter(dp_rank):
     obj = Adapter.__new__(Adapter)
+    obj.active_mask = 3
+    obj.active_masks = (3,)
     obj.dp_size, obj.dp_rank, obj.attn_tp_size, obj.attn_tp_rank = 2, dp_rank, 2, 0
     obj.ep, obj.ep_size, obj.prune, obj.pad_mirror = True, 4, True, True
     obj.max_tokens, obj.max_requests, obj.device = 128, 8, "cpu"
@@ -364,7 +369,7 @@ class TestTorchDpAdapter(unittest.TestCase):
             setattr(batch, name, None)
             self.assertFalse(obj.local_can_run(batch, 128, 4), name)
         batch = make_batch([30, 31])
-        del obj._row_layouts[("mirror", 4)]
+        del obj._row_layouts[("mirror", 4, 3)]
         self.assertFalse(obj.local_can_run(batch, 128, 4))
 
     def test_preflight_accepted_valid_batches_stage_with_real_torch(self):

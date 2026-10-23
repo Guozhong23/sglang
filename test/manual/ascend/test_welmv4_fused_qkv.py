@@ -11,7 +11,8 @@ is reported as SKIP; SDK import/compilation failures on NPU remain errors.
 
 The tests compare contiguous loads with per-row positions, including ragged
 prefill and target verify, and check dense outputs, raw mirror outputs and KV
-scatter. They do not establish independent GEMM/norm/RoPE accuracy or
+scatter. An exactly representable sparse golden also checks Q6/Q12 head offsets and
+invalid cache slots. These do not establish general GEMM/norm/RoPE accuracy or
 model/Graph correctness, and do not measure latency. Compiled callables are
 reused across M.
 """
@@ -55,11 +56,11 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             width: (torch.randn((width, 2048), device=cls.device) * 0.02).to(
                 torch.bfloat16
             )
-            for width in (2048, 2560)
+            for width in (2048, 2560, 3584, 4096)
         }
-        cls.gamma = (
-            1 + 0.1 * torch.randn((1, 256), device=cls.device)
-        ).to(torch.bfloat16)
+        cls.gamma = (1 + 0.1 * torch.randn((1, 256), device=cls.device)).to(
+            torch.bfloat16
+        )
         angle = (
             torch.arange(cls.MAX_POSITION, dtype=torch.float32, device=cls.device)[
                 :, None
@@ -121,8 +122,9 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         torch = self.torch
         hidden, positions, slots = inputs
         m = hidden.shape[0]
-        mirror_m = m if width == 2560 else 1
-        shapes = ((m, 1536), (m, 256), (m, 256), (mirror_m, 256), (mirror_m, 256))
+        mirror_m = m if width in (2560, 4096) else 1
+        q_width = 3072 if width >= 3584 else 1536
+        shapes = ((m, q_width), (m, 256), (m, 256), (mirror_m, 256), (mirror_m, 256))
         # NaN catches missing dense writes; ordinary-layer mirror stand-ins
         # are intentionally unwritten and excluded from assertions.
         outputs = [
@@ -156,7 +158,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         # Test assertions run on CPU, outside the operator execution.
         result = [tensor.cpu() for tensor in outputs + caches]
         for i, name in enumerate(self.OUTPUT_NAMES):
-            if width == 2048 and name.startswith("mirror"):
+            if width in (2048, 3584) and name.startswith("mirror"):
                 continue
             self.assertTrue(torch.isfinite(result[i]).all().item(), name)
         self._check_cache(result, slots.cpu())
@@ -177,7 +179,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
 
     def _assert_equal(self, width, reference, actual):
         for i, name in enumerate(self.OUTPUT_NAMES):
-            if width == 2048 and name.startswith("mirror"):
+            if width in (2048, 3584) and name.startswith("mirror"):
                 continue
             self.torch.testing.assert_close(
                 actual[i], reference[i], rtol=0, atol=0, msg=name
@@ -202,7 +204,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                 "contiguous",
                 (hidden[start:end], positions[start:end], slots[start:end]),
             )
-            for i in range(5 if width == 2560 else 3):
+            for i in range(5 if width in (2560, 4096) else 3):
                 self.torch.testing.assert_close(
                     packed[i][start:end],
                     reference[i],
@@ -211,8 +213,64 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                     msg=f"request={request}, {self.OUTPUT_NAMES[i]}",
                 )
 
+    def test_head_offsets_and_invalid_slots_against_independent_golden(self):
+        # Exactly representable sparse GEMM: head j contains j+1, identity
+        # RoPE, unit gamma. K normalizes to BF16 1; V and mirror stay raw.
+        # This independently catches Q7/Q8 misidentified as K/V in Q12.
+        torch = self.torch
+        old_weights, old_gamma, old_cs = self.weights, self.gamma, self.cos_sin
+        try:
+            self.weights = {}
+            self.gamma = torch.ones_like(old_gamma)
+            self.cos_sin = torch.zeros_like(old_cs)
+            self.cos_sin[:, :32] = 1
+            for width in (2048, 2560, 3584, 4096):
+                heads = 12 if width >= 3584 else 6
+                weight = torch.zeros_like(old_weights[width])
+                for unit in range(width // 256):
+                    weight[unit * 256 : (unit + 1) * 256, 0] = unit + 1
+                self.weights[width] = weight
+                for m in (1, 2, 255, 256, 257, 511, 512, 513):
+                    hidden = torch.zeros(
+                        m, 2048, dtype=torch.bfloat16, device=self.device
+                    )
+                    hidden[:, 0] = 1
+                    positions = torch.zeros(m, dtype=torch.int64, device=self.device)
+                    for all_invalid in (False, True):
+                        with self.subTest(width=width, m=m, all_invalid=all_invalid):
+                            slots = torch.arange(1, m + 1, device=self.device)
+                            if all_invalid:
+                                slots.fill_(-1)
+                            else:
+                                slots[::2] = -1
+                            out = self._invoke(width, "row", (hidden, positions, slots))
+                            expected_q = torch.arange(1, heads + 1).repeat_interleave(
+                                256
+                            )
+                            expected_q = expected_q.to(torch.bfloat16).expand(m, -1)
+                            torch.testing.assert_close(
+                                out[0], expected_q, rtol=0, atol=0
+                            )
+                            for i, value in ((1, 1), (2, heads + 2)):
+                                torch.testing.assert_close(
+                                    out[i],
+                                    torch.full_like(out[i], value),
+                                    rtol=0,
+                                    atol=0,
+                                )
+                            if width in (2560, 4096):
+                                for i, value in ((3, heads + 3), (4, heads + 4)):
+                                    torch.testing.assert_close(
+                                        out[i],
+                                        torch.full_like(out[i], value),
+                                        rtol=0,
+                                        atol=0,
+                                    )
+        finally:
+            self.weights, self.gamma, self.cos_sin = old_weights, old_gamma, old_cs
+
     def test_contiguous_prefill_matches_row_positions(self):
-        for width in (2048, 2560):
+        for width in (2048, 2560, 3584, 4096):
             for m, pad in ((1, False), (129, False), (129, True), (641, True)):
                 with self.subTest(width=width, m=m, pad=pad):
                     self._compare_modes(
@@ -232,7 +290,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             (0, 641, 0),
             (1,) * 641,
         )
-        for width in (2048, 2560):
+        for width in (2048, 2560, 3584, 4096):
             for case_id, lengths in enumerate(cases):
                 with self.subTest(width=width, case=case_id, m=sum(lengths)):
                     self._compare_requests(width, lengths)
@@ -240,7 +298,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
     def test_target_verify_positions_match_per_request_contiguous(self):
         # Verify packs B independent D-token runs. The combined call must use
         # per-row positions even though each individual request is contiguous.
-        for width in (2048, 2560):
+        for width in (2048, 2560, 3584, 4096):
             for bs, draft_tokens in ((1, 2), (2, 3), (56, 2), (56, 3)):
                 with self.subTest(width=width, bs=bs, draft_tokens=draft_tokens):
                     inputs = self._inputs((draft_tokens,) * bs, pad=False)
@@ -258,7 +316,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                                 slots[start:end],
                             ),
                         )
-                        for i in range(5 if width == 2560 else 3):
+                        for i in range(5 if width in (2560, 4096) else 3):
                             self.torch.testing.assert_close(
                                 packed[i][start:end],
                                 reference[i],
@@ -268,7 +326,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                             )
 
     def test_cos_sin_table_tail(self):
-        for width in (2048, 2560):
+        for width in (2048, 2560, 3584, 4096):
             with self.subTest(width=width, mode="contiguous"):
                 self._compare_modes(
                     width,
@@ -285,7 +343,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                 )
 
     def test_arbitrary_decode_positions_and_repeated_launch(self):
-        for width in (2048, 2560):
+        for width in (2048, 2560, 3584, 4096):
             for m in (1, 2, 56):
                 with self.subTest(width=width, m=m):
                     inputs = self._inputs(

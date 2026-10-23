@@ -2054,6 +2054,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     welm_dp_all_active_ordinary_prefill: bool = False
     welm_dp_prefill_graph_candidate: bool = False
+    welm_dp_forward_modes_cpu: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -2305,6 +2306,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self):
         self.welm_dp_all_active_ordinary_prefill = False
         self.welm_dp_prefill_graph_candidate = False
+        self.welm_dp_forward_modes_cpu = None
         self.forward_mode = ForwardMode.EXTEND
         server_args = get_server_args()
 
@@ -2866,6 +2868,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_idle(self):
         self.welm_dp_all_active_ordinary_prefill = False
         self.welm_dp_prefill_graph_candidate = False
+        self.welm_dp_forward_modes_cpu = None
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -2977,6 +2980,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.welm_dp_all_active_ordinary_prefill = False
         self.welm_dp_prefill_graph_candidate = False
+        self.welm_dp_forward_modes_cpu = None
         self.forward_mode = ForwardMode.DECODE
         server_args = get_server_args()
         # Decode embeds the last output token via embed_tokens; clear the stale

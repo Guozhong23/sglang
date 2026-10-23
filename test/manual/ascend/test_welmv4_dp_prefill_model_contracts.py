@@ -6,7 +6,9 @@ ordering. These tests do not validate device kernels or HCCL capture.
 
 import ast
 import copy
+from contextlib import nullcontext
 import math
+import runpy
 import sys
 import unittest
 from pathlib import Path
@@ -15,9 +17,13 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "python/sglang/srt/models/welmv4_dp_attention.py"
+WelmOProjPolicy = runpy.run_path(str(SOURCE.with_name("welm_oproj_policy.py")))[
+    "WelmOProjPolicy"
+]
 
 
 def load_method(name, namespace, *, path=SOURCE, class_name="WelmDpAttentionExecutor"):
+    namespace.setdefault("nullcontext", nullcontext)
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if getattr(n, "name", "") == class_name)
     method = copy.deepcopy(next(n for n in cls.body if getattr(n, "name", "") == name))
@@ -123,6 +129,9 @@ class ModelContracts(unittest.TestCase):
             calls = []
             executor = NS(
                 runner_plan=NS(
+                    replica_dp_group=None,
+                    fused_pack=False,
+                    oproj_policy=WelmOProjPolicy(),
                     finalized=True,
                     first_mirror_consumer=33,
                     attn_tp_size=2,
@@ -178,7 +187,13 @@ class ModelContracts(unittest.TestCase):
     def test_full_residual_handoff_has_no_shard_assumption(self):
         fn = load_method("prepare_graph_mirror_handoff", {"torch": TORCH})
         executor = NS(
-            runner_plan=NS(finalized=True, first_mirror_consumer=33),
+            runner_plan=NS(
+                replica_dp_group=None,
+                fused_pack=False,
+                oproj_policy=WelmOProjPolicy(),
+                finalized=True,
+                first_mirror_consumer=33,
+            ),
             _input_is_scattered=lambda **kw: False,
             _prepare_attention_input=lambda **kw: (kw["hidden_states"], kw["residual"]),
             _assert_fp32_residual=lambda t: self.assertEqual(t.dtype, "float32"),
@@ -208,7 +223,7 @@ class ModelContracts(unittest.TestCase):
             {
                 "WelmRunnerRole": ROLE,
                 "WelmMoeTransport": TRANSPORT,
-                "welm_dp_prepare_full_transport_scratch": lambda view, hidden: calls.append(
+                "welm_dp_prepare_full_transport_scratch": lambda view, hidden, **kw: calls.append(
                     ("full", view.local_slot_rows)
                 ),
                 "welm_dp_prepare_attn_scattered_transport_scratch": lambda *a, **kw: self.fail(
@@ -227,7 +242,12 @@ class ModelContracts(unittest.TestCase):
         )
         executor = NS(
             runner_plan=NS(
-                finalized=True, role=ROLE.TARGET_DP, first_mirror_consumer=33
+                replica_dp_group=None,
+                fused_pack=False,
+                oproj_policy=WelmOProjPolicy(),
+                finalized=True,
+                role=ROLE.TARGET_DP,
+                first_mirror_consumer=33,
             )
         )
         fn(executor, forward_batch=batch, hidden_states=NS(dim=lambda: 2))
@@ -278,6 +298,9 @@ class ModelContracts(unittest.TestCase):
 
             executor = NS(
                 runner_plan=NS(
+                    replica_dp_group=None,
+                    fused_pack=False,
+                    oproj_policy=WelmOProjPolicy(),
                     finalized=True,
                     first_mirror_consumer=33,
                     role=ROLE.TARGET_DP,
@@ -305,7 +328,11 @@ class ModelContracts(unittest.TestCase):
                 welm_dp_moe_row_layout=rows,
                 is_extend_in_batch=True,
                 enable_kv_mirror=True,
-                welm_prefill_graph=NS(is_dp=True, mirror_residual_is_partial=True),
+                welm_prefill_graph=NS(
+                    is_dp=True,
+                    mirror_residual_is_partial=True,
+                    is_idle_role=lambda batch: False,
+                ),
                 welm_prefill_graph_phase="mirror",
                 _original_forward_mode=None,
                 forward_mode=NS(
@@ -356,7 +383,14 @@ class ModelContracts(unittest.TestCase):
 
         layer = NS(mlp=MLP(), is_final_layer=False)
         executor = NS(
-            runner_plan=NS(outer_target_dp_rank=0, attn_tp_rank=0, attn_tp_size=2),
+            runner_plan=NS(
+                replica_dp_group=None,
+                fused_pack=False,
+                oproj_policy=WelmOProjPolicy(),
+                outer_target_dp_rank=0,
+                attn_tp_rank=0,
+                attn_tp_size=2,
+            ),
             _store_final_components=lambda layer, x: x,
         )
         state = NS(
@@ -410,6 +444,9 @@ class ModelContracts(unittest.TestCase):
                 get_moe_ep_normal_comm_group=lambda: "NORMAL-EP4"
             ),
         }
+        modules["sglang.srt.distributed.parallel_state"] = NS(
+            get_welm_replica_dp_group=lambda: None
+        )
         for arch in (
             "WeLMV4VLMForConditionalGeneration",
             "WeLMMoonViTVLForConditionalGeneration",
@@ -458,7 +495,13 @@ class ModelContracts(unittest.TestCase):
         )
         group = NS(all_reduce=lambda x: calls.append("residual-AR") or x)
         executor = NS(
-            runner_plan=NS(attn_tp_group=group), _assert_fp32_residual=lambda x: None
+            runner_plan=NS(
+                replica_dp_group=None,
+                fused_pack=False,
+                oproj_policy=WelmOProjPolicy(),
+                attn_tp_group=group,
+            ),
+            _assert_fp32_residual=lambda x: None,
         )
         hidden = Tensor([[1], [0]], "bf16")
         residual = Tensor([[2], [0]])

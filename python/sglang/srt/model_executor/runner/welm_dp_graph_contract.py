@@ -16,6 +16,9 @@ class WelmPrefillGraphTicket:
     token_rows: tuple[int, ...] = ()
     request_rows: tuple[int, ...] = ()
     reason: str = ""
+    active_mask: int = 0
+    phases: tuple[int, ...] = ()
+    kernel_variant: int = 0
 
     def vote_record(self, local_allowed: bool) -> tuple[int, ...]:
         # Fixed width even for missing metadata: every participating rank must
@@ -26,6 +29,9 @@ class WelmPrefillGraphTicket:
             int(self.allowed and local_allowed),
             self.token_capacity,
             self.request_capacity,
+            self.active_mask,
+            self.kernel_variant,
+            *(self.phases if len(self.phases) == 2 else (0, 0)),
             *tokens,
             *requests,
         )
@@ -39,17 +45,40 @@ def select_welm_dp_prefill_ticket(
     token_buckets: Sequence[int],
     request_buckets: Sequence[int],
     token_alignment: int = 2,
+    phases: Sequence[int] | None = None,
+    kernel_variant: int = 0,
 ) -> WelmPrefillGraphTicket:
     """Choose shared capacities from unpadded scheduler counts, never local T/B."""
     tokens = tuple(int(x) for x in token_rows) if token_rows is not None else ()
     requests = tuple(int(x) for x in request_rows) if request_rows is not None else ()
-    ticket = WelmPrefillGraphTicket(False, token_rows=tokens, request_rows=requests)
+    modes = (
+        tuple(int(x) for x in phases)
+        if phases is not None
+        else ((1, 1) if all_extend else (0, 0))
+    )
+    ticket = WelmPrefillGraphTicket(
+        False,
+        token_rows=tokens,
+        request_rows=requests,
+        phases=modes,
+        kernel_variant=kernel_variant,
+    )
     if len(tokens) != 2 or len(requests) != 2:
         return replace(ticket, reason="missing_dp_counts")
+    # ForwardMode.EXTEND=1 and IDLE=4 are serialized by the scheduler.
+    if len(modes) != 2 or any(mode not in (1, 4) for mode in modes):
+        return replace(ticket, reason="mixed_phase")
+    active_mask = 0
+    for d, (t, b, mode) in enumerate(zip(tokens, requests, modes)):
+        if mode == 1 and 0 < b <= t:
+            active_mask |= 1 << d
+        elif not (mode == 4 and t == b == 0):
+            return replace(ticket, reason="invalid_real_counts")
+    ticket = replace(ticket, active_mask=active_mask)
+    if not active_mask:
+        return replace(ticket, reason="all_idle")
     if not all_extend:
-        return replace(ticket, reason="inactive_or_mixed_phase")
-    if any(t <= 0 or b <= 0 or b > t for t, b in zip(tokens, requests)):
-        return replace(ticket, reason="invalid_real_counts")
+        return replace(ticket, reason="scheduler_ineligible")
     if token_alignment <= 0:
         raise ValueError("WeLM DP graph token alignment must be positive")
     tcap = next(
@@ -71,7 +100,7 @@ def agree_welm_dp_prefill_ticket(
     votes: Sequence[Sequence[int]],
 ) -> WelmPrefillGraphTicket:
     """Require all four ranks to agree on eligibility, shape and real counts."""
-    if len(votes) != 4 or any(len(vote) != 7 for vote in votes):
+    if len(votes) != 4 or any(len(vote) != 11 for vote in votes):
         raise ValueError("WeLM TP2DP2EP4 admission requires four fixed-width votes")
     expected = ticket.vote_record(True)
     if any(tuple(vote[1:]) != expected[1:] for vote in votes):

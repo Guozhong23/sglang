@@ -360,10 +360,14 @@ class TestSplitGraphContracts(unittest.TestCase):
     def test_model_phase_entry_runs_embedding_only_in_prompt_and_stops_at_consumer(self):
         events = []
         forward = load_method(
-            SRT / "models/welmv4.py", "Qwen2MoeModel", "forward",
-            {"get_global_expert_distribution_recorder": lambda: types.SimpleNamespace(
-                with_current_layer=lambda i: nullcontext()
-            )},
+            SRT / "models/welmv4.py",
+            "Qwen2MoeModel",
+            "_forward_impl",
+            {
+                "get_global_expert_distribution_recorder": lambda: types.SimpleNamespace(
+                    with_current_layer=lambda i: nullcontext()
+                )
+            },
         )
 
         class Layer:
@@ -403,7 +407,8 @@ class TestSplitGraphContracts(unittest.TestCase):
     def test_capture_loop_is_sum_not_product_and_largest_mirror_first(self):
         capture = load_method(
             SRT / "model_executor/runner/prefill_cuda_graph_runner.py",
-            "PrefillCudaGraphRunner", "_capture_one_stream",
+            "PrefillCudaGraphRunner",
+            "_capture_one_role",
             {
                 "get_available_gpu_memory": lambda *a, **kw: 100,
                 "get_parallel": lambda: types.SimpleNamespace(tp_rank=1),

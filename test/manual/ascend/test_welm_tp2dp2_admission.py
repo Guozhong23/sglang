@@ -55,7 +55,11 @@ def load_nodes(path, names, namespace, class_name=None):
 RUNNER = load_nodes(
     SRT / "model_executor/runner/prefill_cuda_graph_runner.py",
     ["prepare_welm_dp_graph_ticket", "_validate_welm_dp_manifest", "can_run_graph"],
-    {"torch": torch, "logger": logging.getLogger(__name__)},
+    {
+        "torch": torch,
+        "logger": logging.getLogger(__name__),
+        "nullcontext": contextlib.nullcontext,
+    },
     class_name="PrefillCudaGraphRunner",
 )
 
@@ -84,6 +88,7 @@ def _gloo_admission_worker(rank, init_method):
             model_runner=NS(tp_group=group),
             capture_num_tokens=(64, 128, 256),
             enable_lora=False,
+            capture_hidden_mode=0,
             can_replay_locally=lambda **kw: True,
         )
         with torch.inference_mode():
@@ -93,7 +98,8 @@ def _gloo_admission_worker(rank, init_method):
             "rank_reject",
             "bucket_disagree",
             "counts_disagree",
-            "idle",
+            "idle0",
+            "idle1",
             "decode",
             "valid_again",
         ]
@@ -101,8 +107,10 @@ def _gloo_admission_worker(rank, init_method):
             tokens, requests = (123, 61), (3, 1)
             candidate = True
             runner.capture_num_tokens = (64, 128, 256)
-            if case == "idle":
-                tokens, requests, candidate = (123, 0), (3, 0), False
+            if case == "idle0":
+                tokens, requests = (123, 0), (3, 0)
+            if case == "idle1":
+                tokens, requests = (0, 123), (0, 3)
             if case == "decode":
                 tokens, requests, candidate = (123, 1), (3, 1), False
             reported_tokens = (
@@ -110,7 +118,7 @@ def _gloo_admission_worker(rank, init_method):
             )
             if case == "bucket_disagree" and rank == 3:
                 runner.capture_num_tokens = (256,)
-            adapter.local_can_run = lambda batch, tcap, bcap: not (
+            adapter.local_can_run = lambda batch, tcap, bcap, **kw: not (
                 case == "rank_reject" and rank == 3
             )
             t, b = tokens[dp_rank], requests[dp_rank]
@@ -119,6 +127,11 @@ def _gloo_admission_worker(rank, init_method):
                 welm_dp_raw_rows_cpu=reported_tokens,
                 global_num_requests_cpu=requests,
                 welm_dp_prefill_graph_candidate=candidate,
+                welm_dp_forward_modes_cpu=(
+                    (1, 2)
+                    if case == "decode"
+                    else tuple(1 if t else 4 for t in reported_tokens)
+                ),
                 extend_seq_lens_cpu=lengths,
                 batch_size=b,
                 input_ids=torch.zeros(t, dtype=torch.long),
@@ -133,12 +146,15 @@ def _gloo_admission_worker(rank, init_method):
             with torch.inference_mode():
                 RUNNER["prepare_welm_dp_graph_ticket"](runner, batch)
             ticket = batch.welm_prefill_graph_ticket
-            expected = case in ("valid", "valid_again")
+            expected = case in ("valid", "valid_again", "idle0", "idle1")
             assert ticket.allowed == expected, (rank, case, ticket)
             assert RUNNER["can_run_graph"](runner, batch) == expected
             if expected:
                 assert (ticket.token_capacity, ticket.request_capacity) == (128, 4)
                 assert ticket.token_rows == tokens and ticket.request_rows == requests
+                assert ticket.active_mask == sum(
+                    1 << d for d, t in enumerate(tokens) if t
+                )
         # A manifest mismatch must fail on every rank, before graph capture.
         adapter.manifest = lambda: {"kind": "different" if rank == 3 else "test"}
         try:
@@ -171,9 +187,10 @@ class TestAdmission(unittest.TestCase):
         )["_forward_raw"]
         cases = (
             ("decode", False, True, ["decode"]),
-            ("decode", True, True, ["prepare", "vote", "eager"]),
-            ("idle", True, True, ["prepare", "vote", "eager"]),
-            ("extend", True, True, ["prepare", "vote", "prefill"]),
+            ("decode", False, True, ["prepare", "eager"]),
+            ("decode", True, True, ["vote", "prepare", "eager"]),
+            ("idle", True, True, ["vote", "prefill"]),
+            ("extend", True, True, ["vote", "prefill"]),
             ("decode", True, False, ["decode"]),
         )
         for local_mode, has_extend, is_dp, expected in cases:
@@ -189,12 +206,16 @@ class TestAdmission(unittest.TestCase):
                     ),
                     is_extend_in_batch=has_extend,
                     global_num_tokens_cpu=None,
-                    welm_prefill_graph_ticket=None,
+                    welm_prefill_graph_ticket=(
+                        NS(allowed=True) if not has_extend else None
+                    ),
                 )
 
                 def vote(live):
                     events.append("vote")
-                    live.welm_prefill_graph_ticket = NS(allowed=local_mode == "extend")
+                    live.welm_prefill_graph_ticket = NS(
+                        allowed=local_mode in ("extend", "idle")
+                    )
 
                 prefill = NS(
                     welm_adapter=NS(is_dp=is_dp),
@@ -208,7 +229,7 @@ class TestAdmission(unittest.TestCase):
                     hisparse_coordinator=None,
                     prefill_cuda_graph_runner=prefill,
                     decode_cuda_graph_runner=NS(
-                        can_run_graph=lambda b: True,
+                        can_run_graph=lambda b: expected != ["prepare", "eager"],
                         execute=lambda *a, **kw: events.append("decode"),
                     ),
                     eager_runner=NS(execute=lambda *a, **kw: events.append("eager")),
@@ -255,7 +276,7 @@ class TestAdmission(unittest.TestCase):
                 request_buckets=[1, 2, 4],
             )
             self.assertEqual(ticket.allowed, allowed)
-            self.assertEqual(len(ticket.vote_record(True)), 7)
+            self.assertEqual(len(ticket.vote_record(True)), 11)
 
     def test_request_storage_is_fixed_and_width_independent(self):
         max_mode = NS(is_max_len=lambda: True)

@@ -818,9 +818,13 @@ class Envs:
     SGLANG_DEEPEP_NORMAL_USE_ALLTOALL = EnvBool(False)
     SGLANG_DEEPEP_NORMAL_USE_ALLGATHER = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
-    SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = (
-        EnvInt(None)
-    )
+    SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
+    # Opt-in WeLM TP2DP2EP4 variants; capture again after changing any switch.
+    SGLANG_WELMV4_DP_SCRATCH_CACHE = EnvBool(False)
+    SGLANG_WELMV4_DP_PROFILE_RANGES = EnvBool(False)
+    SGLANG_WELMV4_DP_FUSED_PACK = EnvBool(False)
+    SGLANG_WELMV4_DP_REPLICA_ALLGATHER = EnvBool(False)
+    SGLANG_WELMV4_DP_PREFILL_IDLE_GRAPH = EnvBool(False)
     SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = EnvBool(False)
     # An enabled pipeline with fewer than two chunks follows the fusion switch
     # above: fused MM+RS when enabled, ordinary MM + RS otherwise.

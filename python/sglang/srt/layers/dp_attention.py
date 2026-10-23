@@ -1087,6 +1087,8 @@ def _welm_prepare_idle_buffers(
 def welm_dp_prepare_full_transport_scratch(
     row_view: "WelmDpRowView",
     like: torch.Tensor,
+    *,
+    replica: bool = False,
 ) -> None:
     """Prepare and refresh FULL/local-EP transport scratch before layers.
 
@@ -1112,6 +1114,11 @@ def welm_dp_prepare_full_transport_scratch(
             dtype=like.dtype,
             device=device,
             name="replicate-gather",
+        )
+
+    if replica and row_view._replica_gather_input is None:
+        row_view._replica_gather_input = like.new_empty(
+            (int(row_view.local_slot_rows), *like.shape[1:])
         )
 
     if row_view._segmented_positions is None:
@@ -1355,6 +1362,8 @@ def welm_dp_replicate_gather(
     dp_rank: int,
     contribute: bool,
     output: Optional[torch.Tensor] = None,
+    fused_pack: bool = False,
+    replica_dp_group: Optional[GroupCoordinator] = None,
 ) -> torch.Tensor:
     """Gather one replica per DP shard into fixed segmented slots.
 
@@ -1385,14 +1394,12 @@ def welm_dp_replicate_gather(
             raise RuntimeError(
                 "WeLMv4 cached gather output dtype/device does not match input"
             )
-        output.zero_()
     else:
         if tuple(output.shape) != expected_shape:
             raise RuntimeError(
                 "WeLMv4 DP gather output shape mismatch: "
                 f"{tuple(output.shape)} != {expected_shape}"
             )
-        output.zero_()
 
     local_slot_rows = int(row_view.local_slot_rows)
     if local_tokens.shape[0] > local_slot_rows:
@@ -1400,6 +1407,48 @@ def welm_dp_replicate_gather(
             "WeLMv4 local tensor exceeds its DP slot: "
             f"{local_tokens.shape[0]} > {local_slot_rows}"
         )
+    # Slot geometry is globally synchronized, so all ranks choose the same
+    # transport even when real rows differ or one DP is idle.
+    use_replica = (
+        replica_dp_group is not None
+        and len(row_view.slot_rows_cpu) == 2
+        and row_view.slot_rows_cpu[0] == row_view.slot_rows_cpu[1] > 0
+    )
+    if replica_dp_group is not None or fused_pack:
+        from sglang.srt.layers.welm_dp_pack import pack_dp_slot
+
+        if use_replica:
+            if (
+                replica_dp_group.world_size != 2
+                or replica_dp_group.rank_in_group != dp_rank
+            ):
+                raise RuntimeError(
+                    "WeLM replica-DP group order does not match DP slots"
+                )
+            packed = row_view._replica_gather_input
+            if packed is None or packed.shape[0] != local_slot_rows:
+                raise RuntimeError("WeLM replica gather scratch was not prepared")
+            pack_dp_slot(
+                packed,
+                local_tokens,
+                row_view.real_rows_gpu,
+                dp_rank,
+                0,
+                fused=fused_pack,
+            )
+            replica_dp_group.all_gather_into_tensor(output, packed)
+            return output
+        pack_dp_slot(
+            output,
+            local_tokens,
+            row_view.real_rows_gpu,
+            dp_rank,
+            int(row_view.slot_offsets_cpu[dp_rank]),
+            contribute=contribute,
+            fused=fused_pack,
+        )
+        return group.all_reduce(output) if global_rows else output
+    output.zero_()
     if contribute and local_tokens.shape[0] > 0:
         start = int(row_view.slot_offsets_cpu[dp_rank])
         output.narrow(0, start, local_tokens.shape[0]).copy_(local_tokens)

@@ -7,7 +7,7 @@ group creation remains the responsibility of the runner.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum, auto
@@ -34,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
     welm_reconstruct_attn_scattered_residual_rows,
 )
 from sglang.srt.layers.welmv4_op import mmq_style_norm_after_attn
+from sglang.srt.models.welm_oproj_policy import WelmOProjPolicy
 
 if TYPE_CHECKING:
     from sglang.srt.distributed import GroupCoordinator
@@ -89,6 +90,10 @@ class WelmRunnerParallelPlan:
     o_proj_returns_partial: bool = True
     first_mirror_consumer: Optional[int] = None
     finalized: bool = False
+    oproj_policy: WelmOProjPolicy = WelmOProjPolicy()
+    replica_dp_group: Optional["GroupCoordinator"] = None
+    fused_pack: bool = False
+    profile_ranges: bool = False
 
     @property
     def has_moe_ep(self) -> bool:
@@ -141,6 +146,7 @@ def build_welm_target_runner_plan(
     moe_tp_group: "GroupCoordinator",
     moe_ep_group: Optional["GroupCoordinator"] = None,
     moe_ep_normal_group: Optional["GroupCoordinator"] = None,
+    replica_dp_group: Optional["GroupCoordinator"] = None,
     normal_allgather_enabled: bool = False,
     local_ep_kernel_available: bool = False,
     shared_expert_ep_replicated: bool = False,
@@ -157,8 +163,26 @@ def build_welm_target_runner_plan(
     )
     if moe_ep_group is not None and int(moe_ep_group.world_size) <= 1:
         moe_ep_group = None
+    if replica_dp_group is not None:
+        _validate_group_rank_size(
+            name="replica-DP",
+            group=replica_dp_group,
+            rank=parallel_state.attn_dp_rank,
+            size=2,
+        )
+        lane = parallel_state.attn_tp_rank
+        if list(replica_dp_group.ranks) != [lane, lane + 2]:
+            raise ValueError("WeLM replica-DP groups must be [0,2] and [1,3]")
     return WelmRunnerParallelPlan(
         role=WelmRunnerRole.TARGET_DP,
+        replica_dp_group=replica_dp_group,
+        fused_pack=envs.SGLANG_WELMV4_DP_FUSED_PACK.get(),
+        profile_ranges=envs.SGLANG_WELMV4_DP_PROFILE_RANGES.get(),
+        oproj_policy=WelmOProjPolicy(
+            use_mc2=envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get(),
+            max_pipeline_chunks=envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get(),
+            min_chunk_tokens=envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get(),
+        ),
         attn_tp_group=attn_tp_group,
         moe_tp_group=moe_tp_group,
         moe_ep_group=moe_ep_group,
@@ -756,6 +780,23 @@ class WelmDpAttentionExecutor:
             if key in prepared:
                 continue
             prepared.add(key)
+            lease = getattr(forward_batch, "welm_dp_scratch_lease", None)
+            if lease is not None:
+                lease.bind(
+                    row_view,
+                    (
+                        transport,
+                        "mirror" if row_view is row_layout.request else "prompt",
+                        "idle" if row_view.local_real_rows == 0 else "active",
+                        tuple(row_view.slot_rows_cpu),
+                        hidden_states.dtype,
+                        hidden_states.device,
+                        tuple(hidden_states.shape[1:]),
+                        plan.attn_tp_rank,
+                        plan.attn_tp_size,
+                        plan.replica_dp_group is not None,
+                    ),
+                )
             if transport is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED:
                 welm_dp_prepare_attn_scattered_transport_scratch(
                     row_view,
@@ -765,7 +806,11 @@ class WelmDpAttentionExecutor:
                     attn_tp_size=plan.attn_tp_size,
                 )
             else:
-                welm_dp_prepare_full_transport_scratch(row_view, hidden_states)
+                welm_dp_prepare_full_transport_scratch(
+                    row_view, hidden_states, replica=plan.replica_dp_group is not None
+                )
+            if lease is not None:
+                lease.capture(row_view)
 
     def forward(
         self,
@@ -855,7 +900,9 @@ class WelmDpAttentionExecutor:
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
         mirror_row_indices = None
-        if is_dp_graph or active_view.local_real_rows > 0:
+        if (is_dp_graph and not graph.is_idle_role(forward_batch)) or (
+            not is_dp_graph and active_view.local_real_rows > 0
+        ):
             if later_mirror_prefill and not is_dp_graph:
                 # Trim before input norm: after the first mirror transition the
                 # MoE hidden output occupies the fixed request slot, while the
@@ -898,43 +945,25 @@ class WelmDpAttentionExecutor:
                     input_is_scattered=input_is_scattered,
                 )
 
-            max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
-            oproj_rs_pipeline_chunks = 0
-            use_fused_oproj_rs = False
-            # MAX_LEN may represent a logical decode shard as EXTEND. Only a
-            # real target prefill may replace this shard's original OProj path.
             local_forward_mode = (
                 getattr(forward_batch, "_original_forward_mode", None)
                 or forward_batch.forward_mode
             )
-            if (
-                not is_dp_graph
-                and max_chunks >= 2
-                and plan.role is WelmRunnerRole.TARGET_DP
-                and local_forward_mode.is_extend_without_speculative()
-                and is_non_consumer_attention_layer
-                and batch_plan.attention_finish
-                is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
-                and state.hidden_states.dtype == torch.bfloat16
-                and layer.self_attn.o_proj.weight.dtype == torch.bfloat16
-            ):
-                tp_size = plan.attn_tp_size
-                attention_num_rows = state.hidden_states.shape[0] * (
-                    tp_size if defer_hidden_all_gather else 1
-                )
-                min_chunk_tokens = max(
-                    1,
-                    envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get(),
-                )
-                local_rows = attention_num_rows // tp_size
-                min_local_rows = (min_chunk_tokens + tp_size - 1) // tp_size
-                actual_chunks = min(max_chunks, local_rows // min_local_rows)
-                if actual_chunks >= 2:
-                    oproj_rs_pipeline_chunks = actual_chunks
-                else:
-                    use_fused_oproj_rs = (
-                        envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
-                    )
+            oproj_rs_pipeline_chunks, use_fused_oproj_rs = plan.oproj_policy.select(
+                rows=state.hidden_states.shape[0]
+                * (plan.attn_tp_size if defer_hidden_all_gather else 1),
+                tp_size=plan.attn_tp_size,
+                is_dp_graph=is_dp_graph,
+                eligible=(
+                    plan.role is WelmRunnerRole.TARGET_DP
+                    and local_forward_mode.is_extend_without_speculative()
+                    and is_non_consumer_attention_layer
+                    and batch_plan.attention_finish
+                    is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
+                    and state.hidden_states.dtype == torch.bfloat16
+                    and layer.self_attn.o_proj.weight.dtype == torch.bfloat16
+                ),
+            )
             # Both pipeline and fused OProj already perform the attn-TP RS.
             oproj_output_is_reduce_scattered = (
                 oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
@@ -974,11 +1003,11 @@ class WelmDpAttentionExecutor:
                 ),
             )
         else:
-            # Eager idle only.  Skip norm/attention entirely and reuse the
-            # batch-owned typed scratch prepared before the layer loop. Graph
-            # capture uses a positive capture width and never records this
-            # Python branch.
+            # Eager idle or a captured static IDLE role. Keep positive
+            # transport capacity and FP32 residual; never run attention/KV.
             idle_hidden, idle_residual = welm_dp_idle_buffers(active_view)
+            idle_hidden.zero_()
+            idle_residual.zero_()
             idle_layout = (
                 WelmDpLayout.EP_SCATTERED
                 if batch_plan.moe_transport
@@ -993,13 +1022,19 @@ class WelmDpAttentionExecutor:
                 row_layout=row_layout,
             )
 
-        state = self._run_moe_transport(
-            layer=layer,
-            state=state,
-            forward_batch=forward_batch,
-            batch_plan=batch_plan,
-            active_view=active_view,
+        profile = (
+            torch.profiler.record_function("welm.dp.eager_transport")
+            if not is_dp_graph and getattr(plan, "profile_ranges", False)
+            else nullcontext()
         )
+        with profile:
+            state = self._run_moe_transport(
+                layer=layer,
+                state=state,
+                forward_batch=forward_batch,
+                batch_plan=batch_plan,
+                active_view=active_view,
+            )
         if (
             not is_dp_graph
             and layer.is_final_layer
@@ -1563,6 +1598,8 @@ class WelmDpAttentionExecutor:
             group=plan.row_collective_group,
             dp_rank=plan.outer_target_dp_rank,
             contribute=plan.attn_tp_rank == 0,
+            fused_pack=plan.fused_pack,
+            replica_dp_group=plan.replica_dp_group,
         )
         if full_hidden.shape[0] == 0:
             state.hidden_states = welm_dp_local_slot_slice(
@@ -1578,13 +1615,10 @@ class WelmDpAttentionExecutor:
         )
         invalid_mask = welm_dp_segmented_invalid_mask(active_view)
         if valid_mask.shape[0] != full_hidden.shape[0]:
-            raise RuntimeError(
-                "WeLMv4 segmented MoE mask does not match gathered rows"
-            )
-        full_hidden.masked_fill_(invalid_mask[:, None], 0)
-        use_local_ep = (
-            transport is WelmMoeTransport.EXPLICIT_AG_LOCAL_SORT_EP_AR
-        )
+            raise RuntimeError("WeLMv4 segmented MoE mask does not match gathered rows")
+        if not plan.fused_pack and plan.replica_dp_group is None:
+            full_hidden.masked_fill_(invalid_mask[:, None], 0)
+        use_local_ep = transport is WelmMoeTransport.EXPLICIT_AG_LOCAL_SORT_EP_AR
         mlp_output = layer.mlp(
             full_hidden,
             None,
@@ -1596,12 +1630,8 @@ class WelmDpAttentionExecutor:
             invalid_row_mask=invalid_mask,
             invalid_topk_id=-1 if use_local_ep else 0,
             allow_inplace_expert_shared_merge=True,
-            resolved_moe_tp_group=(
-                None if use_local_ep else plan.moe_tp_group
-            ),
-            resolved_moe_ep_group=(
-                plan.moe_ep_group if use_local_ep else None
-            ),
+            resolved_moe_tp_group=(None if use_local_ep else plan.moe_tp_group),
+            resolved_moe_ep_group=(plan.moe_ep_group if use_local_ep else None),
             use_welm_decode_like_stream_policy=use_local_ep,
         )
         full_hidden = self._store_final_components(layer, mlp_output)

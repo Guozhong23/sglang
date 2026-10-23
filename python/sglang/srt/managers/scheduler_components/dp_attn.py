@@ -102,6 +102,7 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     welm_dp_all_active_ordinary_prefill: bool = False
     welm_dp_prefill_graph_candidate: bool = False
+    welm_dp_forward_modes_cpu: Optional[list[int]] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -201,14 +202,19 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
         self.can_run_prefill_cuda_graph = bool(cpu_data[:, 6].min().item())
         # Preserve the original per-group modes before MAX padding can turn
-        # an idle/decode shard into a fabricated EXTEND. Unlike the MegaMoE
-        # eager predicate, graph admission requires every group to be active.
-        self.welm_dp_prefill_graph_candidate = (
-            self.can_run_prefill_cuda_graph
-            and all(x > 0 for x in self.global_num_tokens)
-            and all(x > 0 for x in self.global_num_requests)
-            and all(
-                mode == ForwardMode.EXTEND.value for mode in cpu_data[:, 5].tolist()
+        # an idle/decode shard into a fabricated EXTEND. Graph admission may
+        # admit a static IDLE role, but never an EXTEND+DECODE/MIXED round.
+        self.welm_dp_forward_modes_cpu = cpu_data[:, 5].tolist()
+        self.welm_dp_prefill_graph_candidate = any(
+            mode == ForwardMode.EXTEND.value for mode in self.welm_dp_forward_modes_cpu
+        ) and all(
+            (mode == ForwardMode.IDLE.value and t == b == 0)
+            or (mode == ForwardMode.EXTEND.value and 0 < b <= t and bool(can_graph))
+            for mode, t, b, can_graph in zip(
+                self.welm_dp_forward_modes_cpu,
+                self.global_num_tokens,
+                self.global_num_requests,
+                cpu_data[:, 6].tolist(),
             )
         )
         if _ENABLE_WELM_MEGAMOE:
@@ -237,6 +243,9 @@ def _update_gather_batch(
     )
     batch.welm_dp_prefill_graph_candidate = (
         not skip_all_gather and mlp_sync_info.welm_dp_prefill_graph_candidate
+    )
+    batch.welm_dp_forward_modes_cpu = (
+        None if skip_all_gather else mlp_sync_info.welm_dp_forward_modes_cpu
     )
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:

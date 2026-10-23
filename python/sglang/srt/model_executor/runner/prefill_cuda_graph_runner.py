@@ -40,7 +40,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -840,6 +840,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return next((n for n in self._prefix_capture_variants if n >= real_n), None)
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
+        if getattr(self.welm_adapter, "is_dp", False):
+            ticket = forward_batch.welm_prefill_graph_ticket
+            return self.welm_adapter.key(
+                ticket.token_capacity, active_mask=ticket.active_mask
+            )
         if self.welm_adapter is not None:
             return self.welm_adapter.key(num_tokens, forward_batch.batch_size)
         variant = None
@@ -1168,6 +1173,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             token_rows=batch.welm_dp_raw_rows_cpu,
             request_rows=batch.global_num_requests_cpu,
             all_extend=batch.welm_dp_prefill_graph_candidate,
+            phases=getattr(batch, "welm_dp_forward_modes_cpu", None),
+            kernel_variant=getattr(adapter, "variant_id", 0),
             token_buckets=self.capture_num_tokens,
             request_buckets=adapter.batch_sizes,
             token_alignment=adapter.attn_tp_size,
@@ -1176,31 +1183,45 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if ticket.allowed:
             dp_rank = adapter.dp_rank
             lengths = batch.extend_seq_lens_cpu
+            idle = ticket.request_rows[dp_rank] == 0
             rows_match = (
-                lengths is not None
-                and sum(lengths) == ticket.token_rows[dp_rank]
-                and batch.batch_size == ticket.request_rows[dp_rank]
-            )
+                (idle and batch.batch_size == 0)
+                or (lengths is not None and sum(lengths) == ticket.token_rows[dp_rank])
+            ) and batch.batch_size == ticket.request_rows[dp_rank]
             local_allowed = (
                 rows_match
-                and self.can_replay_locally(
-                    batch_size=batch.batch_size,
-                    num_tokens=len(batch.input_ids),
-                    input_embeds=batch.input_embeds,
-                    replace_embeds=batch.replace_embeds,
-                    prefix_lens=batch.extend_prefix_lens_cpu,
-                    is_target_verify=batch.forward_mode.is_target_verify(),
-                    capture_hidden_mode=batch.capture_hidden_mode,
-                    return_logprob=batch.return_logprob,
-                    lora_ineligible=self.enable_lora,
+                and (
+                    idle
+                    and not self.enable_lora
+                    and batch.capture_hidden_mode <= self.capture_hidden_mode
+                    or not idle
+                    and self.can_replay_locally(
+                        batch_size=batch.batch_size,
+                        num_tokens=len(batch.input_ids),
+                        input_embeds=batch.input_embeds,
+                        replace_embeds=batch.replace_embeds,
+                        prefix_lens=batch.extend_prefix_lens_cpu,
+                        is_target_verify=batch.forward_mode.is_target_verify(),
+                        capture_hidden_mode=batch.capture_hidden_mode,
+                        return_logprob=batch.return_logprob,
+                        lora_ineligible=self.enable_lora,
+                    )
                 )
                 and adapter.local_can_run(
-                    batch, ticket.token_capacity, ticket.request_capacity
+                    batch,
+                    ticket.token_capacity,
+                    ticket.request_capacity,
+                    active_mask=ticket.active_mask,
                 )
             )
         # Gloo's worker writes output outside the calling inference context.
         # These tiny CPU control tensors must therefore be ordinary tensors.
-        with torch.inference_mode(False):
+        profile = (
+            adapter.profile_range("welm.dp.admission")
+            if getattr(adapter, "profile_ranges", False)
+            else nullcontext()
+        )
+        with profile, torch.inference_mode(False):
             vote = torch.tensor(ticket.vote_record(local_allowed), dtype=torch.int64)
             votes = torch.empty(4 * vote.numel(), dtype=torch.int64)
             torch.distributed.all_gather_into_tensor(
@@ -1211,14 +1232,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ticket, vote_records
         )
         decision = batch.welm_prefill_graph_ticket
+        self._welm_admission_step = getattr(self, "_welm_admission_step", 0) + 1
         logger.debug(
-            "WeLM DP prefill admission allowed=%s reason=%s T=%s B=%s slots=%s/%s",
+            "WeLM DP prefill step=%s local_mode=%s modes=%s mask=%s variant=%s "
+            "allowed=%s reason=%s T=%s B=%s slots=%s/%s path=%s",
+            self._welm_admission_step,
+            batch.forward_mode,
+            decision.phases,
+            decision.active_mask,
+            decision.kernel_variant,
             decision.allowed,
             decision.reason,
             decision.token_rows,
             decision.request_rows,
             decision.token_capacity,
             decision.request_capacity,
+            "graph" if decision.allowed else "eager",
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -1432,6 +1461,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:
+        adapter = self.welm_adapter
+        masks = getattr(adapter, "active_masks", (3,))
+        for mask in masks:
+            if getattr(adapter, "is_dp", False):
+                adapter.active_mask = mask
+            self._capture_one_role()
+        if getattr(adapter, "is_dp", False):
+            adapter.active_mask = 3
+
+    def _capture_one_role(self) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
             self.model_runner.gpu_id,
@@ -1580,6 +1619,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         bs = forward_batch.batch_size
         self.raw_bs = bs
+        if (
+            getattr(self.welm_adapter, "is_dp", False)
+            and forward_batch.welm_prefill_graph_ticket.request_rows[
+                self.welm_adapter.dp_rank
+            ]
+            == 0
+        ):
+            static = copy.copy(forward_batch)
+            for name in ("input_ids", "positions", "out_cache_loc", "input_embeds"):
+                if self.buffer_registry.has_slot(name):
+                    value = self.buffer_registry.get_slot(name).slice_for(
+                        1, static_num_tokens
+                    )
+                    value.fill_(-1 if name == "out_cache_loc" else 0)
+                    setattr(static, name, value)
+            self.welm_adapter.prepare_replay(forward_batch, static, static_num_tokens)
+            return static
 
         self.buffer_registry.fill_from(
             forward_batch,
@@ -1688,6 +1744,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             welm_dp_raw_rows_cpu=forward_batch.welm_dp_raw_rows_cpu,
             global_num_requests_cpu=forward_batch.global_num_requests_cpu,
             welm_dp_prefill_graph_candidate=forward_batch.welm_dp_prefill_graph_candidate,
+            welm_dp_forward_modes_cpu=forward_batch.welm_dp_forward_modes_cpu,
             welm_prefill_graph_ticket=forward_batch.welm_prefill_graph_ticket,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
@@ -1791,8 +1848,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly.
         full_path = self._is_full_backend
         ie_idx = self._input_embeds_arg_idx
+        visual_range = None
 
         def replay_layer_forward(*args, **layer_kwargs):
+            nonlocal visual_range
+            # Outer VLM composition ends when it enters the transformer body.
+            # Keep this range separate from Prompt/Mirror replay and LM head.
+            if visual_range is not None:
+                visual_range.__exit__(None, None, None)
+                visual_range = None
             # The captured body graph reads activations from the static
             # input_embeds slot. The outer model.forward (run eagerly)
             # passes the live embeddings into layer_model.forward as the
@@ -1828,12 +1892,36 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
-        self.layer_model.forward = replay_layer_forward
         # For Full, run the eager tail against the raw user-facing batch so it
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = forward_batch if full_path else static_forward_batch
+        if getattr(self.welm_adapter, "is_dp", False):
+            tail_batch = copy.copy(tail_batch)
+            ticket = forward_batch.welm_prefill_graph_ticket
+            tail_batch.global_num_tokens_for_logprob_cpu = list(ticket.request_rows)
+            tail_batch.global_num_tokens_for_logprob_gpu = (
+                self.welm_adapter.request_real_rows_gpu
+            )
+            if ticket.request_rows[self.welm_adapter.dp_rank] == 0:
+                with self._prefill_forward_context(
+                    static_forward_batch, num_tokens=static_num_tokens, raw_num_tokens=0
+                ):
+                    hs = self.welm_adapter.replay(
+                        shape_key, static_forward_batch, **kwargs
+                    )
+                    empty_hs = _slice_output_rows(hs, 0)
+                    # The world-TP LM head still gathers peer rows. Participate
+                    # with zero local rows before discarding this rank's output.
+                    model = self.model_runner.model
+                    return model.logits_processor(
+                        forward_batch.input_ids, empty_hs, model.lm_head, tail_batch
+                    )
+        self.layer_model.forward = replay_layer_forward
         try:
+            if getattr(self.welm_adapter, "profile_ranges", False):
+                visual_range = self.welm_adapter.profile_range("welm.dp.visual_compose")
+                visual_range.__enter__()
             with self._prefill_forward_context(
                 static_forward_batch,
                 num_tokens=static_num_tokens,
@@ -1847,6 +1935,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
         finally:
             self.layer_model.forward = original_layer_forward
+            if visual_range is not None:
+                visual_range.__exit__(None, None, None)
 
     def _execute_tc_piecewise(
         self,
@@ -1921,8 +2011,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
-            static_forward_batch = self.load_batch(forward_batch, **kwargs)
+            profile = (
+                self.welm_adapter.profile_range("welm.dp.stage_graph_inputs")
+                if getattr(self.welm_adapter, "profile_ranges", False)
+                else nullcontext()
+            )
+            with profile:
+                static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
+            if getattr(self.welm_adapter, "is_dp", False):
+                view = static_forward_batch.welm_dp_moe_row_layout.current
+                set_dp_buffer_len(
+                    view.global_slot_rows,
+                    view.local_slot_rows,
+                    True,
+                    list(view.slot_rows_cpu),
+                )
+                set_is_extend_in_batch(True)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             if (shape_key.variant_label or "").startswith("chunked_prefix:"):

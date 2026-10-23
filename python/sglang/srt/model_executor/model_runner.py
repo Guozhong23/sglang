@@ -1036,8 +1036,11 @@ class ModelRunner:
             for layer_id in (getattr(hf_config, "kv_mirror_layers", None) or [])
             if 0 <= int(layer_id) < num_target_layers
         ]
+        from sglang.srt.distributed.parallel_state import get_welm_replica_dp_group
+
         return build_welm_target_runner_plan(
             parallel_state=self.ps,
+            replica_dp_group=get_welm_replica_dp_group(),
             attn_tp_group=self.attention_tp_group,
             moe_tp_group=parallel.moe_tp_group,
             moe_ep_group=moe_ep_group,
@@ -1125,6 +1128,64 @@ class ModelRunner:
             )
         bind(final_plan)
         self.runner_parallel_plan = final_plan
+        if (
+            getattr(final_plan.role, "name", None) == "TARGET_DP"
+            and envs.SGLANG_WELMV4_DP_SCRATCH_CACHE.get()
+        ):
+            from sglang.srt.models.welm_dp_scratch import (
+                WelmDpScratchPool,
+                warmup_eager_scratch,
+            )
+
+            inner_model.welm_dp_scratch_pool = WelmDpScratchPool(torch.npu.Event)
+            warmup_eager_scratch(
+                inner_model,
+                final_plan,
+                capacities=(128, self.server_args.chunked_prefill_size or 128),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if getattr(final_plan.role, "name", None) == "TARGET_DP":
+            policies = [None] * self.tp_group.world_size
+            with torch.inference_mode(False):
+                torch.distributed.all_gather_object(
+                    policies,
+                    (final_plan.oproj_policy, final_plan.fused_pack),
+                    group=self.tp_group.cpu_group,
+                )
+            if any(
+                policy != (final_plan.oproj_policy, final_plan.fused_pack)
+                for policy in policies
+            ):
+                raise ValueError(f"WeLM OProj policies differ across ranks: {policies}")
+            if final_plan.oproj_policy.use_mc2:
+                for layer in layers:
+                    layer.self_attn._get_welm_npu_o_proj_hcom_name(
+                        final_plan.attn_tp_group
+                    )
+            logger.info(
+                "WeLM resolved topology: global_rank=%s attn_tp=%s dp=%s ep=%s "
+                "attn_group=%s ep_group=%s vision_dp=%s vision_group=%s "
+                "replica_group=%s fused_pack=%s per_dp_chunk=%s "
+                "prefill_graph=%s OProj=%s (DP graph: ordinary BF16 OProj)",
+                torch.distributed.get_rank(),
+                final_plan.attn_tp_size,
+                final_plan.outer_target_dp_size,
+                final_plan.moe_ep_size,
+                final_plan.attn_tp_group.ranks,
+                getattr(final_plan.moe_ep_group, "ranks", None),
+                self.server_args.mm_enable_dp_encoder,
+                (
+                    final_plan.attn_tp_group.ranks
+                    if self.server_args.mm_enable_dp_encoder
+                    else None
+                ),
+                getattr(final_plan.replica_dp_group, "ranks", None),
+                final_plan.fused_pack,
+                self.server_args.chunked_prefill_size,
+                self.server_args.cuda_graph_config,
+                final_plan.oproj_policy,
+            )
 
     def maybe_init_welm_prefill_megamoe(self) -> None:
         self.welm_prefill_megamoe = None
@@ -1713,13 +1774,9 @@ class ModelRunner:
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-            # DP / MLP-sync padding + attn-tp normalization. Only the decode
-            # cuda-graph path above pre-pads its static buffers and returns
-            # early; split prefill, the prefill cuda graph, and the eager
-            # forward all run the live batch and need this first — it sets
-            # global_dp_buffer_len / padded token counts that graph eligibility
-            # and the collectives depend on.
-            self._prepare_eager_forward_batch(forward_batch)
+            # Vote using unpadded true rows before the local EXTEND/IDLE split.
+            # Accepted DP graphs install their own fixed slots; eager fallback
+            # alone runs generic padding, which may convert IDLE to a dummy batch.
             if (
                 getattr(prefill_adapter, "is_dp", False)
                 and forward_batch.is_extend_in_batch
@@ -1727,6 +1784,15 @@ class ModelRunner:
                 self.prefill_cuda_graph_runner.prepare_welm_dp_graph_ticket(
                     forward_batch
                 )
+            dp_ticket = (
+                getattr(forward_batch, "welm_prefill_graph_ticket", None)
+                if getattr(prefill_adapter, "is_dp", False)
+                and forward_batch.is_extend_in_batch
+                else None
+            )
+            dp_prefill_graph = bool(dp_ticket is not None and dp_ticket.allowed)
+            if not dp_prefill_graph:
+                self._prepare_eager_forward_batch(forward_batch)
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
@@ -1744,7 +1810,12 @@ class ModelRunner:
                     forward_count=split_forward_count,
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                (
+                    dp_prefill_graph
+                    or forward_batch.forward_mode.is_extend(
+                        include_draft_extend_v2=True
+                    )
+                )
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

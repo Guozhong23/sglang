@@ -1858,6 +1858,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_WELM_REPLICA_DP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -1880,6 +1881,10 @@ def get_tp_group() -> GroupCoordinator:
         return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
+
+
+def get_welm_replica_dp_group() -> Optional[GroupCoordinator]:
+    return _WELM_REPLICA_DP
 
 
 def get_attn_tp_group() -> GroupCoordinator:
@@ -1981,7 +1986,14 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP, _MOE_EP_NORMAL_COMM):
+            for group in (
+                _DCP,
+                _ATTN_TP,
+                _MOE_EP,
+                _MOE_TP,
+                _MOE_EP_NORMAL_COMM,
+                _WELM_REPLICA_DP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2421,6 +2433,40 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
+        )
+
+    global _WELM_REPLICA_DP
+    # Every world rank enters the same startup vote and new_group order.
+    # This optional topology belongs to model-parallel lifetime, not layers.
+    replica_requested = envs.SGLANG_WELMV4_DP_REPLICA_ALLGATHER.get()
+    if tensor_model_parallel_size == 4 and attention_data_parallel_size == 2:
+        flags = [None] * get_world_group().world_size
+        with torch.inference_mode(False):
+            torch.distributed.all_gather_object(
+                flags, replica_requested, group=get_world_group().cpu_group
+            )
+        if any(flag != replica_requested for flag in flags):
+            raise ValueError("WeLM replica-DP transport differs across ranks")
+    if replica_requested:
+        if (
+            world_size != 4
+            or tensor_model_parallel_size != 4
+            or attention_data_parallel_size != 2
+            or attn_tp_size != 2
+            or expert_model_parallel_size != 4
+            or pipeline_model_parallel_size != 1
+            or recovered_rank
+            or rank_offset != 0
+        ):
+            raise ValueError("WeLM replica-DP AllGather requires single-node TP2DP2EP4")
+        _WELM_REPLICA_DP = init_model_parallel_group(
+            [[0, 2], [1, 3]],
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="welm_replica_dp",
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -2868,6 +2914,11 @@ def destroy_model_parallel():
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
+
+    global _WELM_REPLICA_DP
+    if _WELM_REPLICA_DP:
+        _WELM_REPLICA_DP.destroy()
+    _WELM_REPLICA_DP = None
 
     global _TP
     if _TP:

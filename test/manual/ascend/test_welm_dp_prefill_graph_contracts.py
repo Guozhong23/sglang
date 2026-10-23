@@ -5,6 +5,7 @@ so torch and an initialized distributed runtime are not required.
 """
 
 import copy
+from contextlib import nullcontext
 import dataclasses
 import logging
 import sys
@@ -48,7 +49,8 @@ DP = load_nodes(
         "copy": copy,
         "torch": TORCH,
         "logger": logging.getLogger(__name__),
-        "ForwardMode": types.SimpleNamespace(EXTEND=1),
+        "ForwardMode": types.SimpleNamespace(EXTEND=1, IDLE=4),
+        "nullcontext": nullcontext,
         "DpPaddingMode": types.SimpleNamespace(MAX_LEN=MAX_LEN),
         "build_welm_dp_moe_row_layout": ROWS["build_welm_dp_moe_row_layout"],
     },
@@ -70,6 +72,8 @@ def ticket(**kwargs):
 
 def adapter():
     obj = DpAdapter.__new__(DpAdapter)
+    obj.active_mask = 3
+    obj.active_masks = (3,)
     obj.dp_size = 2
     obj.dp_rank = 1
     obj.attn_tp_size = 2
@@ -96,7 +100,7 @@ class TestDpGraphContracts(unittest.TestCase):
             ((12000, 6000), (3, 1)),
         )
         for tokens, requests, tc, bc in [
-            ([1, 0], [1, 0], 128, 4),
+            ([0, 0], [0, 0], 128, 4),
             ([1, 2], [1, 3], 128, 4),
             ([129, 2], [1, 1], 128, 4),
             ([2, 2], [1, 1], 127, 4),
@@ -228,7 +232,7 @@ class TestDpGraphContracts(unittest.TestCase):
         batch = types.SimpleNamespace(batch_size=3)
         with patch.object(Adapter, "_bind", lambda self, batch, capacity: None):
             obj._bind(batch, 128)
-        self.assertIn(("mirror", 3), obj._row_layouts)
+        self.assertIn(("mirror", 3, 3), obj._row_layouts)
         self.assertNotIn(("mirror", 128), obj._row_layouts)
         self.assertEqual(batch.welm_dp_moe_row_layout.current.slot_rows_cpu, [3, 3])
         self.assertEqual(batch.welm_dp_raw_rows_cpu, [3, 3])

@@ -9,6 +9,8 @@
 """FusedQkvProjNormRopeCache -- WeLMv4 QKV 投影全融合算子(P2,Cube+Vector 复合核).
 
 使用与 MXFP8 算子相同的 cannbotdsl 0.7 API。
+编译期 geometry 支持 TP4 Q6/KV1 和 attention TP2 Q12/KV1；有无 Mirror 的
+投影宽度分别为 2048/2560 和 3584/4096。下面展示 TP4 Mirror 布局示例。
 
 将 sglang WeLMv4 prefill 路径 kv-mirror 层的完整 9 步序列(matmul_fusion.md 步骤 1-8)
 融合为 1 个 MIX_AIC_1_2 复合核:
@@ -102,18 +104,15 @@ from cannbotdsl.tensor import tile_slice
 from cannbotdsl.types.dtypes import bfloat16 as BF16
 from cannbotdsl.types.dtypes import float32 as F32
 
+from sglang.srt.layers.welm_fused_qkv_geometry import FusedQkvGeometry
+
 # ---- model structure constants (per TP rank, WeLMv4 NPU path) ----
 HIDDEN = 2048  # K of the projection
 HEAD_DIM = 256
 ROPE_DIM = 64
 NOPE_DIM = HEAD_DIM - ROPE_DIM
 HALF_ROPE_DIM = ROPE_DIM // 2
-NUM_Q_HEADS = 6
-NUM_UNITS = 10  # 6 Q + K + V + mirror_k + mirror_v
-QKV_WIDTH = NUM_UNITS * HEAD_DIM  # 2560
-UNIT_K = NUM_Q_HEADS
-UNIT_V = NUM_Q_HEADS + 1
-UNIT_MK = NUM_Q_HEADS + 2
+# Q6/Q12 and mirror offsets are compile-time instance geometry, not globals.
 
 # ---- tiling constants (arch35: L1 512K, L0A/B 64K, L0C 256K, AIC 32) ----
 # Cube tiles are PAIR_M=256 rows: two consecutive BASE_M=128 m-tiles form ONE
@@ -137,12 +136,14 @@ _F32_MAX = float.fromhex("0x1.fffffep+127")
 
 @kernel
 class FusedQkvProjNormRopeCacheKernel:
+
     def __init__(
         self,
         return_v: bool = False,
         has_mirror: bool = True,
         positions_contiguous: bool = True,
         rank_chunk_layout: bool = False,
+        num_q_heads: int = 6,
     ):
         # Trace-time constants: fold the optional v materialization, the
         # mirror block-store, and the cos/sin load mode away before IR
@@ -157,6 +158,7 @@ class FusedQkvProjNormRopeCacheKernel:
         self.has_mirror = bool(has_mirror)
         self.positions_contiguous = bool(positions_contiguous)
         self.rank_chunk_layout = bool(rank_chunk_layout)
+        self.num_q_heads = int(num_q_heads)
 
     @jit
     def _rope_q(self, in_ch, out_ch, cs_ch, cur_rows):
@@ -717,20 +719,18 @@ class FusedQkvProjNormRopeCacheKernel:
             cv_r = cv_ub.tail_next()
             cs_r = cs_ch.tail_next()
             out_w = out_ch.head_next()
-            if u < NUM_Q_HEADS:
+            if u < self.num_q_heads:
                 self._rope_q(cv_r, out_w, cs_r, rows_here)
-                q_half = tile_slice(
-                    q_span, (PAIR_M, HEAD_DIM), (pair, u)
-                ).partition(dim=0, part_id=sub)
-                mem_copy(q_half, out_ch.tail_next())
-            elif u == UNIT_K:
-                self._norm_rope_k(
-                    cv_r, out_w, cs_r, gamma_w, rows_here, AVG, epsilon
+                q_half = tile_slice(q_span, (PAIR_M, HEAD_DIM), (pair, u)).partition(
+                    dim=0, part_id=sub
                 )
+                mem_copy(q_half, out_ch.tail_next())
+            elif u == self.num_q_heads:
+                self._norm_rope_k(cv_r, out_w, cs_r, gamma_w, rows_here, AVG, epsilon)
                 out_r = out_ch.tail_next()
-                k_half = tile_slice(
-                    k_span, (PAIR_M, HEAD_DIM), (pair, 0)
-                ).partition(dim=0, part_id=sub)
+                k_half = tile_slice(k_span, (PAIR_M, HEAD_DIM), (pair, 0)).partition(
+                    dim=0, part_id=sub
+                )
                 # The tile drain and the slot scatter are two readers of one
                 # out_ch slot; both consume the same VF-written epoch.
                 mem_copy(k_half, out_r)
@@ -741,7 +741,7 @@ class FusedQkvProjNormRopeCacheKernel:
                             tile_slice(gm_k_cache, (1, HEAD_DIM), (slot, 0)),
                             tile_slice(out_r, (1, HEAD_DIM), (r, 0)),
                         )
-            elif u == UNIT_V:
+            elif u == self.num_q_heads + 1:
                 self._cast_rows(cv_r, out_w, rows_here)
                 out_r = out_ch.tail_next()
                 if const_expr(self.return_v):
@@ -761,11 +761,11 @@ class FusedQkvProjNormRopeCacheKernel:
             else:
                 self._cast_rows(cv_r, out_w, rows_here)
                 out_r = out_ch.tail_next()
-                gm_m = mk_span if u == UNIT_MK else mv_span
+                gm_m = mk_span if u == self.num_q_heads + 2 else mv_span
                 if const_expr(self.has_mirror):
-                    m_half = tile_slice(
-                        gm_m, (PAIR_M, HEAD_DIM), (pair, 0)
-                    ).partition(dim=0, part_id=sub)
+                    m_half = tile_slice(gm_m, (PAIR_M, HEAD_DIM), (pair, 0)).partition(
+                        dim=0, part_id=sub
+                    )
                     mem_copy(m_half, out_r)
                 else:
                     # Plain-layer stand-ins are (1, 256); the mirror units
@@ -808,18 +808,15 @@ def compile_aot(
     mirror layers, mk/mv) are runtime-equality-checked by the framework on
     every launch.
     """
-    n_units = qkv_width // HEAD_DIM
-    if n_units * HEAD_DIM != qkv_width or n_units not in (8, 10):
-        raise ValueError(
-            f"qkv_width must be 2048 or 2560, got {qkv_width}"
-        )
+    geometry = FusedQkvGeometry.from_width(qkv_width)
     op = FusedQkvProjNormRopeCache(
         return_v=return_v,
-        has_mirror=(n_units == 10),
+        has_mirror=geometry.has_mirror,
+        num_q_heads=geometry.num_q_heads,
         positions_contiguous=positions_contiguous,
     )
     m = Dim("M", min=1)
-    mirror_rows = m if n_units == 10 else 1  # plain stand-ins stay (1, 256)
+    mirror_rows = m if geometry.has_mirror else 1  # plain stand-ins stay (1, 256)
     bf, f32, i64 = BF16, F32, dtypes.int64
     specs = (
         TensorSpec((m, HIDDEN), bf),
@@ -828,7 +825,7 @@ def compile_aot(
         TensorSpec((m,), i64),
         TensorSpec((max_pos, ROPE_DIM), f32),
         TensorSpec((m,), i64),
-        TensorSpec((m, NUM_Q_HEADS * HEAD_DIM), bf),
+        TensorSpec((m, geometry.q_width), bf),
         TensorSpec((m, HEAD_DIM), bf),
         TensorSpec((m, HEAD_DIM), bf),  # gm_v (k stand-in when return_v=False)
         TensorSpec((mirror_rows, HEAD_DIM), bf),
@@ -854,17 +851,16 @@ def compile_aot_rank_chunk(
     Caller contract: Mchunk=P*m, Mfull=P*L, 0 <= a < a+m <= L, P>=1.
     This entry retains dense V for the existing attention(q,k,v) ABI.
     """
-    n_units = qkv_width // HEAD_DIM
-    if n_units * HEAD_DIM != qkv_width or n_units not in (8, 10):
-        raise ValueError(f"qkv_width must be 2048 or 2560, got {qkv_width}")
+    geometry = FusedQkvGeometry.from_width(qkv_width)
     op = FusedQkvProjNormRopeCache(
         return_v=True,
-        has_mirror=(n_units == 10),
+        has_mirror=geometry.has_mirror,
+        num_q_heads=geometry.num_q_heads,
         positions_contiguous=positions_contiguous,
     )
     m_chunk = Dim("Mchunk", min=1)
     m_full = Dim("Mfull", min=1)
-    mirror_rows = m_full if n_units == 10 else 1
+    mirror_rows = m_full if geometry.has_mirror else 1
     bf, f32, i64 = BF16, F32, dtypes.int64
     specs = (
         TensorSpec((m_chunk, HIDDEN), bf),
@@ -873,7 +869,7 @@ def compile_aot_rank_chunk(
         TensorSpec((m_full,), i64),
         TensorSpec((max_pos, ROPE_DIM), f32),
         TensorSpec((m_full,), i64),
-        TensorSpec((m_full, NUM_Q_HEADS * HEAD_DIM), bf),
+        TensorSpec((m_full, geometry.q_width), bf),
         TensorSpec((m_full, HEAD_DIM), bf),
         TensorSpec((m_full, HEAD_DIM), bf),
         TensorSpec((mirror_rows, HEAD_DIM), bf),
@@ -915,7 +911,11 @@ class FusedQkvProjNormRopeCache:
         return_v: bool = False,
         has_mirror: bool = True,
         positions_contiguous: bool = True,
+        num_q_heads: int = 6,
     ):
+        self._num_q_heads = FusedQkvGeometry(
+            num_q_heads=num_q_heads, has_mirror=has_mirror
+        ).num_q_heads
         self._return_v = bool(return_v)
         self._has_mirror = bool(has_mirror)
         self._positions_contiguous = bool(positions_contiguous)
@@ -945,7 +945,10 @@ class FusedQkvProjNormRopeCache:
         if block_dim > grid_cap:
             block_dim = grid_cap
         op = FusedQkvProjNormRopeCacheKernel(
-            self._return_v, self._has_mirror, self._positions_contiguous
+            self._return_v,
+            self._has_mirror,
+            self._positions_contiguous,
+            num_q_heads=self._num_q_heads,
         )
         op[block_dim](
             gm_hidden,
@@ -963,7 +966,6 @@ class FusedQkvProjNormRopeCache:
             gm_v_cache,
             eps,
         )
-
 
     @host
     def run_rank_chunk(
@@ -997,6 +999,7 @@ class FusedQkvProjNormRopeCache:
             self._has_mirror,
             self._positions_contiguous,
             rank_chunk_layout=True,
+            num_q_heads=self._num_q_heads,
         )
         op[block_dim].rank_chunk(
             gm_hidden,
@@ -1046,7 +1049,7 @@ def fused_qkv_proj_norm_rope_cache(
 
     Args:
         hidden: (M, 2048) bf16 contiguous (QKV projection input)
-        weight: (2560, 2048) bf16 contiguous, nn.Linear (N, K) layout
+        weight: (N, 2048) bf16 contiguous; N=2048/2560/3584/4096
         k_gamma: (256,) bf16, K RMSNorm weight
         positions: (M,) int64, contiguous positions (validated when validate=True)
         cos_sin_cache: (max_pos, 64) fp32, first 32 cos / last 32 sin per row
@@ -1061,10 +1064,10 @@ def fused_qkv_proj_norm_rope_cache(
             guarantees the invariants.
 
     Returns:
-        weight (2560, 2048) — kv-mirror source layer:
+        weight N=2560 or 4096 — kv-mirror source layer:
             return_v=False: (q, k, mirror_k, mirror_v) — v goes to cache only.
             return_v=True:  (q, k, v, mirror_k, mirror_v).
-        weight (2048, 2048) — plain QKV layer (no mirror segments):
+        weight N=2048 or 3584 — plain QKV layer (no mirror segments):
             return_v=False: (q, k).
             return_v=True:  (q, k, v).
 
@@ -1075,13 +1078,7 @@ def fused_qkv_proj_norm_rope_cache(
     assert hidden.dim() == 2 and hidden.shape[1] == HIDDEN
     assert hidden.dtype == torch.bfloat16 and hidden.is_contiguous()
     assert weight.dim() == 2 and weight.shape[1] == HIDDEN
-    # Two profiled widths: 2560 = kv-mirror source layer (5 head-units),
-    # 2048 = plain QKV layer (q/k/v only, welmv4.py:1845-1847 branch).
-    n_units = weight.shape[0] // HEAD_DIM
-    assert n_units * HEAD_DIM == weight.shape[0] and n_units in (8, 10), (
-        f"weight must be (2048, {HIDDEN}) or ({QKV_WIDTH}, {HIDDEN}), "
-        f"got {tuple(weight.shape)}"
-    )
+    geometry = FusedQkvGeometry.from_width(weight.shape[0])
     assert weight.dtype == torch.bfloat16 and weight.is_contiguous()
     assert k_gamma.dim() == 1 and k_gamma.shape[0] == HEAD_DIM
     assert k_gamma.dtype == torch.bfloat16 and k_gamma.is_contiguous()
@@ -1141,9 +1138,7 @@ def fused_qkv_proj_norm_rope_cache(
             )
 
     device = hidden.device
-    q = torch.empty(
-        (num_tokens, NUM_Q_HEADS * HEAD_DIM), dtype=torch.bfloat16, device=device
-    )
+    q = torch.empty((num_tokens, geometry.q_width), dtype=torch.bfloat16, device=device)
     k = torch.empty((num_tokens, HEAD_DIM), dtype=torch.bfloat16, device=device)
     if return_v:
         v = torch.empty((num_tokens, HEAD_DIM), dtype=torch.bfloat16, device=device)
@@ -1153,7 +1148,7 @@ def fused_qkv_proj_norm_rope_cache(
         # shape-compatible stand-in; the v-write branch is folded away at
         # trace time so this tensor is never written
         gm_v = k
-    if n_units == 10:
+    if geometry.has_mirror:
         mirror_k = torch.empty(
             (num_tokens, HEAD_DIM), dtype=torch.bfloat16, device=device
         )
@@ -1168,7 +1163,8 @@ def fused_qkv_proj_norm_rope_cache(
 
     op = FusedQkvProjNormRopeCache(
         return_v=return_v,
-        has_mirror=(n_units == 10),
+        has_mirror=geometry.has_mirror,
+        num_q_heads=geometry.num_q_heads,
         positions_contiguous=positions_contiguous,
     )
     op.run(
@@ -1187,7 +1183,7 @@ def fused_qkv_proj_norm_rope_cache(
         v_cache,
         float(eps),
     )
-    if n_units == 10:
+    if geometry.has_mirror:
         if return_v:
             return q, k, v, mirror_k, mirror_v
         return q, k, mirror_k, mirror_v

@@ -17,6 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
 import os
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -133,7 +134,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 # Cache only compiled programs, never per-forward Q/K/V or mirror activations.
-_WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
+_WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, ...], Any] = {}
 _WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
 
 # Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
@@ -167,8 +168,12 @@ def _get_welm_fused_qkv_program(
     *,
     rank_chunk_layout: bool = False,
 ) -> Any:
+    from sglang.srt.layers.welm_fused_qkv_geometry import FusedQkvGeometry
+
+    geometry = FusedQkvGeometry.from_width(qkv_width)
     key = (
         device,
+        geometry,
         qkv_width,
         num_slots,
         max_pos,
@@ -2105,8 +2110,14 @@ class Qwen2MoeAttention(nn.Module):
         self.use_npu_fused_qkv = (
             _is_npu
             and os.environ.get("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1"
-            and get_tensor_model_parallel_world_size() == 4
-            and not is_dp_attention_enabled()
+            and (
+                (attn_tp_size == 4 and not is_dp_attention_enabled())
+                or (
+                    attn_tp_size == 2
+                    and is_dp_attention_enabled()
+                    and os.environ.get("SGLANG_NPU_WELMV4_DP_FUSED_QKV", "0") == "1"
+                )
+            )
             and not is_nextn
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
@@ -2141,6 +2152,20 @@ class Qwen2MoeAttention(nn.Module):
         ]
     ]:
         """Use the fixed WeLM BF16 ABI for target prefill, decode or verify."""
+        # This ABI has no Q norm or bias arguments. Keep unsupported layers
+        # on their existing projection path, including all DP prefill graphs.
+        if (
+            self.num_heads not in (6, 12)
+            or self.num_kv_heads != 1
+            or self.head_dim != 256
+            or self.qk_rope_head_dim != 64
+            or self.q_norm is not None
+            or self.k_norm is None
+            or getattr(self.qkv_proj, "bias", None) is not None
+            or getattr(self, "qkv_proj_bias", None) is not None
+            or getattr(forward_batch.welm_prefill_graph, "is_dp", False)
+        ):
+            return None
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return None
@@ -2178,6 +2203,19 @@ class Qwen2MoeAttention(nn.Module):
             and hasattr(self, "qkv_proj_weight")
         )
         weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
+        if (
+            weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or tuple(weight.shape)
+            != (self.q_size + (4 if has_mirror else 2) * 256, 2048)
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or hidden_states.shape[1] != 2048
+            or self.q_size != self.num_heads * 256
+            or self.k_norm.weight.dtype != torch.bfloat16
+            or not self.k_norm.weight.is_contiguous()
+        ):
+            return None
         # CANNBotDSL accepts plain tensors; do not bind/copy loader Parameters.
         weight = weight.data
         gamma = self.k_norm.weight.data.view(1, self.head_dim)
@@ -2744,7 +2782,15 @@ class Qwen2MoeAttention(nn.Module):
         name = self._welm_npu_o_proj_hcom_names.get(process_group)
         if name is None:
             backend = process_group._get_backend(torch.device("npu"))
-            name = backend.get_hccl_comm_name(process_group.rank())
+            global_rank = torch.distributed.get_rank()
+            name = backend.get_hccl_comm_name(global_rank)
+            logger.info(
+                "WeLM OProj HCCL global_rank=%s group_rank=%s device=%s members=%s",
+                global_rank,
+                process_group.rank(),
+                torch.npu.current_device(),
+                group.ranks,
+            )
             self._welm_npu_o_proj_hcom_names[process_group] = name
         return name
 
@@ -3107,11 +3153,15 @@ class Qwen2MoeAttention(nn.Module):
             )
         elif self.use_npu_fused_qkv:
             if self._is_npu_mxfp8_projection(self.qkv_proj):
-                result = self._try_npu_fused_qkv_mxfp8(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    prefill_mxfp8_all_gather_group,
+                result = (
+                    None
+                    if is_dp_attention_enabled()
+                    else self._try_npu_fused_qkv_mxfp8(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        prefill_mxfp8_all_gather_group,
+                    )
                 )
                 if result is not None:
                     (
@@ -5080,6 +5130,39 @@ class Qwen2MoeModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        pool = getattr(self, "welm_dp_scratch_pool", None)
+        if (
+            pool is not None
+            and forward_batch.is_extend_in_batch
+            and forward_batch.welm_prefill_graph is None
+        ):
+            with pool.scope(forward_batch):
+                return self._forward_impl(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    input_embeds,
+                    pp_proxy_tensors,
+                    skip_oe_fusion,
+                )
+        return self._forward_impl(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            skip_oe_fusion,
+        )
+
+    def _forward_impl(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
         # Construct immutable request-segment metadata once per eager forward.
         # EXTEND/MIXED positions are independently contiguous per request;
         # speculative modes are deliberately excluded.  DP-attention may have
@@ -5125,6 +5208,9 @@ class Qwen2MoeModel(nn.Module):
         )
         if split_mirror:
             hidden_states, residual, positions = graph.begin_mirror(forward_batch)
+        elif getattr(graph, "is_dp", False) and graph.is_idle_role(forward_batch):
+            hidden_states = graph.idle_prompt_hidden[: positions.numel()]
+            residual = None
         elif self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -5168,10 +5254,16 @@ class Qwen2MoeModel(nn.Module):
                 # Allocate batch-owned gather/mask scratch during eager setup
                 # (or Graph warmup), then refresh dynamic masks on every real
                 # model forward so the refresh operations are captured.
-                dp_executor.prepare_forward_scratch(
-                    forward_batch=forward_batch,
-                    hidden_states=hidden_states,
+                profile = (
+                    torch.profiler.record_function("welm.dp.prepare_scratch")
+                    if getattr(dp_executor.runner_plan, "profile_ranges", False)
+                    else nullcontext()
                 )
+                with profile:
+                    dp_executor.prepare_forward_scratch(
+                        forward_batch=forward_batch,
+                        hidden_states=hidden_states,
+                    )
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
