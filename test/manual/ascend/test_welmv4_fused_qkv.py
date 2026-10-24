@@ -12,9 +12,11 @@ is reported as SKIP; SDK import/compilation failures on NPU remain errors.
 The tests compare contiguous loads with per-row positions, including ragged
 prefill and target verify, and check dense outputs, raw mirror outputs and KV
 scatter. An exactly representable sparse golden also checks Q6/Q12 head offsets and
-invalid cache slots. These do not establish general GEMM/norm/RoPE accuracy or
-model/Graph correctness, and do not measure latency. Compiled callables are
-reused across M.
+invalid cache slots. Q12 rank-chunk tests simulate two-rank AllGather inputs on
+one NPU, including an unaligned tail, and compare restored outputs/cache with
+the full-row kernel. These do not establish distributed communication overlap,
+general GEMM/norm/RoPE accuracy or model/Graph correctness, and do not measure
+latency. Compiled callables are reused across M.
 """
 
 import importlib.util
@@ -88,6 +90,17 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             )
         return self.programs[key]
 
+    def _rank_chunk_program(self, width, mode):
+        key = (width, mode, "rank_chunk")
+        if key not in self.programs:
+            self.programs[key] = self.operator.compile_aot_rank_chunk(
+                width,
+                self.CACHE_ROWS,
+                self.MAX_POSITION,
+                positions_contiguous=mode == "contiguous",
+            )
+        return self.programs[key]
+
     def _inputs(self, lengths, *, prefixes=None, pad=True):
         torch = self.torch
         real_m = sum(lengths)
@@ -118,10 +131,8 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             slots[real_m // 2] = -1
         return hidden, positions.to(self.device), slots.to(self.device)
 
-    def _invoke(self, width, mode, inputs):
+    def _empty_results(self, width, m):
         torch = self.torch
-        hidden, positions, slots = inputs
-        m = hidden.shape[0]
         mirror_m = m if width in (2560, 4096) else 1
         q_width = 3072 if width >= 3584 else 1536
         shapes = ((m, q_width), (m, 256), (m, 256), (mirror_m, 256), (mirror_m, 256))
@@ -140,6 +151,11 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             )
             for _ in range(2)
         ]
+        return outputs, caches
+
+    def _invoke(self, width, mode, inputs):
+        hidden, positions, slots = inputs
+        outputs, caches = self._empty_results(width, hidden.shape[0])
         args = (
             hidden,
             self.weights[width],
@@ -153,6 +169,44 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         )
         program = self._program(width, mode)
         program(*args)
+        return self._read_results(width, outputs, caches, slots)
+
+    def _invoke_rank_chunks(self, width, inputs, local_rows, chunks):
+        torch = self.torch
+        hidden, positions, slots = inputs
+        self.assertEqual(hidden.shape[0], 2 * local_rows)
+        outputs, caches = self._empty_results(width, hidden.shape[0])
+        rank_hidden = hidden.view(2, local_rows, 2048)
+        # Simulate AG's rank-major receive rows within each chunk. Keep every
+        # receive tensor alive until the launches finish; outputs and metadata
+        # retain the original full rank-major order throughout.
+        chunk_inputs = [
+            torch.cat((rank_hidden[0, start:end], rank_hidden[1, start:end]))
+            for start, end, _ in chunks
+        ]
+        programs = {
+            mode: self._rank_chunk_program(width, mode)
+            for _, _, mode in chunks
+        }
+        for (start, end, mode), chunk_hidden in zip(chunks, chunk_inputs):
+            programs[mode](
+                chunk_hidden,
+                self.weights[width],
+                self.gamma,
+                positions,
+                self.cos_sin,
+                slots,
+                *outputs,
+                *caches,
+                1e-6,
+                local_rows,
+                end - start,
+                start,
+            )
+        return self._read_results(width, outputs, caches, slots)
+
+    def _read_results(self, width, outputs, caches, slots):
+        torch = self.torch
         torch.npu.synchronize()
 
         # Test assertions run on CPU, outside the operator execution.
@@ -276,6 +330,36 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                     self._compare_modes(
                         width, "contiguous", self._inputs((m,), pad=pad)
                     )
+
+    def test_tp2_rank_chunks_restore_q12_rows_and_cache(self):
+        torch = self.torch
+        local_rows = 513
+        for width in (3584, 4096):
+            for first_mode in ("contiguous", "row"):
+                with self.subTest(width=width, first_chunk_mode=first_mode):
+                    hidden, positions, slots = self._inputs(
+                        (local_rows, local_rows), prefixes=(17, 1601), pad=False
+                    )
+                    if first_mode == "row":
+                        # Discontinuous positions inside both rank segments
+                        # exercise metadata indexing beyond the first chunk.
+                        positions = (
+                            (torch.arange(2 * local_rows, device="cpu") * 131 + 37)
+                            % self.MAX_POSITION
+                        ).to(self.device)
+                    # Reverse the nonconsecutive physical slot map and skip
+                    # writes at rank/chunk boundaries, including the tail row.
+                    slots = slots.cpu().flip(0)
+                    slots[[0, 255, 256, 512, 513, 768, 769, 1025]] = -1
+                    inputs = hidden, positions, slots.to(self.device)
+                    reference = self._invoke(width, "row", inputs)
+                    actual = self._invoke_rank_chunks(
+                        width,
+                        inputs,
+                        local_rows,
+                        ((0, 256, first_mode), (256, 513, "row")),
+                    )
+                    self._assert_equal(width, reference, actual)
 
     def test_ragged_prefill_matches_per_request_contiguous(self):
         cases = (

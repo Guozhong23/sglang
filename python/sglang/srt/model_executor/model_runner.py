@@ -1146,18 +1146,37 @@ class ModelRunner:
                 device=self.device,
             )
         if getattr(final_plan.role, "name", None) == "TARGET_DP":
+            # Chunk count and fusion eligibility change the collective
+            # sequence. Reject mismatched launch environments before serving;
+            # this adds no per-layer/per-request control collective.
+            qkv_ag_config = (
+                tuple(
+                    layer.layer_id
+                    for layer in layers
+                    if layer.self_attn.use_npu_fused_qkv
+                ),
+                envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get(),
+                envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS.get(),
+                envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MIN_CHUNK_TOKENS.get(),
+                envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MAX_CHUNKS.get(),
+            )
+            execution_policy = (
+                final_plan.oproj_policy, final_plan.fused_pack, qkv_ag_config
+            )
             policies = [None] * self.tp_group.world_size
             with torch.inference_mode(False):
                 torch.distributed.all_gather_object(
                     policies,
-                    (final_plan.oproj_policy, final_plan.fused_pack),
+                    execution_policy,
                     group=self.tp_group.cpu_group,
                 )
-            if any(
-                policy != (final_plan.oproj_policy, final_plan.fused_pack)
-                for policy in policies
-            ):
-                raise ValueError(f"WeLM OProj policies differ across ranks: {policies}")
+            if any(policy != execution_policy for policy in policies):
+                raise ValueError(f"WeLM execution policies differ across ranks: {policies}")
+            logger.info(
+                "WeLM eager BF16 AG+QKV: fused_layers=%s Full(min_tokens,max_chunks)=%s "
+                "SWA_overrides=%s (DP prefill graphs excluded)",
+                qkv_ag_config[0], qkv_ag_config[1:3], qkv_ag_config[3:],
+            )
             if final_plan.oproj_policy.use_mc2:
                 for layer in layers:
                     layer.self_attn._get_welm_npu_o_proj_hcom_name(

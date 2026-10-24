@@ -887,11 +887,28 @@ class WelmDpAttentionExecutor:
             and is_non_consumer_attention_layer
             and layer.self_attn.can_reuse_prefill_mxfp8_input()
         )
-        defer_hidden_all_gather = bool(
+        defer_mxfp8_hidden_all_gather = bool(
             input_is_scattered
             and plan.attn_tp_size > 1
             and reuse_prefill_mxfp8_input
         )
+        # Check the real BF16 ABI after input norm, which may narrow FP32
+        # incoming hidden. A rejected/short candidate restores the original AG
+        # before attention can submit chunk collectives or write KV.
+        defer_bf16_hidden_all_gather = bool(
+            graph is None
+            and plan.role is WelmRunnerRole.TARGET_DP
+            and has_ordinary_prefill
+            and input_is_scattered
+            and plan.attn_tp_size > 1
+            and is_non_consumer_attention_layer
+            and not reuse_prefill_mxfp8_input
+            and layer.self_attn.use_npu_fused_qkv
+        )
+        defer_hidden_all_gather = (
+            defer_mxfp8_hidden_all_gather or defer_bf16_hidden_all_gather
+        )
+        prefill_ag_qkv_slices = None
         later_mirror_prefill = bool(
             plan.role is WelmRunnerRole.TARGET_DP
             and has_ordinary_prefill
@@ -927,6 +944,17 @@ class WelmDpAttentionExecutor:
                     input_is_scattered=input_is_scattered,
                     defer_hidden_all_gather=defer_hidden_all_gather,
                 )
+                if defer_bf16_hidden_all_gather:
+                    prefill_ag_qkv_slices = (
+                        layer.self_attn.get_prefill_ag_fused_qkv_slices(
+                            hidden_states, forward_batch, tp_size=plan.attn_tp_size
+                        )
+                    )
+                    if prefill_ag_qkv_slices is None:
+                        hidden_states = welm_attn_all_gather_rows(
+                            hidden_states, attn_tp_group=plan.attn_tp_group
+                        )
+                        defer_hidden_all_gather = False
             state = WelmDpLayerState(
                 hidden_states=hidden_states,
                 residual=residual,
@@ -985,7 +1013,11 @@ class WelmDpAttentionExecutor:
                     # ordinary-prefill transport: FP8 activation/scale for
                     # QKV plus original BF16 hidden rows for Gate.  DP=TP has
                     # attn_tp_size=1, so it keeps the existing local path.
-                    plan.attn_tp_group if defer_hidden_all_gather else None
+                    plan.attn_tp_group if defer_mxfp8_hidden_all_gather else None
+                ),
+                prefill_ag_qkv_slices=prefill_ag_qkv_slices,
+                prefill_bf16_all_gather_group=(
+                    plan.attn_tp_group if prefill_ag_qkv_slices is not None else None
                 ),
             )
             state = self._finish_attention_and_norm(

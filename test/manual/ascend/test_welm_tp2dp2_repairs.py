@@ -145,9 +145,9 @@ class TestGeometry(unittest.TestCase):
             ),
             _is_swa_layer=lambda layer: False,
         )
-        fn = load_nodes(
+        methods = load_nodes(
             SRT / "models/welmv4.py",
-            ["_try_npu_fused_qkv"],
+            ["_try_npu_fused_qkv", "_can_use_npu_fused_qkv"],
             dict(
                 torch=torch,
                 ForwardMode=NS(EXTEND=1, MIXED=3, DECODE=2, TARGET_VERIFY=5),
@@ -157,8 +157,13 @@ class TestGeometry(unittest.TestCase):
                 ),
             ),
             class_name="Qwen2MoeAttention",
-        )["_try_npu_fused_qkv"]
-        owner = NS(
+        )
+        fn = methods["_try_npu_fused_qkv"]
+
+        class Attention(NS):
+            _can_use_npu_fused_qkv = methods["_can_use_npu_fused_qkv"]
+
+        owner = Attention(
             num_heads=12,
             num_kv_heads=1,
             head_dim=256,

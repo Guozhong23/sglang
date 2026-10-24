@@ -159,6 +159,21 @@ def _get_welm_prefill_ag_qkv_slices(
     return list(zip(boundaries, boundaries[1:]))
 
 
+def _restore_welm_prefill_ag_gate(
+    gate: torch.Tensor, slices: List[Tuple[int, int]], tp_size: int
+) -> torch.Tensor:
+    """Restore chunk-major Gate outputs to the attention group's rank order."""
+    restored = gate.new_empty(gate.shape)
+    rows = restored.view(tp_size, -1, *gate.shape[1:])
+    for start, end in slices:
+        rows[:, start:end].copy_(
+            gate[tp_size * start : tp_size * end].view(
+                tp_size, end - start, *gate.shape[1:]
+            )
+        )
+    return restored
+
+
 def _get_welm_fused_qkv_program(
     device: Any,
     qkv_width: int,
@@ -2137,6 +2152,85 @@ class Qwen2MoeAttention(nn.Module):
             segment_tile_starts=batch.welmv4_rope_segment_tile_starts,
         )
 
+    def _can_use_npu_fused_qkv(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
+        """Check the BF16 ABI before any collective or fused KV write."""
+        if (
+            self.num_heads not in (6, 12)
+            or self.num_kv_heads != 1
+            or self.head_dim != 256
+            or self.qk_rope_head_dim != 64
+            or self.q_norm is not None
+            or self.k_norm is None
+            or getattr(self.qkv_proj, "bias", None) is not None
+            or getattr(self, "qkv_proj_bias", None) is not None
+            or getattr(forward_batch.welm_prefill_graph, "is_dp", False)
+            or forward_batch.forward_mode
+            not in (
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.DECODE,
+                ForwardMode.TARGET_VERIFY,
+            )
+        ):
+            return False
+        has_mirror = (
+            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers
+            and hasattr(self, "qkv_proj_weight")
+        )
+        weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
+        return (
+            hidden_states.ndim == 2
+            and hidden_states.shape[0] > 0
+            and hidden_states.shape[1] == 2048
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and weight.dtype == torch.bfloat16
+            and weight.is_contiguous()
+            and tuple(weight.shape)
+            == (self.q_size + (4 if has_mirror else 2) * 256, 2048)
+            and self.q_size == self.num_heads * 256
+            and self.k_norm.weight.dtype == torch.bfloat16
+            and self.k_norm.weight.numel() == 256
+            and self.k_norm.weight.is_contiguous()
+        )
+
+    def get_prefill_ag_fused_qkv_slices(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        tp_size: int,
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Select eager BF16 chunks using the actual post-norm local input."""
+        local_mode = (
+            getattr(forward_batch, "_original_forward_mode", None)
+            or forward_batch.forward_mode
+        )
+        if (
+            not self.use_npu_fused_qkv
+            or self.is_nextn
+            or self.kv_mirror_layer_idx in self.kv_mirror_layers
+            or forward_batch.welm_prefill_graph is not None
+            or local_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or tp_size < 2
+            or not self._can_use_npu_fused_qkv(hidden_states, forward_batch)
+        ):
+            return None
+        min_tokens = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS.get()
+        max_chunks = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS.get()
+        if self.sliding_window_size > -1:
+            swa_min = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MIN_CHUNK_TOKENS.get()
+            swa_max = envs.SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MAX_CHUNKS.get()
+            if swa_min is not None:
+                min_tokens = swa_min
+            if swa_max is not None:
+                max_chunks = swa_max
+        return _get_welm_prefill_ag_qkv_slices(
+            hidden_states.shape[0], tp_size, min_tokens, max_chunks
+        )
+
     def _try_npu_fused_qkv(
         self,
         positions: torch.Tensor,
@@ -2152,23 +2246,9 @@ class Qwen2MoeAttention(nn.Module):
         ]
     ]:
         """Use the fixed WeLM BF16 ABI for target prefill, decode or verify."""
-        # This ABI has no Q norm or bias arguments. Keep unsupported layers
-        # on their existing projection path, including all DP prefill graphs.
-        if (
-            self.num_heads not in (6, 12)
-            or self.num_kv_heads != 1
-            or self.head_dim != 256
-            or self.qk_rope_head_dim != 64
-            or self.q_norm is not None
-            or self.k_norm is None
-            or getattr(self.qkv_proj, "bias", None) is not None
-            or getattr(self, "qkv_proj_bias", None) is not None
-            or getattr(forward_batch.welm_prefill_graph, "is_dp", False)
-        ):
+        if not self._can_use_npu_fused_qkv(hidden_states, forward_batch):
             return None
         num_tokens = hidden_states.shape[0]
-        if num_tokens == 0:
-            return None
         mode = forward_batch.forward_mode
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
@@ -2203,19 +2283,6 @@ class Qwen2MoeAttention(nn.Module):
             and hasattr(self, "qkv_proj_weight")
         )
         weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
-        if (
-            weight.dtype != torch.bfloat16
-            or not weight.is_contiguous()
-            or tuple(weight.shape)
-            != (self.q_size + (4 if has_mirror else 2) * 256, 2048)
-            or hidden_states.dtype != torch.bfloat16
-            or not hidden_states.is_contiguous()
-            or hidden_states.shape[1] != 2048
-            or self.q_size != self.num_heads * 256
-            or self.k_norm.weight.dtype != torch.bfloat16
-            or not self.k_norm.weight.is_contiguous()
-        ):
-            return None
         # CANNBotDSL accepts plain tensors; do not bind/copy loader Parameters.
         weight = weight.data
         gamma = self.k_norm.weight.data.view(1, self.head_dim)
@@ -2591,6 +2658,7 @@ class Qwen2MoeAttention(nn.Module):
         local_hidden: torch.Tensor,
         forward_batch: ForwardBatch,
         slices: List[Tuple[int, int]],
+        all_gather_group: Optional[Any] = None,
     ) -> Tuple[
         torch.Tensor,
         Tuple[
@@ -2602,7 +2670,9 @@ class Qwen2MoeAttention(nn.Module):
         ],
     ]:
         """Return chunk-major Gate input and original-row-order fused QKV."""
-        group = get_tp_group()
+        if all_gather_group is None and is_dp_attention_enabled():
+            raise RuntimeError("WeLM DP fused QKV AG requires an attention-TP group")
+        group = get_tp_group() if all_gather_group is None else all_gather_group
         tp_size = group.world_size
         local_rows, hidden_size = local_hidden.shape
         num_tokens = tp_size * local_rows
@@ -2634,6 +2704,8 @@ class Qwen2MoeAttention(nn.Module):
                 else forward_batch.out_cache_loc
             )
         )
+        if positions.numel() != num_tokens or slots.numel() != num_tokens:
+            raise RuntimeError("WeLM fused QKV AG rows do not match positions/KV slots")
         full_positions = positions.to(torch.int64)
         full_slots = slots.to(torch.int64)
 
@@ -3107,6 +3179,7 @@ class Qwen2MoeAttention(nn.Module):
         o_proj_rs_group: Optional[Any] = None,
         prefill_ag_qkv_slices: Optional[List[Tuple[int, int]]] = None,
         prefill_mxfp8_ag_qkv_slices: Optional[List[Tuple[int, int]]] = None,
+        prefill_bf16_all_gather_group: Optional[Any] = None,
     ) -> torch.Tensor:
         prefill_gate_hidden_states = None
         prefill_gate_all_gather_on_alt_stream = False
@@ -3136,9 +3209,20 @@ class Qwen2MoeAttention(nn.Module):
         if prefill_ag_qkv_slices is not None:
             # Only Gate consumes this chunk-major arena. Attention and mirror
             # consumers continue to use the fused outputs in original row order.
-            prefill_gate_hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
-                positions, hidden_states, forward_batch, prefill_ag_qkv_slices
+            profile = (
+                torch.profiler.record_function("welm.dp.ag_fused_qkv")
+                if prefill_bf16_all_gather_group is not None
+                and envs.SGLANG_WELMV4_DP_PROFILE_RANGES.get()
+                else nullcontext()
             )
+            with profile:
+                prefill_gate_hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    prefill_ag_qkv_slices,
+                    all_gather_group=prefill_bf16_all_gather_group,
+                )
         elif prefill_mxfp8_ag_qkv_slices is not None:
             (
                 fused_qkv,
@@ -3527,18 +3611,16 @@ class Qwen2MoeAttention(nn.Module):
                 gate = self.gate_proj(gate_input)[0].unsqueeze(-1)
                 if prefill_ag_qkv_slices is not None:
                     # One BF16 Gate MM over the whole chunk-major receive arena.
-                    # Restore only [M, local_heads, 1] (6 heads at TP4), not
+                    # Restore only [M, local_heads, 1] (6/12 heads at TP4/TP2), not
                     # [M, hidden_size], before pairing Gate with attention rows.
-                    tp_size = get_tp_group().world_size
-                    restored_gate = gate.new_empty(gate.shape)
-                    gate_rows = restored_gate.view(tp_size, -1, *gate.shape[1:])
-                    for start, end in prefill_ag_qkv_slices:
-                        gate_rows[:, start:end].copy_(
-                            gate[tp_size * start : tp_size * end].view(
-                                tp_size, end - start, *gate.shape[1:]
-                            )
-                        )
-                    gate = restored_gate
+                    group = (
+                        get_tp_group()
+                        if prefill_bf16_all_gather_group is None
+                        else prefill_bf16_all_gather_group
+                    )
+                    gate = _restore_welm_prefill_ag_gate(
+                        gate, prefill_ag_qkv_slices, group.world_size
+                    )
             # gate: (bs * seq_len, num_heads, 1)
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             if enable_npu_gate_alt_stream:

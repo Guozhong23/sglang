@@ -831,7 +831,9 @@ class Envs:
     # MAX_CHUNKS < 2 keeps the existing non-pipeline path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
-    # BF16/MXFP8 QKV AG settings apply to Full and, unless overridden, SWA.
+    # QKV AG settings apply to Full and, unless overridden, SWA. DP attention
+    # supports eager BF16 only and also requires SGLANG_NPU_WELMV4_DP_FUSED_QKV=1.
+    # Non-DP attention retains its BF16/MXFP8 pipelines.
     # MIN_CHUNK_TOKENS counts gathered rows; MAX_CHUNKS < 2 disables chunking.
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS = EnvInt(0)
