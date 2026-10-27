@@ -37,7 +37,11 @@ def preflight(monkeypatch):
     spec = importlib.util.spec_from_file_location("welm_vl_preflight_deps", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    for flag in FLAGS + ("SGLANG_VLM_VISION_USE_DP", "SGLANG_VLM_VISION_USE_ULYSSES"):
+    for flag in FLAGS + (
+        "SGLANG_VLM_VISION_USE_DP",
+        "SGLANG_VLM_VISION_USE_ULYSSES",
+        "SGLANG_NPU_WELMV4_DP_FUSED_QKV",
+    ):
         monkeypatch.delenv(flag, raising=False)
     extensions = {
         name: SimpleNamespace(**{symbol: Mock() for symbol in symbols})
@@ -196,8 +200,58 @@ def test_cli_forwards_profile_to_runtime_with_standalone_baseline_default(
     monkeypatch.setattr(preflight.module, "check_runtime", runtime)
     preflight.module.main()
     runtime.assert_called_once_with(
-        Path("/checkpoint"), 4, 0, None, profile or "baseline", False
+        Path("/checkpoint"), 4, 0, None, profile or "baseline", False, 1
     )
+
+
+def test_dp4_profile_checks_deepep_and_uses_attention_tp_for_fused_qkv(
+    preflight, monkeypatch
+):
+    monkeypatch.setenv("SGLANG_NPU_WELMV4_FUSED_QKV", "1")
+    preflight.module.check_optimization_dependencies(tp=4, dp=4, profile="dp4ep4")
+    preflight.importer.assert_called_once_with("deep_ep")
+
+
+def test_dp2_fused_qkv_checks_its_enabled_extension(preflight, monkeypatch):
+    monkeypatch.setenv("SGLANG_NPU_WELMV4_FUSED_QKV", "1")
+    monkeypatch.setenv("SGLANG_NPU_WELMV4_DP_FUSED_QKV", "1")
+    preflight.module.check_optimization_dependencies(tp=4, dp=2)
+    preflight.importer.assert_called_once_with(FUSED)
+
+
+def test_dp4_parallel_dimensions_use_one_attention_shard(preflight):
+    config = {
+        "text_config": {"num_attention_heads": 7},
+        "vision_config": {"num_attention_heads": 5, "intermediate_size": 37},
+    }
+    assert preflight.module.check_parallel_dimensions(config, 4, True, dp=4) == "dp"
+    with pytest.raises(ValueError, match="attention TP=2"):
+        preflight.module.check_parallel_dimensions(config, 4, True, dp=2)
+
+
+@pytest.mark.parametrize("tp,dp", [(0, 1), (4, 0), (4, 3), (4, 8), (-4, 4)])
+def test_invalid_attention_topology_is_rejected(preflight, tp, dp):
+    with pytest.raises(ValueError, match="positive.*divisible"):
+        preflight.module.attention_tp_size(tp, dp)
+
+
+@pytest.mark.parametrize("tp,dp,vision_dp", [(4, 1, True), (8, 4, True), (4, 4, False)])
+def test_dp4_profile_requires_matching_topology_and_encoder(
+    preflight, tp, dp, vision_dp
+):
+    with pytest.raises(ValueError, match="dp4ep4 profile requires"):
+        preflight.module.check_deployment_profile("dp4ep4", tp, dp, vision_dp)
+
+
+def test_dp4_cli_forwards_dp_to_runtime(preflight, monkeypatch):
+    _configure_cli(
+        preflight, monkeypatch, "--runtime", "--profile", "dp4ep4",
+        "--dp", "4", "--mm-enable-dp-encoder",
+    )
+    runtime = Mock()
+    monkeypatch.setattr(preflight.module, "check_runtime", runtime)
+    preflight.module.main()
+    runtime.assert_called_once_with(Path("/checkpoint"), 4, 0, None, "dp4ep4", True, 4)
 
 
 def test_unknown_profile_is_rejected_before_imports(preflight):

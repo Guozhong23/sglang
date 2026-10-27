@@ -23,11 +23,20 @@ def vision_parallel_mode(mm_enable_dp_encoder=False, *, supports_ulysses=True) -
     )
 
 
-def check_parallel_dimensions(config: dict, tp: int, mm_enable_dp_encoder=False) -> str:
+def attention_tp_size(tp: int, dp: int = 1) -> int:
+    if tp <= 0 or dp <= 0 or tp % dp:
+        raise ValueError(
+            "TP and DP sizes must be positive and TP must be divisible by DP"
+        )
+    return tp // dp
+
+
+def check_parallel_dimensions(
+    config: dict, tp: int, mm_enable_dp_encoder=False, dp: int = 1
+) -> str:
     moonvit = "WeLMMoonViTVLForConditionalGeneration" in config.get("architectures", [])
     mode = vision_parallel_mode(mm_enable_dp_encoder, supports_ulysses=not moonvit)
-    if tp <= 0:
-        raise ValueError("TP size must be positive")
+    attn_tp = attention_tp_size(tp, dp)
     dimensions = [(config["text_config"], "num_attention_heads")]
     # DP has full heads/MLPs on each worker; Ulysses only shards heads during
     # attention, while its block MLP weights are replicated.
@@ -36,9 +45,20 @@ def check_parallel_dimensions(config: dict, tp: int, mm_enable_dp_encoder=False)
     if mode == "tp":
         dimensions.append((config["vision_config"], "intermediate_size"))
     for cfg, field in dimensions:
-        if cfg[field] % tp:
-            raise ValueError(f"{field}={cfg[field]} is not divisible by TP={tp}.")
+        if cfg[field] % attn_tp:
+            raise ValueError(
+                f"{field}={cfg[field]} is not divisible by attention TP={attn_tp}."
+            )
     return mode
+
+
+def check_deployment_profile(profile, tp, dp, mm_enable_dp_encoder):
+    attention_tp_size(tp, dp)
+    if profile == "dp4ep4":
+        if (tp, dp) != (4, 4):
+            raise ValueError("The dp4ep4 profile requires TP=4, DP=4 (attention TP=1)")
+        if not mm_enable_dp_encoder:
+            raise ValueError("The dp4ep4 profile requires --mm-enable-dp-encoder")
 
 
 def check_artifacts(model_path: Path) -> dict:
@@ -86,16 +106,18 @@ def check_artifacts(model_path: Path) -> dict:
     return config
 
 
-def check_optimization_dependencies(tp: int, profile: str = "baseline") -> None:
+def check_optimization_dependencies(
+    tp: int, profile: str = "baseline", dp: int = 1
+) -> None:
     """Import enabled extensions without allocating distributed runtime buffers."""
-    if profile not in ("baseline", "optimized"):
+    if profile not in ("baseline", "optimized", "dp4ep4"):
         raise ValueError(f"Unknown WeLM-VL profile: {profile}")
 
     required = []
-    if profile == "optimized":
-        required.append(("deep_ep", ("Buffer", "Config"), "optimized DeepEP profile"))
-    # Match the individual production flag parsers. Fused QKV is enabled only
-    # by the literal value "1" and its specialized projection uses TP=4.
+    if profile in ("optimized", "dp4ep4"):
+        required.append(("deep_ep", ("Buffer", "Config"), f"{profile} DeepEP profile"))
+    # Match the production flags and supported attention topologies. The
+    # specialized projection supports TP4 and the separately enabled TP2DP2.
     if os.getenv("WELM_NPU_USE_MEGAMOE", "0").lower() in ("1", "true", "yes", "y"):
         required.append(
             (
@@ -112,7 +134,12 @@ def check_optimization_dependencies(tp: int, profile: str = "baseline") -> None:
                 "WELM_NPU_USE_FLASH_ATTN",
             )
         )
-    if tp == 4 and os.getenv("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1":
+    attn_tp = attention_tp_size(tp, dp)
+    fused_qkv_topology = attn_tp == 4 or (
+        (tp, dp) == (4, 2)
+        and os.getenv("SGLANG_NPU_WELMV4_DP_FUSED_QKV", "0") == "1"
+    )
+    if fused_qkv_topology and os.getenv("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1":
         # Import the real kernel module: importing cannbotdsl alone would miss
         # incompatible cannbotdsl 0.7 RingBuffer/memory/register APIs.
         required.append(
@@ -144,6 +171,7 @@ def check_runtime(
     chat_template: str | None,
     profile: str = "baseline",
     mm_enable_dp_encoder: bool = False,
+    dp: int = 1,
 ):
     mode = vision_parallel_mode(mm_enable_dp_encoder)
     import torch
@@ -163,7 +191,7 @@ def check_runtime(
         VisionNPUFusionConfig.from_env().validate_runtime(
             torch.device(f"npu:{base_device}")
         )
-        check_optimization_dependencies(tp, profile)
+        check_optimization_dependencies(tp, profile, dp)
     config = get_config(str(model_path), trust_remote_code=True, local_files_only=True)
     processor = get_processor(
         str(model_path), trust_remote_code=True, local_files_only=True
@@ -205,7 +233,8 @@ def check_runtime(
     else:
         heads, width = vision.num_attention_heads, vision.hidden_size
     head_dim = width // heads
-    attention_heads = heads if mode == "dp" else heads // tp
+    attn_tp = attention_tp_size(tp, dp)
+    attention_heads = heads if mode == "dp" else heads // attn_tp
     device = torch.device(f"npu:{base_device}")
     with torch.npu.device(device), torch.inference_mode():
         q = torch.zeros(
@@ -230,7 +259,8 @@ def check_runtime(
         torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
     print(
         f"NPU vision attention probe passed: BF16, head_dim={head_dim}, "
-        f"vision={mode}, local_heads={attention_heads}, LLM TP={tp}."
+        f"vision={mode}, local_heads={attention_heads}, "
+        f"LLM attention TP={attn_tp}, DP={dp}, world TP={tp}."
     )
 
 
@@ -238,12 +268,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_path", type=Path)
     parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--base-device", type=int, default=0)
     parser.add_argument("--chat-template")
     parser.add_argument("--runtime", action="store_true")
     parser.add_argument("--mm-enable-dp-encoder", action="store_true")
     parser.add_argument(
-        "--profile", choices=("baseline", "optimized"), default="baseline"
+        "--profile", choices=("baseline", "optimized", "dp4ep4"), default="baseline"
     )
     args = parser.parse_args()
     try:
@@ -252,7 +283,10 @@ def main():
             raise ValueError(
                 "This checkpoint's basic TP path supports TP=1, 2, 4 or 8."
             )
-        check_parallel_dimensions(config, args.tp, args.mm_enable_dp_encoder)
+        check_deployment_profile(
+            args.profile, args.tp, args.dp, args.mm_enable_dp_encoder
+        )
+        check_parallel_dimensions(config, args.tp, args.mm_enable_dp_encoder, args.dp)
         if args.chat_template and not Path(args.chat_template).is_file():
             raise ValueError(f"Chat template does not exist: {args.chat_template}")
         if args.runtime:
@@ -263,6 +297,7 @@ def main():
                 args.chat_template,
                 args.profile,
                 args.mm_enable_dp_encoder,
+                args.dp,
             )
     except (
         ValueError,

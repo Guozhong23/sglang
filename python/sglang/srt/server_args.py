@@ -5922,11 +5922,24 @@ class ServerArgs:
         if unsupported:
             raise ValueError(
                 "WeLM-VL supports BF16 combined vision/language serving with "
-                "ordinary attention TP or NPU TP2 x DP2 x EP4, with optional "
-                "DeepEP and WeLM prefill MegaMoE. "
+                "ordinary attention TP or NPU TP2 x DP2 x EP4 / TP1 x DP4 x EP4, "
+                "with optional DeepEP and WeLM prefill MegaMoE. "
                 "Not yet supported: " + ", ".join(unsupported) + "."
             )
         if self.enable_dp_attention:
+            if self.tp_size == 4 and self.dp_size == 4:
+                if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                    logger.warning(
+                        "WeLM-VL DP4EP4 currently uses eager prefill; disabling "
+                        "prefill graphs while preserving decode graph settings."
+                    )
+                    self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                logger.info(
+                    "WeLM-VL DP4EP4: attention TP=1, DP=4, EP=4. ViT DP "
+                    "runs each request's images on its local rank; different "
+                    "DP requests never share a vision collective. Chunked "
+                    "prefill is limited to 32768 tokens per DP worker."
+                )
             self._validate_welm_vlm_attention_dp_config()
         if self.disaggregation_mode != "null":
             unsupported_pd = [
@@ -5982,11 +5995,12 @@ class ServerArgs:
         )
 
     def _validate_welm_vlm_attention_dp_config(self, *, resolved=False) -> None:
-        """Bound the first VL attention-DP implementation to TP2 x DP2 x EP4.
+        """Validate VL attention TP2/DP2 or TP1/DP4 with four MoE EP ranks.
 
         DeepEP resolves EP later, so validate the final EP group only in the
         post-resolution pass. Module layout and resolved BF16 dtype are checked
-        again by the model runner and graph adapter before capture.
+        again by the model runner. DP4 prefill stays eager; only DP2 supports
+        the current prefill graph adapter.
         """
         view = resolved_view(self) if resolved else self
         text_config = self.get_model_config().hf_text_config
@@ -5995,8 +6009,8 @@ class ServerArgs:
             for enabled, option in (
                 (not is_npu(), "non-NPU runtime"),
                 (
-                    view.tp_size != 4 or self.dp_size != 2,
-                    "requires --tp-size 4 --dp-size 2",
+                    view.tp_size != 4 or self.dp_size not in (2, 4),
+                    "requires --tp-size 4 and --dp-size 2 or 4",
                 ),
                 (self.nnodes != 1, "multi-node workers"),
                 (
@@ -6032,7 +6046,22 @@ class ServerArgs:
             )
             if enabled
         ]
-        if resolved and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        if self.dp_size == 4:
+            # The framework divides the CLI budget by DP size later in
+            # _handle_data_parallelism. Check both representations so invalid
+            # large budgets fail before communication buffers or kernels
+            # are initialized.
+            chunk_limit = 32768 if resolved else 32768 * self.dp_size
+            chunk = self.chunked_prefill_size
+            if chunk is None or chunk <= 0 or chunk > chunk_limit:
+                unsupported.append(
+                    "DP4EP4 requires a positive chunked-prefill-size of at most "
+                    "32768 tokens per DP worker (CLI budget at most 131072 "
+                    "before division by DP=4)"
+                )
+            if resolved and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                unsupported.append("DP4EP4 requires disabled prefill graphs")
+        elif resolved and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
             prefill = self.cuda_graph_config.prefill
             capacities = [getattr(prefill, "max_bs", None)] + list(
                 getattr(prefill, "bs", None) or []
@@ -6047,7 +6076,8 @@ class ServerArgs:
                 )
         if unsupported:
             raise ValueError(
-                "WeLM-VL attention DP supports single-node NPU BF16 TP2 x DP2 x EP4. "
+                "WeLM-VL attention DP supports single-node NPU BF16 TP2 x DP2 x EP4 "
+                "or eager-prefill TP1 x DP4 x EP4. "
                 "Not yet supported: " + ", ".join(unsupported) + "."
             )
 
@@ -6084,7 +6114,7 @@ class ServerArgs:
         Group coverage, local-EP kernels, module sharding, and OProj reduction
         are runner/model facts and are deliberately left to plan finalization.
         The text executor uses capability checks; VL additionally keeps its
-        first implementation within the explicit TP2 x DP2 x EP4 topology.
+        supported implementations within TP2 x DP2 x EP4 or TP1 x DP4 x EP4.
         """
         if (
             not is_npu()
@@ -6932,9 +6962,10 @@ class ServerArgs:
                 )
             else:
                 logger.info(
-                    "--mm-enable-dp-encoder is enabled across TP=%d. It replicates "
-                    "the vision encoder and distributes image work across ranks; "
-                    "this is most useful when high-resolution or multi-image ViT "
+                    "--mm-enable-dp-encoder is enabled with world TP=%d. It replicates "
+                    "the vision encoder; the model selects the image work group "
+                    "(WeLM-VL uses each attention-TP group under attention DP). "
+                    "This is most useful when high-resolution or multi-image ViT "
                     "prefill is a material part of TTFT. Measure against the default "
                     "for small-image workloads because replication and aggregation "
                     "can increase memory use and overhead.",

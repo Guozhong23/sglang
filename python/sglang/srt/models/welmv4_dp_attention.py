@@ -168,11 +168,18 @@ def build_welm_target_runner_plan(
             name="replica-DP",
             group=replica_dp_group,
             rank=parallel_state.attn_dp_rank,
-            size=2,
+            size=parallel_state.attn_dp_size,
         )
         lane = parallel_state.attn_tp_rank
-        if list(replica_dp_group.ranks) != [lane, lane + 2]:
-            raise ValueError("WeLM replica-DP groups must be [0,2] and [1,3]")
+        expected_ranks = [
+            lane + dp_rank * parallel_state.attn_tp_size
+            for dp_rank in range(parallel_state.attn_dp_size)
+        ]
+        if list(replica_dp_group.ranks) != expected_ranks:
+            raise ValueError(
+                "WeLM replica-DP ranks must preserve attention-TP lanes "
+                f"in DP slot order: expected {expected_ranks}"
+            )
     return WelmRunnerParallelPlan(
         role=WelmRunnerRole.TARGET_DP,
         replica_dp_group=replica_dp_group,

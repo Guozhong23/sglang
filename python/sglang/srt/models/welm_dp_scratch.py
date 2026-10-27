@@ -22,15 +22,23 @@ def warmup_eager_scratch(model, plan, *, capacities, dtype, device):
         build_welm_dp_moe_row_layout,
     )
 
-    if plan.attn_tp_size != 2 or plan.outer_target_dp_size != 2:
-        raise ValueError("WeLM scratch warmup currently requires attention TP2 x DP2")
+    attn_tp_size = int(plan.attn_tp_size)
+    dp_size = int(plan.outer_target_dp_size)
+    if (attn_tp_size, dp_size) not in ((2, 2), (1, 4)):
+        raise ValueError(
+            "WeLM scratch warmup requires attention TP2 x DP2 or TP1 x DP4"
+        )
     pool = model.welm_dp_scratch_pool
     executor = model.layers[0]._welm_dp_executor
     for capacity in sorted(set(capacities)):
-        capacity = (max(2, capacity) + 1) // 2 * 2
+        capacity = (
+            (max(attn_tp_size, capacity) + attn_tp_size - 1)
+            // attn_tp_size
+            * attn_tp_size
+        )
         for request_capacity in (1, 16):
-            for mask in (1, 2, 3):
-                tokens = [capacity if mask & (1 << d) else 0 for d in range(2)]
+            for mask in range(1, 1 << dp_size):
+                tokens = [capacity if mask & (1 << d) else 0 for d in range(dp_size)]
                 requests = [min(request_capacity, t) for t in tokens]
                 layout = build_welm_dp_moe_row_layout(
                     raw_rows_cpu=tokens,
@@ -38,7 +46,7 @@ def warmup_eager_scratch(model, plan, *, capacities, dtype, device):
                     local_dp_rank=plan.outer_target_dp_rank,
                     device=device,
                     padding_mode=DpPaddingMode.MAX_LEN,
-                    current_slot_alignment=2,
+                    current_slot_alignment=attn_tp_size,
                 )
                 batch = SimpleNamespace(
                     welm_dp_moe_row_layout=layout,

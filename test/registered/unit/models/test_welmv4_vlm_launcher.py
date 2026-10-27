@@ -14,6 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
 LAUNCHER = ROOT / "examples/runtime/welm_vl/run_950pr.sh"
+DP4_LAUNCHER = ROOT / "examples/runtime/welm_vl/run_950pr_dp4ep4.sh"
 PERFORMANCE_FLAGS = (
     "WELM_NPU_USE_MEGAMOE",
     "WELM_NPU_USE_FLASH_ATTN",
@@ -31,6 +32,7 @@ PERFORMANCE_FLAGS = (
     "SGLANG_VLM_NPU_FUSE_ADD_LAYERNORM",
 )
 RECORDED_ENV = PERFORMANCE_FLAGS + (
+    "SGLANG_NPU_WELMV4_DP_FUSED_QKV",
     "SGLANG_VIT_ENABLE_CUDA_GRAPH",
     "SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES",
     "PYTHONPATH",
@@ -56,7 +58,7 @@ def invoke_launcher(tmp_path):
     )
     recorder.chmod(0o755)
 
-    def invoke(*args, **environment):
+    def invoke(*args, launcher=LAUNCHER, **environment):
         recordings.unlink(missing_ok=True)
         # Deliberately exclude inherited WeLM/device flags to make defaults
         # reproducible; tests inject inherited overrides explicitly.
@@ -68,7 +70,7 @@ def invoke_launcher(tmp_path):
             **environment,
         }
         result = subprocess.run(
-            ["bash", str(LAUNCHER), *args],
+            ["bash", str(launcher), *args],
             cwd=tmp_path,
             env=env,
             capture_output=True,
@@ -104,7 +106,9 @@ def _successful_calls(result, calls):
     assert "--enable-multimodal" in launch["argv"]
     assert "--trust-remote-code" in launch["argv"]
     expected_profile = (
-        "optimized"
+        "dp4ep4"
+        if "--dp-size" in launch["argv"]
+        else "optimized"
         if _option(launch["argv"], "--moe-a2a-backend") == "deepep"
         else "baseline"
     )
@@ -113,6 +117,101 @@ def _successful_calls(result, calls):
         assert call["env"]["SGLANG_VIT_ENABLE_CUDA_GRAPH"] == "0"
         assert call["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(ROOT / "python")
     return preflight, launch
+
+
+def test_dp4ep4_launches_four_local_attention_workers(invoke_launcher):
+    result, calls = invoke_launcher("--mm-enable-dp-encoder", launcher=DP4_LAUNCHER)
+    preflight, launch = _successful_calls(result, calls)
+    argv = launch["argv"]
+    for name in ("--tp-size", "--dp-size", "--ep-size"):
+        assert _option(argv, name) == "4"
+    assert _option(preflight["argv"], "--dp") == "4"
+    assert "--enable-dp-attention" in argv
+    assert "--mm-enable-dp-encoder" in argv
+    assert "--mm-enable-dp-encoder" in preflight["argv"]
+    assert _option(argv, "--chunked-prefill-size") == "131072"
+    assert _option(argv, "--max-prefill-tokens") == "32768"
+    assert "--disable-prefill-cuda-graph" in argv
+    assert "--enable-mixed-chunk" not in argv
+    assert "--disable-cuda-graph" not in argv
+    assert _option(argv, "--cuda-graph-max-bs") == "8"
+    assert _option(argv, "--moe-a2a-backend") == "deepep"
+    for flag in (
+        "SGLANG_NPU_WELMV4_FUSED_QKV",
+        "SGLANG_NPU_WELMV4_DP_FUSED_QKV",
+        "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER",
+        "WELM_NPU_USE_MEGAMOE",
+        "WELM_NPU_USE_FLASH_ATTN",
+    ):
+        assert launch["env"][flag] == "0"
+
+
+def test_dp4ep4_custom_worker_budget_and_eager_decode(invoke_launcher):
+    result, calls = invoke_launcher(
+        "--mm-enable-dp-encoder",
+        launcher=DP4_LAUNCHER,
+        CHUNKED_PREFILL_TOKENS_PER_WORKER="8192",
+        MAX_PREFILL_TOKENS="16384",
+        WELM_VL_DECODE_GRAPH="0",
+    )
+    _, launch = _successful_calls(result, calls)
+    assert _option(launch["argv"], "--chunked-prefill-size") == "32768"
+    assert _option(launch["argv"], "--max-prefill-tokens") == "16384"
+    assert "--disable-cuda-graph" in launch["argv"]
+    assert "--cuda-graph-max-bs" not in launch["argv"]
+
+
+def test_dp4ep4_requires_explicit_encoder_flag(invoke_launcher):
+    result, calls = invoke_launcher(launcher=DP4_LAUNCHER)
+    assert result.returncode == 2
+    assert "explicit --mm-enable-dp-encoder" in result.stderr
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"TP_SIZE": "2"},
+        {"DP_SIZE": "2"},
+        {"EP_SIZE": "2"},
+        {"CHUNKED_PREFILL_TOKENS_PER_WORKER": "0"},
+        {"CHUNKED_PREFILL_TOKENS_PER_WORKER": "32769"},
+        {"CHUNKED_PREFILL_TOKENS_PER_WORKER": "-1"},
+        {"CHUNKED_PREFILL_TOKENS_PER_WORKER": "$(false)"},
+        {"MAX_PREFILL_TOKENS": "65536"},
+        {"CHUNKED_PREFILL_SIZE": "32768"},
+        {"WELM_VL_PREFILL_GRAPH": "1"},
+        {"WELM_VL_MIXED_CHUNK": "1"},
+        {"WELM_VL_DECODE_GRAPH": "invalid"},
+        {"SGLANG_VLM_VISION_USE_ULYSSES": "1"},
+    ],
+)
+def test_dp4ep4_invalid_settings_fail_before_preflight(invoke_launcher, environment):
+    result, calls = invoke_launcher(
+        "--mm-enable-dp-encoder", launcher=DP4_LAUNCHER, **environment
+    )
+    assert result.returncode == 2
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--tp-size=8",
+        "--dp-size=2",
+        "--ep-size=1",
+        "--enable-mixed-chunk",
+        "--chunked-prefill-size=32769",
+        "--cuda-graph-config={}",
+        "--moe-a2a-backend=none",
+    ],
+)
+def test_dp4ep4_rejects_cli_contract_overrides(invoke_launcher, option):
+    result, calls = invoke_launcher(
+        "--mm-enable-dp-encoder", option, launcher=DP4_LAUNCHER
+    )
+    assert result.returncode == 2
+    assert not calls
 
 
 def _assert_optimized(launch, tp):

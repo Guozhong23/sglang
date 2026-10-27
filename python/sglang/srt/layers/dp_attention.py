@@ -1411,15 +1411,15 @@ def welm_dp_replicate_gather(
     # transport even when real rows differ or one DP is idle.
     use_replica = (
         replica_dp_group is not None
-        and len(row_view.slot_rows_cpu) == 2
-        and row_view.slot_rows_cpu[0] == row_view.slot_rows_cpu[1] > 0
+        and local_slot_rows > 0
+        and all(rows == local_slot_rows for rows in row_view.slot_rows_cpu)
     )
     if replica_dp_group is not None or fused_pack:
         from sglang.srt.layers.welm_dp_pack import pack_dp_slot
 
         if use_replica:
             if (
-                replica_dp_group.world_size != 2
+                replica_dp_group.world_size != len(row_view.slot_rows_cpu)
                 or replica_dp_group.rank_in_group != dp_rank
             ):
                 raise RuntimeError(

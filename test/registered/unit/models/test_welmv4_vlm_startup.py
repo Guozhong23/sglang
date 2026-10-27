@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import runpy
+import sys
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -512,7 +513,7 @@ def test_attention_tp2_dp2_ep4_accepts_bf16_and_keeps_eager_optimizations(
     "changes",
     [
         {"tp_size": 8},
-        {"dp_size": 4},
+        {"dp_size": 3},
         {"nnodes": 2},
         {"attn_cp_size": 2},
         {"dcp_size": 2},
@@ -589,3 +590,83 @@ def test_attention_dp_graph_capacity_uses_resolved_per_group_chunk(field):
         args.cuda_graph_config.prefill, field, 16512 if field == "max_bs" else [16512]
     )
     _parallel_policy()(args)
+
+
+@pytest.mark.parametrize("decode_backend", ["full", "disabled"])
+@pytest.mark.parametrize(
+    "model_arch", [ARCH, "WeLMMoonViTVLForConditionalGeneration"]
+)
+def test_dp4_ep4_disables_only_prefill_graphs(monkeypatch, decode_backend, model_arch):
+    args = _attention_dp_args(dp_size=4, chunked_prefill_size=32768)
+    args.cuda_graph_config.decode.backend = decode_backend
+    _startup_policy()(args)
+    _apply_shared_welm_prefill_policy(args, monkeypatch, model_arch=model_arch)
+    _parallel_policy()(args)
+    assert args.cuda_graph_config.prefill.backend == "disabled"
+    assert args.cuda_graph_config.decode.backend == decode_backend
+    assert args.mm_enable_dp_encoder and args.enable_dp_attention
+    assert not args.enable_mixed_chunk
+
+
+@pytest.mark.parametrize("per_worker", [128, 8192, 32768])
+def test_dp4_ep4_chunk_budget_runs_real_dp_division(monkeypatch, per_worker):
+    args = _attention_dp_args(dp_size=4, chunked_prefill_size=per_worker * 4)
+    args.schedule_conservativeness = 1.0
+    _startup_policy()(args)
+    # Omit only the unrelated resolution imports; execute the production
+    # handler so the CLI budget cannot accidentally be divided twice.
+    overrides = ModuleType("sglang.srt.arg_groups.overrides")
+    overrides._data_parallelism_defaults = object()
+    overrides._dp_lm_head_validation = object()
+    overrides.run_post_process_pass = lambda *_: None
+    monkeypatch.setitem(sys.modules, overrides.__name__, overrides)
+    handler = _definitions(
+        SRT / "server_args.py",
+        {"_handle_data_parallelism"},
+        {
+            "Backend": SimpleNamespace(DISABLED="disabled"),
+            "logger": logging.getLogger(__name__),
+        },
+    )["_handle_data_parallelism"]
+    handler(args)
+    _parallel_policy()(args)
+    assert args.chunked_prefill_size == per_worker
+    assert args.schedule_conservativeness == pytest.approx(0.3)
+    assert args.cuda_graph_config.prefill.backend == "disabled"
+
+
+@pytest.mark.parametrize("chunk", [None, -1, 0, 131073])
+def test_dp4_ep4_rejects_unbounded_or_oversized_cli_chunk(chunk):
+    with pytest.raises(ValueError, match="32768 tokens per DP worker"):
+        _startup_policy()(_attention_dp_args(dp_size=4, chunked_prefill_size=chunk))
+
+
+@pytest.mark.parametrize("chunk", [-1, 0, 32769])
+def test_dp4_ep4_checks_final_per_worker_chunk(chunk):
+    args = _attention_dp_args(dp_size=4)
+    _startup_policy()(args)
+    args.chunked_prefill_size = chunk
+    with pytest.raises(ValueError, match="32768 tokens per DP worker"):
+        _parallel_policy()(args)
+
+
+def test_dp4_ep4_rejects_reenabled_prefill_graph_after_resolution():
+    args = _attention_dp_args(dp_size=4)
+    _startup_policy()(args)
+    args.cuda_graph_config.prefill.backend = "breakable"
+    with pytest.raises(ValueError, match="disabled prefill graphs"):
+        _parallel_policy()(args)
+
+
+@pytest.mark.parametrize(
+    "changes,message",
+    [
+        ({"mm_enable_dp_encoder": False}, "mm-enable-dp-encoder"),
+        ({"moe_a2a_backend": "none"}, "DeepEP"),
+        ({"tp_size": 8}, "--tp-size 4"),
+        ({"disaggregation_mode": "prefill"}, "P/D disaggregation"),
+    ],
+)
+def test_dp4_ep4_preserves_transport_and_vision_guards(changes, message):
+    with pytest.raises(ValueError, match=message):
+        _startup_policy()(_attention_dp_args(dp_size=4, **changes))

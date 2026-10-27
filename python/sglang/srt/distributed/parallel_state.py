@@ -2439,7 +2439,7 @@ def initialize_model_parallel(
     # Every world rank enters the same startup vote and new_group order.
     # This optional topology belongs to model-parallel lifetime, not layers.
     replica_requested = envs.SGLANG_WELMV4_DP_REPLICA_ALLGATHER.get()
-    if tensor_model_parallel_size == 4 and attention_data_parallel_size == 2:
+    if tensor_model_parallel_size == 4 and attention_data_parallel_size in (2, 4):
         flags = [None] * get_world_group().world_size
         with torch.inference_mode(False):
             torch.distributed.all_gather_object(
@@ -2451,16 +2451,25 @@ def initialize_model_parallel(
         if (
             world_size != 4
             or tensor_model_parallel_size != 4
-            or attention_data_parallel_size != 2
-            or attn_tp_size != 2
+            or (attention_data_parallel_size, attn_tp_size) not in ((2, 2), (4, 1))
             or expert_model_parallel_size != 4
             or pipeline_model_parallel_size != 1
             or recovered_rank
             or rank_offset != 0
         ):
-            raise ValueError("WeLM replica-DP AllGather requires single-node TP2DP2EP4")
+            raise ValueError(
+                "WeLM replica-DP AllGather requires single-node TP2DP2EP4 "
+                "or TP1DP4EP4"
+            )
+        replica_groups = [
+            [
+                lane + dp_rank * attn_tp_size
+                for dp_rank in range(attention_data_parallel_size)
+            ]
+            for lane in range(attn_tp_size)
+        ]
         _WELM_REPLICA_DP = init_model_parallel_group(
-            [[0, 2], [1, 3]],
+            replica_groups,
             get_world_group().local_rank,
             backend,
             use_pynccl=False,
