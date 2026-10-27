@@ -195,7 +195,13 @@ def encode_vision_dp(items, encoder, projector, group):
             grids = torch.tensor(
                 [plan.grids[index] for index in batch], dtype=torch.int64
             )
-            outputs.append(projector(encoder(pixels, grids)))
+            hidden_states = encoder(pixels, grids)
+            project_images = getattr(projector, "forward_images", None)
+            outputs.append(
+                project_images(hidden_states, grids)
+                if project_images is not None
+                else projector(hidden_states)
+            )
         local = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
     else:
         # Idle ranks enter the same AllGather without running empty attention.

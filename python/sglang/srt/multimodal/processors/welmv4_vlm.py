@@ -1,6 +1,6 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0
-"""WeLM-v4.5-VL image preprocessing using the checkpoint's native processor."""
+"""WeLM visual preprocessing using the checkpoint's native processor."""
 
 import asyncio
 import threading
@@ -26,6 +26,7 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
     # Preserve template token IDs through both OpenAI chat and TokenizerManager.
     prompt_input_type = "token_ids"
     prefer_tokenized_input = True
+    _supports_native_video = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self._validate_checkpoint_processor(_processor, server_args)
@@ -42,10 +43,30 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
                 f"config={configured_image_id}, tokenizer={self.image_token_id}. "
                 "Use the tokenizer distributed with this VL checkpoint."
             )
-        self.vision_start_token_id = self._require_token_id(
-            tokenizer, "<|vision_start|>"
-        )
-        self.vision_end_token_id = self._require_token_id(tokenizer, "<|vision_end|>")
+        (
+            self.vision_start_token_id,
+            self.vision_end_token_id,
+        ) = self._resolve_vision_boundary_tokens(tokenizer, self.image_token)
+        self.video_token = None
+        self.video_token_id = None
+        # Actor represents video frames as timestamped IMAGE token runs. Keep
+        # older checkpoints (including the MoonViT subclass) image-only unless
+        # their native processor explicitly provides that normalization API.
+        self._supports_native_video = callable(
+            getattr(_processor, "normalize_video_item", None)
+        ) and bool(getattr(_processor, "video_token", None))
+        if self._supports_native_video:
+            self.video_token = _processor.video_token
+            self.video_token_id = self._require_token_id(tokenizer, self.video_token)
+            configured_video_id = getattr(hf_config, "video_token_id", None)
+            if (
+                configured_video_id is not None
+                and configured_video_id != self.video_token_id
+            ):
+                raise ValueError(
+                    "WeLM video_token_id does not match the checkpoint tokenizer: "
+                    f"config={configured_video_id}, tokenizer={self.video_token_id}."
+                )
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.IM_START_TOKEN_ID = self.vision_start_token_id
         self.IM_END_TOKEN_ID = self.vision_end_token_id
@@ -53,6 +74,8 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.image_token,
             image_token_id=self.image_token_id,
+            video_token=self.video_token,
+            video_token_id=self.video_token_id,
         ).build(_processor)
         # The checkpoint processor can hold mutable preprocessing state. Offload
         # CPU patchification without concurrently invoking that shared object.
@@ -112,6 +135,24 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
             )
         return token_id
 
+    @classmethod
+    def _resolve_vision_boundary_tokens(cls, tokenizer, image_token):
+        prefixes = (
+            ("welm_", "") if image_token.startswith("<|welm_") else ("", "welm_")
+        )
+        for prefix in prefixes:
+            try:
+                return (
+                    cls._require_token_id(tokenizer, f"<|{prefix}vision_start|>"),
+                    cls._require_token_id(tokenizer, f"<|{prefix}vision_end|>"),
+                )
+            except ValueError:
+                continue
+        raise ValueError(
+            "WeLM tokenizer is missing a matching pair of vision boundary tokens. "
+            "Use the tokenizer distributed with this VL checkpoint."
+        )
+
     @staticmethod
     def _is_token_id_input(input_text) -> bool:
         return isinstance(input_text, list) and (
@@ -146,18 +187,40 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
             loaded_images[idx] = future.result()
         return loaded_images
 
-    def _process_token_ids(self, input_ids, image_data):
+    def _processor_kwargs(self):
+        processor_kwargs = {}
+        if self.image_config:
+            processor_kwargs["images_kwargs"] = dict(self.image_config)
+        if getattr(self, "video_config", None):
+            processor_kwargs["videos_kwargs"] = dict(self.video_config)
+        return processor_kwargs
+
+    def _normalize_videos(self, video_data, processor_kwargs):
+        if not video_data:
+            return None
+        # Decode separate videos concurrently while preserving their order.
+        # This runs under _processor_lock, just like image patchification.
+        futures = [
+            self.io_executor.submit(
+                self._processor.normalize_video_item,
+                video,
+                processor_kwargs=processor_kwargs,
+            )
+            for video in video_data
+        ]
+        return [future.result() for future in futures]
+
+    def _process_token_ids(self, input_ids, image_data, video_data=None):
+        processor_kwargs = self._processor_kwargs()
+        normalized_videos = self._normalize_videos(video_data, processor_kwargs)
         resolved = self._processor.resolve_tokenized_multimodal_inputs(
             input_ids,
             images=image_data,
-            normalized_videos=None,
+            normalized_videos=normalized_videos,
             load_images=False,
         )
         resolved_images = resolved["images"]
         loaded_images = self._load_images(resolved_images) if resolved_images else None
-        processor_kwargs = {}
-        if self.image_config:
-            processor_kwargs["images_kwargs"] = dict(self.image_config)
         return self._processor.process_resolved_tokenized_multimodal_prompt(
             input_ids,
             images=loaded_images,
@@ -166,6 +229,16 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
             return_tensors="pt",
             processor_kwargs=processor_kwargs,
         )
+
+    def _process_video_prompt(self, input_text, image_data, video_data):
+        # A string prompt is already rendered by the caller. Tokenize once,
+        # then let the checkpoint preserve timestamps and interleaved ordering.
+        # Generic video preprocessing uses a different frame/token layout.
+        if not self._is_token_id_input(input_text):
+            input_text = self._processor.tokenizer.encode(
+                input_text, add_special_tokens=False
+            )
+        return self._process_token_ids(input_text, image_data, video_data)
 
     async def _fallback_text_processor(self, input_text, image_data):
         base_output = await self.load_mm_data(
@@ -222,6 +295,7 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
             im_token_id=self.image_token_id,
+            video_token_id=getattr(self, "video_token_id", None),
             token_type_ids=token_type_ids,
         )
 
@@ -234,30 +308,43 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
-        if image_data and getattr(request_obj, "mm_hashes", None):
+        video_data = getattr(request_obj, "video_data", None)
+        if (image_data or video_data) and getattr(request_obj, "mm_hashes", None):
             raise ValueError(
                 "WeLM-v4.5-VL does not support caller-supplied mm_hashes yet: "
                 "external image hashes have not been validated to include the "
                 "image grid. Omit mm_hashes so the server computes a key from "
                 "the processed pixels and grid."
             )
-        if (
-            getattr(request_obj, "video_data", None)
-            or audio_data
-            or getattr(request_obj, "audio_data", None)
+        if audio_data or getattr(request_obj, "audio_data", None):
+            raise ValueError(
+                "WeLM-v4.5-VL audio inputs are not supported by this implementation."
+            )
+        if video_data and not self._supports_native_video:
+            raise ValueError(
+                "This WeLM checkpoint supports image inputs only; video requires "
+                "a native processor with normalize_video_item and video tokens."
+            )
+        if any(
+            self._is_precomputed_item(item)
+            for items in (image_data, video_data)
+            for item in (items or [])
         ):
             raise ValueError(
-                "WeLM-v4.5-VL currently supports text and images; "
-                "video and audio inputs are not supported by this implementation."
-            )
-        if any(self._is_precomputed_item(item) for item in (image_data or [])):
-            raise ValueError(
-                "WeLM-v4.5-VL currently requires raw images; precomputed embeddings "
+                "WeLM-v4.5-VL requires raw visual inputs; precomputed embeddings "
                 "and processor_output inputs are not supported."
             )
         entry_time = time.perf_counter()
         use_token_ids = self._is_token_id_input(input_text)
-        if use_token_ids:
+        if video_data:
+            ret = await asyncio.to_thread(
+                self._run_processor_locked,
+                self._process_video_prompt,
+                input_text,
+                image_data,
+                video_data,
+            )
+        elif use_token_ids:
             ret = await asyncio.to_thread(
                 self._run_processor_locked,
                 self._process_token_ids,
@@ -269,7 +356,7 @@ class WeLMV4VLMImageProcessor(BaseMultimodalProcessor):
         logger.debug(
             "WeLM-v4.5-VL preprocessing rid=%s path=%s duration_ms=%.2f",
             getattr(request_obj, "rid", "anonymous_rid"),
-            "token_ids" if use_token_ids else "text",
+            "video" if video_data else "token_ids" if use_token_ids else "text",
             (time.perf_counter() - entry_time) * 1000,
         )
         # Hashing full-resolution CPU pixels can be expensive; keep it off the

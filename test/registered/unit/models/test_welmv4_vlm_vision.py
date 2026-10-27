@@ -43,6 +43,9 @@ def _load_ops():
 
 
 OPS = _load_ops()
+VLM_UTILS = runpy.run_path(
+    str(ROOT / "python/sglang/srt/models/welmv4_vlm_utils.py")
+)
 
 _cache_spec = importlib.util.spec_from_file_location(
     "welmv4_vision_test_cache", ROOT / "python/sglang/srt/layers/welmv4_vision_cache.py"
@@ -69,6 +72,7 @@ def _load_definitions(*names, **extra):
         SimpleNamespace=SimpleNamespace,
         vision_grid_key=CACHE.vision_grid_key,
         VisionMetadataCache=CACHE.VisionMetadataCache,
+        welmv4_vlm_visual_actor_match=VLM_UTILS["welmv4_vlm_visual_actor_match"],
         VisionDPInputSpec=runpy.run_path(
             str(ROOT / "python/sglang/srt/layers/welmv4_vision_dp.py")
         )["VisionDPInputSpec"],

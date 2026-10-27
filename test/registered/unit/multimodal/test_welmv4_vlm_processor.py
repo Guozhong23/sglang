@@ -170,6 +170,96 @@ class TestWeLMV4VLMProcessor(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["input_ids"].tolist(), [[1, 154752, 2]])
 
+    async def test_video_frames_keep_render_order_timestamps_and_resize_specs(self):
+        processor = self.make_processor()
+        processor._supports_native_video = True
+        processor.video_config = {"fps": 2, "max_frames": 8}
+        frames = [
+            {"image": "frame-0", "timestamp": "0.000s"},
+            {"image": "frame-1", "timestamp": "0.500s", "max_pixels": 1024},
+        ]
+        processor._processor.normalize_video_item = Mock(return_value=frames)
+        processor._processor.resolve_tokenized_multimodal_inputs.return_value = {
+            "images": ["before", "frame-0", "frame-1", "after"],
+            "video_timestamp_groups": [["0.000s", "0.500s"]],
+            "image_resize_specs": [None, None, {"max_pixels": 1024}, None],
+        }
+        processor._load_images = Mock(side_effect=lambda images: list(images))
+        ids = [1, 154752, 2, 154753, 3, 154752]
+        video = {"video": frames, "fps": 2}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            processor.io_executor = executor
+            await processor.process_mm_data_async(
+                ["before", "after"],
+                None,
+                ids,
+                SimpleNamespace(video_data=[video]),
+            )
+        processor_kwargs = {
+            "images_kwargs": {"max_pixels": 4096},
+            "videos_kwargs": {"fps": 2, "max_frames": 8},
+        }
+        processor._processor.normalize_video_item.assert_called_once_with(
+            video, processor_kwargs=processor_kwargs
+        )
+        resolve = processor._processor.resolve_tokenized_multimodal_inputs
+        resolve.assert_called_once_with(
+            ids,
+            images=["before", "after"],
+            normalized_videos=[frames],
+            load_images=False,
+        )
+        process = processor._processor.process_resolved_tokenized_multimodal_prompt
+        call = process.call_args
+        self.assertIs(call.args[0], ids)
+        self.assertEqual(
+            call.kwargs["images"], ["before", "frame-0", "frame-1", "after"]
+        )
+        self.assertEqual(
+            call.kwargs["video_timestamp_groups"], [["0.000s", "0.500s"]]
+        )
+        self.assertEqual(
+            call.kwargs["image_resize_specs"], [None, None, {"max_pixels": 1024}, None]
+        )
+        self.assertEqual(call.kwargs["processor_kwargs"], processor_kwargs)
+
+    async def test_video_text_prompt_uses_native_token_path(self):
+        processor = self.make_processor()
+        processor._supports_native_video = True
+        processor._processor.tokenizer = SimpleNamespace(
+            encode=Mock(return_value=[1, 154753, 2])
+        )
+        processor._process_token_ids = Mock(return_value={"input_ids": [1, 2]})
+        processor._fallback_text_processor = AsyncMock()
+        result = await processor.process_mm_data_async(
+            [], None, "rendered video prompt", SimpleNamespace(video_data=["video.mp4"])
+        )
+        processor._processor.tokenizer.encode.assert_called_once_with(
+            "rendered video prompt", add_special_tokens=False
+        )
+        processor._process_token_ids.assert_called_once_with(
+            [1, 154753, 2], [], ["video.mp4"]
+        )
+        processor._fallback_text_processor.assert_not_called()
+        self.assertEqual(result, {"input_ids": [1, 2]})
+
+    def test_video_loading_preserves_order_when_workers_finish_out_of_order(self):
+        processor = self.make_processor()
+        second_entered = threading.Event()
+
+        def normalize(video, processor_kwargs):
+            if video == "first":
+                self.assertTrue(second_entered.wait(timeout=2))
+            else:
+                second_entered.set()
+            return [{"image": video, "timestamp": "0.000s"}]
+
+        processor._processor.normalize_video_item = normalize
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            processor.io_executor = executor
+            result = processor._normalize_videos(["first", "second"], {})
+        self.assertEqual([frames[0]["image"] for frames in result], ["first", "second"])
+
     async def test_cpu_processing_does_not_block_event_loop(self):
         processor = self.make_processor()
         entered = threading.Event()
@@ -372,8 +462,8 @@ class TestWeLMV4VLMProcessor(unittest.IsolatedAsyncioTestCase):
     async def test_unsupported_media_fail_before_native_processing(self):
         cases = (
             (["image"], None, SimpleNamespace(mm_hashes=["00"]), "mm_hashes"),
-            ([], None, SimpleNamespace(video_data=["video.mp4"]), "video and audio"),
-            ([], ["audio.wav"], SimpleNamespace(), "video and audio"),
+            ([], None, SimpleNamespace(video_data=["video.mp4"]), "video requires"),
+            ([], ["audio.wav"], SimpleNamespace(), "audio inputs"),
             (
                 [{"format": "precomputed_embedding"}],
                 None,
@@ -394,6 +484,24 @@ class TestWeLMV4VLMProcessor(unittest.IsolatedAsyncioTestCase):
                     await processor.process_mm_data_async(images, audio, [1], request)
                 resolve = processor._processor.resolve_tokenized_multimodal_inputs
                 resolve.assert_not_called()
+
+    async def test_native_video_rejects_precomputed_inputs_and_external_hashes(self):
+        cases = (
+            (
+                SimpleNamespace(video_data=["video.mp4"], mm_hashes=["bad"]),
+                "mm_hashes",
+            ),
+            (
+                SimpleNamespace(video_data=[{"format": "processor_output"}]),
+                "processor_output",
+            ),
+        )
+        for request, message in cases:
+            processor = self.make_processor()
+            processor._supports_native_video = True
+            with self.assertRaisesRegex(ValueError, message):
+                await processor.process_mm_data_async([], None, [1], request)
+            processor._processor.resolve_tokenized_multimodal_inputs.assert_not_called()
 
     def test_image_loading_preserves_order_and_preloaded_images(self):
         processor = object.__new__(WeLMV4VLMImageProcessor)
@@ -429,6 +537,25 @@ class TestWeLMV4VLMProcessor(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(ValueError, "required token"):
             WeLMV4VLMImageProcessor._require_token_id(tokenizer, "<|image_pad|>")
+
+    def test_vision_boundaries_match_the_checkpoint_token_family(self):
+        vocab = {
+            "<|vision_start|>": 10,
+            "<|vision_end|>": 11,
+            "<|welm_vision_start|>": 20,
+            "<|welm_vision_end|>": 21,
+        }
+        tokenizer = SimpleNamespace(
+            convert_tokens_to_ids=lambda token: vocab.get(token, 0), unk_token_id=0
+        )
+        resolve = WeLMV4VLMImageProcessor._resolve_vision_boundary_tokens
+        self.assertEqual(resolve(tokenizer, "<|image_pad|>"), (10, 11))
+        self.assertEqual(resolve(tokenizer, "<|welm_image_pad|>"), (20, 21))
+        del vocab["<|vision_end|>"]
+        self.assertEqual(resolve(tokenizer, "<|image_pad|>"), (20, 21))
+        del vocab["<|welm_vision_start|>"]
+        with self.assertRaisesRegex(ValueError, "matching pair"):
+            resolve(tokenizer, "<|image_pad|>")
 
     def test_processor_native_template_is_used_by_chat_tokenizer(self):
         processor = self.make_processor()._processor

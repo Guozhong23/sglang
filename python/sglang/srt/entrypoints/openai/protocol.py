@@ -525,10 +525,25 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     min_dynamic_patch: Optional[int] = None
 
 
+class PreSampledVideoFrame(BaseModel):
+    """A timestamped frame accepted by the WeLM native video processor."""
+
+    image: str
+    timestamp: Optional[Union[str, int, float]] = None
+    # Native WeLM accepts per-frame resize hints in addition to video defaults.
+    model_config = ConfigDict(extra="allow")
+
+
 class ChatCompletionMessageContentVideoURL(BaseModel):
-    url: str
+    url: Union[str, List[PreSampledVideoFrame]]
+    fps: Optional[float] = None
+    num_frames: Optional[int] = None
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    resized_height: Optional[int] = None
+    resized_width: Optional[int] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -544,6 +559,12 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    fps: Optional[float] = None
+    num_frames: Optional[int] = None
+    resized_height: Optional[int] = None
+    resized_width: Optional[int] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioPart(BaseModel):

@@ -8,8 +8,9 @@ import ast
 import importlib.util
 import runpy
 import unittest
+from functools import wraps
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -139,13 +140,14 @@ def _load_forward(class_name):
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == class_name
     )
-    forward = next(
+    methods = [
         node
         for node in model_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "forward"
-    )
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("forward", "_forward_impl")
+    ]
     extracted = ast.Module(
-        body=[ast.parse("from __future__ import annotations").body[0], forward],
+        body=[ast.parse("from __future__ import annotations").body[0], *methods],
         type_ignores=[],
     )
     namespace = {
@@ -154,7 +156,18 @@ def _load_forward(class_name):
         "KVMirrorManager": SimpleNamespace(activations_dict_kv={}),
     }
     exec(compile(extracted, str(path), "exec"), namespace)
-    return namespace["forward"]
+    forward = namespace["forward"]
+    if "_forward_impl" not in namespace:
+        return forward
+
+    @wraps(forward)
+    def with_forward_impl(self, *args, **kwargs):
+        # The production entry now owns scratch lifetime and delegates its
+        # execution body. Bind both real methods onto the small CPU stand-in.
+        self._forward_impl = MethodType(namespace["_forward_impl"], self)
+        return forward(self, *args, **kwargs)
+
+    return with_forward_impl
 
 
 class TestWeLMVLMOverEncodingFusion(unittest.TestCase):

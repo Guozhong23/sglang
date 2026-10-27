@@ -177,20 +177,30 @@ def process_content_for_template_format(
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
-                    mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
-                        video_data.append(chunk["video_url"]["url"])
+                    video_entry = {"url": video_obj["url"]}
+                    for key in (
+                        "fps",
+                        "num_frames",
+                        "max_dynamic_patch",
+                        "min_dynamic_patch",
+                        "resized_height",
+                        "resized_width",
+                        "min_pixels",
+                        "max_pixels",
+                    ):
+                        value = chunk.get(key)
+                        if value is None:
+                            value = video_obj.get(key)
+                        if value is not None:
+                            video_entry[key] = value
+                    if len(video_entry) == 1 and isinstance(video_entry["url"], str):
+                        video_data.append(video_entry["url"])
                     else:
-                        # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
-                        )
+                        video_data.append(video_entry)
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
-                    # Normalize to simple 'video' type for template compatibility
+                    # The native processor expands timestamps/frames from the
+                    # side channel; rendering them here would expand them twice.
                     processed_content_parts.append({"type": "video"})
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])

@@ -444,6 +444,23 @@ class GenerateReqInput:
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
+            # A flat image list belongs to this one prompt. Keep an already
+            # batched list unchanged for callers using the existing format.
+            if (
+                isinstance(self.image_data, list)
+                and self.image_data
+                and not isinstance(self.image_data[0], list)
+            ):
+                self.image_data = [self.image_data]
+            # Keep all videos of this prompt together. The batch normalizer
+            # repeats its outer list once per sample, not once per video.
+            # Preserve callers' existing batch wrapper, as for images above.
+            if self.video_data is not None and (
+                not isinstance(self.video_data, list)
+                or not self.video_data
+                or not isinstance(self.video_data[0], list)
+            ):
+                self.video_data = [self.video_data]
             self.is_single = False
             if self.text is not None:
                 self.text = [self.text]

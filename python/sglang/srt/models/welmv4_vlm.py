@@ -49,6 +49,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welmv4 import WeLMV4MoeForCausalLM
+from sglang.srt.models.welmv4_vlm_utils import welmv4_vlm_visual_actor_match
 from sglang.srt.utils import add_prefix, print_warning_once
 
 # Maximum number of vision-encoder patch tokens processed in a single
@@ -113,19 +114,15 @@ def _patch_embed_forward_matmul(
     in_channels: int,
     hidden_size: int,
     chunk_size: Optional[int] = None,
+    actor_match: bool = False,
 ) -> torch.Tensor:
     x = x.view(-1, in_channels, k_t, k_h, k_w).to(dtype=weight.dtype)
     n = x.shape[0]
     weight2d = weight.reshape(hidden_size, -1)
 
-    # The bias is added AFTER the GEMM, NOT through cuBLAS's fused fp32
-    # epilogue. The WeLMV4 training stack computes the GEMM and the bias
-    # add as two separate bf16 ops (``out = gemm(x, w); out = out + b``),
-    # so each operation rounds to bf16 once. Using ``F.linear(x, w, b)``
-    # here would fuse the bias add into the GEMM epilogue and round only
-    # once in fp32, producing slightly different outputs. We mirror the
-    # training-side two-round semantics so inference outputs stay aligned
-    # with training.
+    # Legacy checkpoints round the GEMM before adding the BF16 bias.
+    # Actor checkpoints use F.linear's bias epilogue instead. These are
+    # different numerical contracts, even though the tensor shapes match.
 
     if chunk_size is None:
         chunk_size = _vision_max_patches()
@@ -136,6 +133,8 @@ def _patch_embed_forward_matmul(
         unfolded = unfolded.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
             n, -1, in_channels * k_t * k_h * k_w
         )
+        if actor_match:
+            return F.linear(unfolded, weight2d, bias)
         out = F.linear(unfolded, weight2d, None)
         if bias is not None:
             out = out + bias
@@ -152,8 +151,8 @@ def _patch_embed_forward_matmul(
         unfolded = unfolded.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
             e - s, -1, in_channels * k_t * k_h * k_w
         )
-        out_seg = F.linear(unfolded, weight2d, None)
-        if bias is not None:
+        out_seg = F.linear(unfolded, weight2d, bias if actor_match else None)
+        if bias is not None and not actor_match:
             out_seg = out_seg + bias
         out[s:e] = out_seg
     return out
@@ -166,6 +165,7 @@ class WeLMV4VisionPatchEmbed(nn.Module):
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.hidden_size = config.hidden_size
+        self._actor_match = getattr(config, "welm_visual_actor_match", False)
         kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
         self.proj = nn.Conv3d(
             config.in_channels,
@@ -186,6 +186,7 @@ class WeLMV4VisionPatchEmbed(nn.Module):
             k_w,
             self.in_channels,
             self.hidden_size,
+            actor_match=self._actor_match,
         )
         return out.view(-1, self.hidden_size)
 
@@ -194,6 +195,7 @@ class WeLMV4VisionPositionEmbedding(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self._actor_match = getattr(config, "welm_visual_actor_match", False)
         self.spatial_merge_size = config.spatial_merge_size
         self.num_position_embeddings = config.num_position_embeddings
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
@@ -209,6 +211,8 @@ class WeLMV4VisionPositionEmbedding(nn.Module):
     def _scale(self, x: torch.Tensor, size: int) -> torch.Tensor:
         if size == 1:
             return torch.zeros_like(x, dtype=torch.float32)
+        if self._actor_match:
+            return x.to(torch.float32) * (self.num_grid_per_side - 1) / (size - 1)
         # Use a 0-d fp32 tensor (rather than a Python int) as the divisor:
         # Torch dispatches scalar / tensor divisors to slightly different
         # CUDA kernels with different rounding behaviour, and the training
@@ -233,11 +237,12 @@ class WeLMV4VisionPositionEmbedding(nn.Module):
         w_floor = w_axis.floor().to(torch.int64)
         h_ceil = (h_floor + 1).clamp(max=self.num_grid_per_side - 1)
         w_ceil = (w_floor + 1).clamp(max=self.num_grid_per_side - 1)
-        # Keep the fractional part in fp32 through the bilinear outer
-        # product; the cast to the embedding dtype happens once on the
-        # stacked ``weights`` tensor below.
+        # Actor rounds each fractional axis before the bilinear products;
+        # legacy WeLM keeps both axes in FP32 until the weights are formed.
         dh = h_axis - h_floor.to(torch.float32)
         dw = w_axis - w_floor.to(torch.float32)
+        if self._actor_match:
+            dh, dw = dh.to(dtype), dw.to(dtype)
 
         base = h_floor * self.num_grid_per_side
         base_c = h_ceil * self.num_grid_per_side
@@ -471,6 +476,7 @@ class WeLMV4VisionEncoder(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self._actor_match = getattr(config, "welm_visual_actor_match", False)
         self._ulysses_group = create_vision_ulysses_group(
             config,
             use_data_parallel=use_data_parallel,
@@ -544,6 +550,7 @@ class WeLMV4VisionEncoder(nn.Module):
             self.config.hidden_size,
             self.config.num_attention_heads,
             self.pos_embed.num_grid_per_side,
+            self._actor_match,
         )
 
         def build():
@@ -596,6 +603,11 @@ class WeLMV4VisionEncoder(nn.Module):
         sin = freqs.sin()
         cos_hw = torch.cat([cos[pos_ids[:, 0]], cos[pos_ids[:, 1]]], dim=-1)
         sin_hw = torch.cat([sin[pos_ids[:, 0]], sin[pos_ids[:, 1]]], dim=-1)
+        if self._actor_match:
+            # Actor rounds the table to the model dtype, then rotates Q/K in
+            # FP32. Cache the rounded values in FP32 so the existing NPU fused
+            # RoPE kernel keeps that boundary without a cast in every layer.
+            return cos_hw.to(self.dtype).float(), sin_hw.to(self.dtype).float()
         return cos_hw, sin_hw
 
     def _cu_seqlens(self, grid_thw: torch.Tensor) -> torch.Tensor:
@@ -660,9 +672,8 @@ class WeLMV4VisionEncoder(nn.Module):
         hidden_states = self.patch_embed(pixel_values)
         position, cu_seqlens, cos, sin = self._metadata(grids)
         hidden_states = hidden_states + position.to(hidden_states.dtype)
-        # Keep cos/sin in fp32 here. Our RoPE operation reads them in fp32;
-        # casting to bf16 would lose precision on low-magnitude sin
-        # values and add a measurable error to every block.
+        # Metadata already implements the checkpoint's table rounding. Both
+        # contracts pass FP32 values to the same reference/fused RoPE path.
 
         max_patches = _vision_max_patches()
         total = hidden_states.shape[0]
@@ -757,6 +768,7 @@ class WeLMV4VisionProjector(nn.Module):
         super().__init__()
         merge_hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.merge_hidden_size = merge_hidden_size
+        self._actor_match = getattr(config, "welm_visual_actor_match", False)
         self.ln_q = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self._vision_fusions = VisionNPUFusionConfig.from_env()
         tp_kwargs = _vision_dp_tp_kwargs(use_data_parallel)
@@ -794,6 +806,20 @@ class WeLMV4VisionProjector(nn.Module):
         hidden_states, _ = self.mlp[2](hidden_states)
         return hidden_states
 
+    def forward_images(self, hidden_states, grid_thw):
+        """Keep Actor projector GEMM shapes independent of the image batch."""
+        if not self._actor_match:
+            return self(hidden_states)
+        grids = vision_grid_key(grid_thw)
+        if len(grids) == 1:
+            return self(hidden_states)
+        counts = [t * h * w for t, h, w in grids]
+        if sum(counts) != hidden_states.shape[0]:
+            raise ValueError("Vision projector image grids do not match patch rows")
+        return torch.cat(
+            [self(image) for image in hidden_states.split(counts)], dim=0
+        )
+
 
 class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
     """WeLM text backbone with image embeddings injected after OE fusion.
@@ -815,7 +841,8 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             )
         text_config = copy.copy(_as_config(config.text_config))
         text_config._welmv4_vlm_target_only = True
-        vision_config = _as_config(config.vision_config)
+        vision_config = copy.copy(_as_config(config.vision_config))
+        vision_config.welm_visual_actor_match = welmv4_vlm_visual_actor_match(config)
         if vision_config.out_hidden_size != text_config.hidden_size:
             raise ValueError("vision projector output must match the text hidden size")
         image_token_id = getattr(config, "image_token_id", None)
@@ -880,6 +907,9 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         pixel_values = torch.cat([item.feature for item in items], dim=0)
         image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
         image_embeds = self.vision_encoder(pixel_values, image_grid_thw)
+        project_images = getattr(self.vision_projector, "forward_images", None)
+        if project_images is not None:
+            return project_images(image_embeds, image_grid_thw)
         return self.vision_projector(image_embeds)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

@@ -3,6 +3,30 @@
 import copy
 
 
+def welmv4_vlm_visual_actor_match(config):
+    """Select the native WeLM visual math contract from checkpoint metadata.
+
+    Actor checkpoints use the namespaced image token and Actor-compatible
+    rounding boundaries. Older checkpoints retain their existing visual math.
+    An explicit vision-config boolean overrides this default without changing
+    either the checkpoint config or the separate MoonViT model's behavior.
+    """
+    missing = object()
+
+    def read(value, name, default=None):
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    vision_config = read(config, "vision_config")
+    override = read(vision_config, "welm_visual_actor_match", missing)
+    if override is not missing:
+        if not isinstance(override, bool):
+            raise ValueError("vision_config.welm_visual_actor_match must be a boolean")
+        return override
+    return read(config, "image_token") == "<|welm_image_pad|>"
+
+
 def welmv4_vlm_target_config(config, speculative_algorithm=None):
     """Build the non-MTP execution view without mutating checkpoint metadata.
 

@@ -135,6 +135,66 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _build_welm_vlm_nested_processor(
+    model_path, config, trust_remote_code, revision, **kwargs
+):
+    """Load Actor's nested component configs with the checkpoint's own classes.
+
+    Older Transformers image loaders require preprocessor_config.json, while
+    this export stores its image settings inside processor_config.json. Do not
+    substitute default image settings or change the legacy WeLM/MoonViT loader.
+    """
+    if (
+        not trust_remote_code
+        or getattr(config, "model_type", None) != "welmv4_vlm"
+        or getattr(config, "image_token", None) != "<|welm_image_pad|>"
+    ):
+        return None
+
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.processing_utils import ProcessorMixin
+
+    processor_dict, _ = ProcessorMixin.get_processor_dict(
+        model_path, revision=revision, **kwargs
+    )
+    if not isinstance(processor_dict.get("image_processor"), dict):
+        return None
+
+    def load_class(settings, auto_class):
+        reference = settings.get("auto_map", {}).get(auto_class)
+        if not isinstance(reference, str):
+            raise ValueError(
+                f"WeLM-VL nested processor config is missing {auto_class} auto_map"
+            )
+        return get_class_from_dynamic_module(
+            reference, model_path, revision=revision, **kwargs
+        )
+
+    processor_class = load_class(processor_dict, "AutoProcessor")
+    components = {}
+    for name, auto_class in (
+        ("image_processor", "AutoImageProcessor"),
+        ("video_processor", "AutoVideoProcessor"),
+    ):
+        settings = processor_dict.get(name)
+        if not isinstance(settings, dict):
+            raise ValueError(f"WeLM-VL processor config is missing {name}")
+        component_class = load_class(settings, auto_class)
+        # from_dict copies its input. Keep the serialized normalization,
+        # patch ordering and sampling settings instead of relying on defaults.
+        components[name] = component_class.from_dict(settings)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+    return processor_class(
+        tokenizer=tokenizer,
+        chat_template=kwargs.get("chat_template")
+        or processor_dict.get("chat_template")
+        or getattr(tokenizer, "chat_template", None),
+        **components,
+    )
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -208,13 +268,21 @@ def get_processor(
                     **kwargs,
                 )
             else:
-                processor = AutoProcessor.from_pretrained(
+                processor = _build_welm_vlm_nested_processor(
                     tokenizer_name,
-                    *args,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
+                    config,
+                    trust_remote_code,
+                    revision,
                     **kwargs,
                 )
+                if processor is None:
+                    processor = AutoProcessor.from_pretrained(
+                        tokenizer_name,
+                        *args,
+                        trust_remote_code=trust_remote_code,
+                        revision=revision,
+                        **kwargs,
+                    )
 
     except ValueError as e:
         error_message = str(e)
