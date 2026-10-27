@@ -45,6 +45,15 @@ class Tensor:
     def __gt__(self, other):
         return Tensor(self.data > other)
 
+    def __lt__(self, other):
+        return Tensor(self.data < (other.data if isinstance(other, Tensor) else other))
+
+    def __ge__(self, other):
+        return Tensor(self.data >= (other.data if isinstance(other, Tensor) else other))
+
+    def __and__(self, other):
+        return Tensor(self.data & other.data)
+
     def __sub__(self, other):
         return Tensor(self.data - other)
 
@@ -186,6 +195,7 @@ class TestSplitMath(unittest.TestCase):
 
     def _check_handoff(self, pad_mirror):
         adapter = Adapter.__new__(Adapter)
+        adapter.read_done_by_key = {}
         adapter.pad_mirror = pad_mirror
         adapter.mirror_q_used = Tensor(np.zeros(4, dtype=np.int32))
         adapter.max_tokens = 16

@@ -28,6 +28,12 @@ TORCH = types.SimpleNamespace(
     zeros_like=lambda x: Tensor(np.zeros_like(x.data)),
     arange=lambda n, *, dtype=np.int32, **kw: Tensor(np.arange(n, dtype=dtype)),
     cat=lambda xs: Tensor(np.concatenate([x.data for x in xs])),
+    cumsum=lambda x, dim: Tensor(np.cumsum(x.data, axis=dim)),
+    where=lambda mask, x, y: Tensor(np.where(
+        mask.data,
+        x.data if isinstance(x, Tensor) else x,
+        y.data if isinstance(y, Tensor) else y,
+    )),
 )
 
 
@@ -59,11 +65,13 @@ def make_backend(hybrid=True):
         get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache,
         translate_loc_from_full_to_swa=lambda x: Tensor(x.data + 128),
     )
+    backend.req_to_token = backend.req_to_token_pool.req_to_token
     backend._welm_flash_attn_metadata = lambda *a, **kw: calls.append(("schedule", kw)) or object()
     backend._welm_flash_attn = lambda q, *a, **kw: (
         calls.append(("flash", q.shape[0], kw)) or q.clone(), None
     )
     for name in ("create_welm_prefill_graph_metadata", "prepare_welm_prefill_graph_metadata",
+                 "prepare_welm_prefill_graph_metadata_device", "_prepare_welm_graph_page_tables_device",
                  "write_welm_prefill_graph_kv", "_forward_welm_flash_attention"):
         fn = load_method(path, "AscendAttnBackend", name,
                          {"torch": TORCH, "torch_npu": npu, "ForwardMetadata": metadata})
@@ -190,6 +198,23 @@ class TestFlashMetadata(unittest.TestCase):
         adapter.swa_write_locs = tensor(np.zeros(16))
         adapter.local_valid_rows = tensor([0])
         adapter.tail_indices = tensor(np.zeros(4))
+        adapter.read_done_by_key = {}
+        adapter.runner = types.SimpleNamespace(
+            model_runner=types.SimpleNamespace(welm_graph_read_done_enabled=False)
+        )
+        adapter.request_inputs = {
+            name: tensor(np.zeros(4, dtype=np.int32))
+            for name in ("req_pool_indices", "seq_lens", "extend_seq_lens")
+        }
+        adapter.page_starts = tensor([0, 64, 128, 192], dtype=np.int64)
+        adapter.page_in_bounds = tensor([True] * 4, dtype=bool)
+        adapter.token_indices = tensor(np.arange(16), dtype=np.int64)
+
+        def stage_requests(fb):
+            for name, buf in adapter.request_inputs.items():
+                buf[:fb.batch_size].copy_(getattr(fb, name))
+                setattr(fb, name, buf[:fb.batch_size])
+
         with patch.dict(ADAPTER, torch=TORCH):
             for phase, capacity, lengths in (("prompt", 16, [16]), ("prompt", 8, [8]),
                                               ("mirror", 16, [16 // mirror_bs] * mirror_bs)):
@@ -202,6 +227,7 @@ class TestFlashMetadata(unittest.TestCase):
                 fb.num_token_non_padded_cpu = capacity
                 fb.global_dp_buffer_len = capacity
                 fb.global_num_tokens_cpu = [capacity]
+                stage_requests(fb)
                 adapter.prepare_capture(fb, capacity)
             p8, p16, m2 = (adapter.flash_metadata[k] for k in
                            (adapter.key(8), adapter.key(16), adapter.mirror_key(mirror_bs)))
@@ -233,8 +259,13 @@ class TestFlashMetadata(unittest.TestCase):
                 live.global_num_tokens_cpu = [t]
                 static = copy.copy(live)
                 static.positions = tensor(np.arange(t))
+                static.out_cache_loc = tensor(
+                    list(range(200, 200 + real)) + [0] * (t - real)
+                )
                 static.num_token_non_padded = None
-                adapter.prepare_replay(live, static, t)
+                stage_requests(static)
+                adapter.prepare_replay(live, static, t, raw_num_tokens=real)
+                adapter._prepare_prompt_metadata_device(static)
                 self.assertIs(adapter.current_flash_metadata, adapter.flash_metadata[adapter.key(t)])
                 np.testing.assert_array_equal(adapter.full_write_locs.data[:t],
                                               list(range(200, 200+real)) + [-1]*(t-real))

@@ -187,6 +187,7 @@ def _welm_build_row_view(
     padding_mode: DpPaddingMode,
     real_rows_gpu: Optional[torch.Tensor] = None,
     slot_rows_cpu: Optional[List[int]] = None,
+    pin_memory: bool = False,
 ) -> WelmDpRowView:
     rows = [int(x) for x in real_rows_cpu]
     if not rows:
@@ -215,14 +216,27 @@ def _welm_build_row_view(
         offsets.append(cursor)
         cursor += slot
 
-    if real_rows_gpu is None:
+    if real_rows_gpu is not None and real_rows_gpu.numel() != len(rows):
+        raise ValueError(
+            "WeLM DP fixed real-row buffer has the wrong capacity: "
+            f"{real_rows_gpu.numel()} != {len(rows)}"
+        )
+    if pin_memory:
+        # Fresh staging lets the NPU pinned allocator protect in-flight H2D
+        # reads; a shared host buffer could be overwritten by the next batch.
+        rows_host = torch.tensor(
+            rows,
+            dtype=torch.int32 if real_rows_gpu is None else real_rows_gpu.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        if real_rows_gpu is None:
+            real_rows_gpu = rows_host.to(device=device, non_blocking=True)
+        else:
+            real_rows_gpu.copy_(rows_host, non_blocking=True)
+    elif real_rows_gpu is None:
         real_rows_gpu = torch.tensor(rows, dtype=torch.int32, device=device)
     else:
-        if real_rows_gpu.numel() != len(rows):
-            raise ValueError(
-                "WeLM DP fixed real-row buffer has the wrong capacity: "
-                f"{real_rows_gpu.numel()} != {len(rows)}"
-            )
         real_rows_gpu.copy_(
             torch.tensor(rows, dtype=real_rows_gpu.dtype, device=real_rows_gpu.device)
         )
@@ -255,6 +269,7 @@ def build_welm_dp_moe_row_layout(
     request_slot_rows_cpu: Optional[List[int]] = None,
     current_slot_alignment: int = 1,
     request_slot_alignment: int = 1,
+    pin_memory: bool = False,
 ) -> WelmDpMoeRowLayout:
     """Build WeLM row metadata without touching generic DP token counts.
 
@@ -292,6 +307,7 @@ def build_welm_dp_moe_row_layout(
         padding_mode=padding_mode,
         real_rows_gpu=current_real_rows_gpu,
         slot_rows_cpu=current_slots,
+        pin_memory=pin_memory,
     )
 
     request = None
@@ -314,6 +330,7 @@ def build_welm_dp_moe_row_layout(
             slot_rows_cpu=[
                 ceil_align(x, request_slot_alignment) for x in request_slot_basis
             ],
+            pin_memory=pin_memory,
         )
     return WelmDpMoeRowLayout(current=current, request=request)
 
@@ -1002,6 +1019,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the default full-query path is mathematically equivalent.
     enable_kv_mirror: bool = False
 
+    # Capture-only owner; never copied to the device or reused by eager batches.
+    welm_graph_read_done: Optional[Any] = None
+
     # Target BF16 breakable prefill only. Tensor storage, including native
     # Flash metadata, is runner-owned; request history is prepared before replay.
     welm_prefill_graph: Optional[Any] = None
@@ -1244,6 +1264,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        pin_memory = is_pin_memory_available(device)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1271,9 +1292,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            ret.num_token_non_padded = torch.tensor(
+                num_tokens,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
         # For MLP sync
@@ -1300,12 +1323,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
+                global_num_tokens,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
 
         # Build WeLM's independent row metadata before the idle return. Raw
@@ -1359,6 +1386,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner,
                     current_width=1,
                 ),
+                pin_memory=pin_memory,
             )
 
         if ret.forward_mode.is_idle():
@@ -1395,10 +1423,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32
+                    extend_seq_lens,
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
+                    extend_prefix_lens,
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
@@ -1699,7 +1731,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
-    def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+    def _pad_tensor_to_size(
+        self,
+        tensor: torch.Tensor,
+        size: int,
+        *,
+        value: int = 0,
+        allow_unpadded_alias: bool = False,
+    ):
+        # Opt in only for read-only inputs with an already-protected lifetime.
+        # Keep cat's materialization for non-contiguous inputs and real padding.
+        if (
+            allow_unpadded_alias
+            and size == tensor.shape[0]
+            and tensor.is_contiguous()
+        ):
+            return tensor
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
@@ -1723,6 +1770,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
+
+        # Decide before decode/idle can be converted into a synthetic EXTEND.
+        # Ordinary WeLM Flash prefill reads these device inputs; graph input
+        # staging and the default eager runner's buffer copies remain intact.
+        # Overlap keeps scheduler input references alive, and subsequent batch
+        # updates rebind tensors rather than overwriting these inputs.
+        args = model_runner.server_args
+        allow_unpadded_alias = (
+            _is_npu
+            and self.forward_mode == ForwardMode.EXTEND
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_none()
+            and self.spec_info is None
+            and not model_runner.is_draft_worker
+            and getattr(model_runner.attn_backend, "use_welm_flash_attn", False)
+            and not args.enable_two_batch_overlap
+            and self.tbo_split_seq_index is None
+            and not self.tbo_children
+            and not args.enable_pdmux
+            and not args.enable_prefill_cp
+            and get_parallel().attn_cp_size == 1
+            and model_runner.dcp_size == 1
+            and not enable_cp_v2()
+            and not envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+        )
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
@@ -1930,7 +2002,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_num_tokens = num_tokens
 
         # padding
-        self._pad_inputs_to_size(model_runner, num_tokens, bs)
+        self._pad_inputs_to_size(
+            model_runner, num_tokens, bs, allow_unpadded_alias=allow_unpadded_alias
+        )
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
@@ -1947,11 +2021,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
 
-    def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
+    def _pad_inputs_to_size(
+        self,
+        model_runner: ModelRunner,
+        num_tokens,
+        bs,
+        *,
+        allow_unpadded_alias: bool = False,
+    ):
         # padding
         self._original_num_tokens = self.positions.shape[0]
-        self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
-        self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+        self.input_ids = self._pad_tensor_to_size(
+            self.input_ids, num_tokens, allow_unpadded_alias=allow_unpadded_alias
+        )
+        self.req_pool_indices = self._pad_tensor_to_size(
+            self.req_pool_indices, bs, allow_unpadded_alias=allow_unpadded_alias
+        )
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
@@ -1965,17 +2050,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 bs - self.seq_lens.shape[0]
             )
         self.seq_lens = self._pad_tensor_to_size(
-            self.seq_lens, bs, value=seq_len_fill_value
+            self.seq_lens,
+            bs,
+            value=seq_len_fill_value,
+            allow_unpadded_alias=allow_unpadded_alias,
         )
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self._pad_tensor_to_size(
                 self.seq_lens_cpu, bs, value=seq_len_fill_value
             )
 
-        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        self.out_cache_loc = self._pad_tensor_to_size(
+            self.out_cache_loc, num_tokens, allow_unpadded_alias=allow_unpadded_alias
+        )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
-        self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        self.positions = self._pad_tensor_to_size(
+            self.positions, num_tokens, allow_unpadded_alias=allow_unpadded_alias
+        )
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs
@@ -2000,7 +2092,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                self.extend_seq_lens, bs, allow_unpadded_alias=allow_unpadded_alias
+            )
 
         if self.rids_int is not None:
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)

@@ -1634,7 +1634,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     )
                     value.fill_(-1 if name == "out_cache_loc" else 0)
                     setattr(static, name, value)
-            self.welm_adapter.prepare_replay(forward_batch, static, static_num_tokens)
+            self.welm_adapter.prepare_replay(
+                forward_batch, static, static_num_tokens, raw_num_tokens=0
+            )
             return static
 
         self.buffer_registry.fill_from(
@@ -1830,7 +1832,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.welm_adapter is not None:
             self.welm_adapter.prepare_replay(
-                forward_batch, static_forward_batch, static_num_tokens
+                forward_batch,
+                static_forward_batch,
+                static_num_tokens,
+                raw_num_tokens=num_tokens,
             )
 
         return static_forward_batch

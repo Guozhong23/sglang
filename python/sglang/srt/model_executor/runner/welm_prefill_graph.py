@@ -29,7 +29,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -147,6 +147,7 @@ class WelmMXFP8GraphWorkspace:
 
 class WelmPrefillGraphAdapter:
     is_dp = False
+    supports_graph_read_done = True
     # VL composes base/OE/vision eagerly for both image and text-only requests.
     # A fixed capture boundary prevents replay from applying OE to image rows.
     eager_input_embeddings = False
@@ -256,15 +257,36 @@ class WelmPrefillGraphAdapter:
             min(runner.max_bs, self.max_tokens),
         )
         self.max_requests = max(self.batch_sizes)
+        if runner._prefill_static_buffers is None or runner.max_bs < self.max_requests:
+            raise ValueError("WeLM prefill requires fixed Bmax request input buffers")
+        # Prompt captures with batch_size=1, but replay can carry any B<=Bmax.
+        # Read full fixed views, never the capture batch's one-request slices.
+        self.request_inputs = {
+            name: runner._prefill_static_buffers[name][: self.max_requests]
+            for name in ("req_pool_indices", "seq_lens", "extend_seq_lens")
+        }
         # Allocated outside either graph pool and never shared with decode.
         # Page tables / KV lengths can be shared by T and B graphs: both
         # replays consume the same batch, in order on the forward stream.
         self.flash_inputs = self.backend.create_welm_prefill_graph_metadata(
             self.max_requests
         )
+        self.page_starts = (
+            torch.arange(
+                self.flash_inputs.block_tables.shape[1],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            * self.backend.page_size
+        )
+        self.page_in_bounds = self.page_starts < self.backend.req_to_token.shape[1]
+        self.token_indices = torch.arange(
+            self.max_tokens, dtype=torch.int64, device=self.device
+        )
         self.flash_metadata = {}
         self.current_flash_metadata = None
         self.capture_phase = "prompt"
+        self.read_done_by_key = {}
         self.first_mirror = (
             self.model.layers[0].first_target_kv_mirror_layer if self.prune else None
         )
@@ -407,13 +429,21 @@ class WelmPrefillGraphAdapter:
         batch.welm_prefill_swa_write_locs = self.swa_write_locs[:capacity]
         batch.welmv4_rope_segment_tile_starts = self.rope_tiles.get(capacity)
 
+    def _reset_request_padding(self, batch_size: int):
+        # E=0 is the validity sentinel for every full-Bmax graph consumer.
+        # Mask stale req/seq tails on device instead of issuing more host fills.
+        if batch_size < self.max_requests:
+            self.request_inputs["extend_seq_lens"][batch_size:].zero_()
+
     def prepare_capture(self, batch: ForwardBatch, capacity: int):
         self._bind(batch, capacity)
         self._prepare_mirror_requests(batch.batch_size)
         # Capture is startup-only. Page zero is the existing reserved dummy
         # page; all real request/cache allocations remain outside this adapter.
-        batch.out_cache_loc.zero_()
+        # The captured producer must preserve the no-write dummy contract.
+        batch.out_cache_loc.fill_(-1)
         batch.req_pool_indices.zero_()
+        self._reset_request_padding(batch.batch_size)
         batch.input_ids.zero_()
         positions = []
         for length in batch.extend_seq_lens_cpu:
@@ -430,11 +460,24 @@ class WelmPrefillGraphAdapter:
         else:
             self.local_valid_rows.fill_(capacity)
         self._prepare_tiles(batch, capacity)
+        self._prepare_capture_tail_indices(batch)
         self.backend.prepare_welm_prefill_graph_metadata(
             self.flash_inputs, batch, capture=True
         )
         mirror = batch.welm_prefill_graph_phase == "mirror"
         key = self.mirror_key(batch.batch_size) if mirror else self.key(capacity)
+        if (
+            not mirror
+            and self.supports_graph_read_done
+            and self.runner.model_runner.welm_graph_read_done_enabled
+        ):
+            from sglang.srt.hardware_backend.npu.graph_runner.graph_read_done import (
+                NpuGraphReadDone,
+            )
+
+            if key in self.read_done_by_key:
+                raise RuntimeError("Cannot replace a live WeLM read-done graph owner")
+            self.read_done_by_key[key] = NpuGraphReadDone(device=self.device)
         metadata = copy.copy(self.flash_inputs)
         metadata.welm_flash_schedules = {}
         if mirror:
@@ -496,6 +539,10 @@ class WelmPrefillGraphAdapter:
         )
         self.rope_tiles[key].copy_(host_tiles, non_blocking=True)
         batch.welmv4_rope_segment_tile_starts = self.rope_tiles[key]
+
+    def _prepare_capture_tail_indices(self, batch: ForwardBatch):
+        # Mirror warmup has valid dummy inputs independently of a prior Prompt.
+        # Serving tails are produced from live lengths inside the Prompt graph.
         offset = 0
         tails = []
         for length in batch.extend_seq_lens_cpu:
@@ -506,6 +553,42 @@ class WelmPrefillGraphAdapter:
             tails, dtype=torch.int64, device="cpu", pin_memory=True
         )
         self.tail_indices.copy_(host_tails, non_blocking=True)
+
+    def _prepare_prompt_metadata_device(self, batch: ForwardBatch):
+        """Captured once per Prompt, using only fixed-address device inputs."""
+        capacity = batch.positions.numel()
+        lengths = self.request_inputs["extend_seq_lens"]
+        ends = torch.cumsum(lengths, dim=0)
+        valid_rows = self.token_indices[:capacity] < ends[-1]
+        self.valid_rows[:capacity].copy_(valid_rows)
+
+        # Use true request ends for Mirror. cu-Q's endpoints (0, Tcap) are
+        # initialized once per key; even B==Bmax keeps the physical padded end.
+        self.tail_indices.copy_(torch.where(lengths > 0, ends - 1, 0))
+        cu_q = self.current_flash_metadata.welm_flash_cu_seqlens_q
+        if self.max_requests > 1:
+            cu_q[1:-1].copy_(ends[:-1])
+
+        raw_locs = batch.out_cache_loc
+        valid_writes = valid_rows & (raw_locs >= 0)
+        self.full_write_locs[:capacity].copy_(torch.where(valid_writes, raw_locs, -1))
+        if self.backend.use_sliding_window_kv_pool:
+            # Invalid/padded slots must be safe BEFORE indexing the SWA map.
+            safe_locs = torch.where(valid_writes, raw_locs, 0)
+            swa_locs = self.backend.token_to_kv_pool.translate_loc_from_full_to_swa(
+                safe_locs
+            )
+            self.swa_write_locs[:capacity].copy_(
+                torch.where(valid_writes, swa_locs, -1)
+            )
+        self.backend.prepare_welm_prefill_graph_metadata_device(
+            self.flash_inputs,
+            self.request_inputs["req_pool_indices"],
+            self.request_inputs["seq_lens"],
+            lengths,
+            self.page_starts,
+            self.page_in_bounds,
+        )
 
     def before_capture_forward(self, batch: ForwardBatch):
         from sglang.srt.models.welmv4 import KVMirrorManager
@@ -544,14 +627,33 @@ class WelmPrefillGraphAdapter:
             batch.num_token_non_padded.copy_(self.local_valid_rows)
         if batch.global_num_tokens_gpu is not None and global_rows is not None:
             batch.global_num_tokens_gpu.fill_(global_rows[0])
+        # Mirror consumes the metadata produced by Prompt; never overwrite it
+        # with Mirror's one-Q-per-request capture template.
+        if batch.welm_prefill_graph_phase == "prompt":
+            read_done = self.read_done_by_key.get(key)
+            if read_done is not None:
+                read_done.begin_capture_forward()
+            self._prepare_prompt_metadata_device(batch)
+            if read_done is not None:
+                read_done.signal_once()
         self.current_batch = batch
 
     def after_capture(self, key: ShapeKey, batch: ForwardBatch):
         self.capture_keys.add(key)
         if batch.welm_prefill_graph_phase == "prompt":
             self.captured_states[key] = batch.model_specific_states
+            read_done = self.read_done_by_key.get(key)
+            if read_done is not None:
+                read_done.after_capture()
 
-    def prepare_replay(self, live: ForwardBatch, static: ForwardBatch, capacity: int):
+    def prepare_replay(
+        self,
+        live: ForwardBatch,
+        static: ForwardBatch,
+        capacity: int,
+        *,
+        raw_num_tokens: int,
+    ):
         self._bind(static, capacity)
         self._prepare_mirror_requests(live.batch_size)
         static.welm_prefill_graph_phase = "prompt"
@@ -560,8 +662,7 @@ class WelmPrefillGraphAdapter:
         static.welmv4_npu_deepep_scattered = False
         static.welmv4_npu_deepep_full_mirror = False
         real_rows = sum(live.extend_seq_lens_cpu)
-        self.valid_rows[:real_rows].fill_(True)
-        self.valid_rows[real_rows:capacity].zero_()
+        self._reset_request_padding(live.batch_size)
         self.oe_ids[:, real_rows:capacity].zero_()
         if self.model.oe_grams and not self.eager_input_embeddings:
             # Image placeholders are cache hashes, not logical token IDs. VL
@@ -576,20 +677,14 @@ class WelmPrefillGraphAdapter:
             self.local_valid_rows.copy_(static.num_token_non_padded)
         else:
             self.local_valid_rows.fill_(real_rows)
-        self.full_write_locs[real_rows:capacity].fill_(-1)
-        self.full_write_locs[:real_rows].copy_(live.out_cache_loc[:real_rows])
-        self.swa_write_locs[real_rows:capacity].fill_(-1)
-        if self.backend.use_sliding_window_kv_pool:
-            swa = self.backend.token_to_kv_pool.translate_loc_from_full_to_swa(
-                live.out_cache_loc[:real_rows]
-            )
-            self.swa_write_locs[:real_rows].copy_(swa)
-        self.backend.prepare_welm_prefill_graph_metadata(self.flash_inputs, live)
         self.current_flash_metadata = self.flash_metadata[self.key(capacity)]
-        self._prepare_flash_offsets(self.current_flash_metadata, live, capacity)
         self._prepare_tiles(static, capacity)
         # Arbitrary-position fused QKV may load padded positions as well.
-        static.positions[real_rows:capacity].zero_()
+        # The registry already clears [raw_num_tokens:capacity] on every load.
+        # Only clear MLP-sync padding copied with the live input head; real
+        # request rows can be fewer than the input length passed to load_batch.
+        if real_rows < raw_num_tokens:
+            static.positions[real_rows:raw_num_tokens].zero_()
         self.current_batch = static
 
     def finish_prompt(self, hidden_states, residual, positions, batch):
@@ -698,9 +793,33 @@ class WelmPrefillGraphAdapter:
             self.prune and mirror_key not in self.capture_keys
         ):
             raise RuntimeError("WeLM graph eligibility changed before replay")
-        result = self.runner.backend.replay(key, batch, **kwargs)
-        if mirror_key is not None:
-            result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+        owner = self.read_done_by_key.get(key)
+        if (
+            self.supports_graph_read_done
+            and self.runner.model_runner.welm_graph_read_done_enabled
+            and owner is None
+        ):
+            raise RuntimeError("Missing WeLM Prompt read-done owner")
+        if owner is None:
+            result = self.runner.backend.replay(key, batch, **kwargs)
+            if mirror_key is not None:
+                result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+        else:
+            with owner.replay(torch.npu.current_stream()) as ticket:
+                result = self.runner.backend.replay(key, batch, **kwargs)
+                if mirror_key is not None:
+                    result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+            # MIXED still drains its captured signal, but keeps the conservative
+            # scheduler fence until its request-lifetime paths are audited.
+            # Offload copies ordered behind the scheduler also need KV writes
+            # to finish, so preserve upstream's whole-forward protection.
+            memory = get_memory()
+            if batch.forward_mode == ForwardMode.EXTEND and not (
+                memory.enable_hierarchical_cache
+                or memory.hicache_storage_backend is not None
+                or memory.enable_lmcache
+            ):
+                self.runner.model_runner.war_fastpath_read_done_event = ticket
         self.publish_state(key, batch)
         return result
 

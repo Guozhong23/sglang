@@ -110,6 +110,12 @@ class CpuBackend:
     prepare_welm_prefill_graph_metadata = load_method(
         BACKEND, backend_class, "prepare_welm_prefill_graph_metadata", backend_ns
     )
+    prepare_welm_prefill_graph_metadata_device = load_method(
+        BACKEND, backend_class, "prepare_welm_prefill_graph_metadata_device", backend_ns
+    )
+    _prepare_welm_graph_page_tables_device = load_method(
+        BACKEND, backend_class, "_prepare_welm_graph_page_tables_device", backend_ns
+    )
 
     def __init__(self):
         self.device = "cpu"
@@ -120,6 +126,7 @@ class CpuBackend:
         self.req_to_token_pool = types.SimpleNamespace(
             req_to_token=torch.arange(32 * 512).reshape(32, 512)
         )
+        self.req_to_token = self.req_to_token_pool.req_to_token
         self.full_to_swa_index_mapping = torch.arange(32 * 512) + 32
         self.token_to_kv_pool = types.SimpleNamespace(
             translate_loc_from_full_to_swa=lambda loc: loc + 32
@@ -136,6 +143,7 @@ def make_adapter(dp_rank):
     obj.eager_input_embeddings, obj.mixed_chunk = True, False
     obj.batch_sizes = (1, 2, 4, 8)
     obj.capture_keys, obj.flash_metadata, obj.captured_states = set(), {}, {}
+    obj.read_done_by_key = {}
     obj._row_layouts, obj._capture_templates, obj.rope_tiles, obj.mtp_kv = (
         {},
         {},
@@ -176,7 +184,31 @@ def make_adapter(dp_rank):
     )
     obj.backend = CpuBackend()
     obj.flash_inputs = obj.backend.create_welm_prefill_graph_metadata(8)
+    obj.request_inputs = {
+        "req_pool_indices": torch.zeros(8, dtype=torch.int64),
+        "seq_lens": torch.zeros(8, dtype=torch.int32),
+        "extend_seq_lens": torch.zeros(8, dtype=torch.int32),
+    }
+    obj.page_starts = torch.arange(32, dtype=torch.int64) * obj.backend.page_size
+    obj.page_in_bounds = obj.page_starts < obj.backend.req_to_token.shape[1]
+    obj.token_indices = torch.arange(128, dtype=torch.int64)
     return obj
+
+
+def stage_requests(obj, batch):
+    """Mirror runner copies into Bmax buffers; retain stale tails deliberately."""
+    for name, buffer in obj.request_inputs.items():
+        buffer[: batch.batch_size].copy_(getattr(batch, name))
+        setattr(batch, name, buffer[: batch.batch_size])
+    return batch
+
+
+def run_captured_prologue(obj, batch):
+    module = types.SimpleNamespace(
+        KVMirrorManager=types.SimpleNamespace(activations_dict_kv={})
+    )
+    with patch.dict(sys.modules, {"sglang.srt.models.welmv4": module}):
+        obj.before_capture_forward(batch)
 
 
 def make_batch(lengths, capacity=128, *, prefix=0):
@@ -203,7 +235,7 @@ def make_batch(lengths, capacity=128, *, prefix=0):
         orig_seq_lens=lens + prefix,
         seq_lens_cpu=lens + prefix,
         seq_lens=lens + prefix,
-        req_pool_indices=torch.arange(len(lengths), dtype=torch.int64),
+        req_pool_indices=torch.arange(1, len(lengths) + 1, dtype=torch.int64),
         out_cache_loc=torch.arange(1000, 1000 + capacity, dtype=torch.int64),
         global_num_tokens_cpu=[capacity, capacity],
         global_num_tokens_gpu=torch.tensor([capacity, capacity], dtype=torch.int32),
@@ -225,7 +257,7 @@ def capture_metadata(obj):
         ("mirror", 128, [128]),
     ]:
         obj.capture_phase = phase
-        batch = make_batch(lengths, capacity)
+        batch = stage_requests(obj, make_batch(lengths, capacity))
         obj.prepare_capture(batch, capacity)
         key = obj.key(capacity) if phase == "prompt" else obj.mirror_key(len(lengths))
         obj.after_capture(key, batch)
@@ -235,6 +267,72 @@ def capture_metadata(obj):
 
 
 class TestTorchDpAdapter(unittest.TestCase):
+    def test_bmax_request_inputs_mask_stale_padding_and_keep_dp_rows(self):
+        obj = make_adapter(0)
+        capture_metadata(obj)
+        metadata = obj.flash_metadata[obj.key(128)]
+        pointers = {name: value.data_ptr() for name, value in obj.request_inputs.items()}
+        for lengths in ([1, 2, 3, 4, 5, 6, 7, 8], [3], [2] * 8):
+            live = make_batch(lengths, prefix=33)
+            live.welm_prefill_graph_ticket = types.SimpleNamespace(
+                allowed=True, token_capacity=128, request_capacity=8,
+                token_rows=(sum(lengths), 71), request_rows=(len(lengths), 1),
+            )
+            # req/seq tails are deliberately invalid: clearing E alone must
+            # prevent either Full or SWA lookup from touching stale requests.
+            obj.request_inputs["req_pool_indices"].fill_(1000000)
+            obj.request_inputs["seq_lens"].fill_(1000000)
+            obj.request_inputs["extend_seq_lens"].fill_(1000000)
+            static = stage_requests(obj, make_batch(lengths, prefix=33))
+            obj.prepare_replay(live, static, 128, raw_num_tokens=128)
+            run_captured_prologue(obj, static)
+            b, real = len(lengths), sum(lengths)
+            self.assertEqual(metadata.welm_flash_seqused_q.tolist(), lengths + [0] * (8 - b))
+            self.assertEqual(
+                metadata.welm_flash_seqused_kv.tolist(),
+                [length + 33 for length in lengths] + [0] * (8 - b),
+            )
+            self.assertFalse(metadata.block_tables[b:].any())
+            self.assertFalse(metadata.block_tables_swa[b:].any())
+            self.assertEqual(metadata.welm_flash_cu_seqlens_q[0].item(), 0)
+            self.assertEqual(metadata.welm_flash_cu_seqlens_q[-1].item(), 128)
+            ends = torch.cumsum(torch.tensor(lengths), 0)
+            self.assertEqual(obj.tail_indices[:b].tolist(), (ends - 1).tolist())
+            self.assertEqual(obj.valid_rows.sum().item(), real)
+            self.assertTrue((obj.full_write_locs[real:] == -1).all())
+            self.assertEqual(obj.prompt_real_rows_gpu.tolist(), [real, 71])
+            self.assertEqual(obj.request_real_rows_gpu.tolist(), [b, 1])
+            self.assertEqual(static.num_token_non_padded.item(), real)
+            self.assertEqual(pointers, {name: value.data_ptr() for name, value in obj.request_inputs.items()})
+
+    def test_device_metadata_is_produced_only_by_active_prompt(self):
+        obj = make_adapter(0)
+        captured = capture_metadata(obj)
+        live = make_batch([3, 4], prefix=17)
+        live.welm_prefill_graph_ticket = types.SimpleNamespace(
+            allowed=True, token_capacity=128, request_capacity=2,
+            token_rows=(7, 5), request_rows=(2, 1),
+        )
+        static = stage_requests(obj, make_batch([3, 4], prefix=17))
+        obj.prepare_replay(live, static, 128, raw_num_tokens=128)
+        with patch.object(obj, "_prepare_prompt_metadata_device", wraps=obj._prepare_prompt_metadata_device) as produce:
+            run_captured_prologue(obj, static)
+            produce.assert_called_once_with(static)
+            before = obj.flash_inputs.welm_flash_seqused_q.clone()
+            run_captured_prologue(obj, captured[obj.mirror_key(2)])
+            produce.assert_called_once_with(static)
+            torch.testing.assert_close(before, obj.flash_inputs.welm_flash_seqused_q)
+
+        idle = make_adapter(1)
+        idle.active_mask, idle.active_masks = 1, (1, 2, 3)
+        idle_captured = capture_metadata(idle)
+        with patch.object(idle, "_prepare_prompt_metadata_device") as produce:
+            run_captured_prologue(idle, idle_captured[idle.key(128)])
+            run_captured_prologue(idle, idle_captured[idle.mirror_key(2)])
+            produce.assert_not_called()
+        self.assertFalse(idle.supports_graph_read_done)
+        self.assertEqual(idle.read_done_by_key, {})
+
     def test_live_vectors_flash_metadata_and_handoff_survive_large_small_large(self):
         for rank in (0, 1):
             obj = make_adapter(rank)
@@ -275,9 +373,10 @@ class TestTorchDpAdapter(unittest.TestCase):
                     token_rows=tokens,
                     request_rows=requests,
                 )
-                static = make_batch(lengths, prefix=17 + step)
+                static = stage_requests(obj, make_batch(lengths, prefix=17 + step))
                 self.assertTrue(obj.local_can_run(live, 128, bcap), obj._warned)
-                obj.prepare_replay(live, static, 128)
+                obj.prepare_replay(live, static, 128, raw_num_tokens=128)
+                run_captured_prologue(obj, static)
                 self.assertEqual(obj.prompt_real_rows_gpu.tolist(), list(tokens))
                 self.assertEqual(obj.request_real_rows_gpu.tolist(), list(requests))
                 self.assertEqual(obj.current_flash_metadata, prompt_meta)
@@ -390,7 +489,9 @@ class TestTorchDpAdapter(unittest.TestCase):
                 request_rows=(len(other_lengths), len(local_lengths)),
             )
             self.assertTrue(obj.local_can_run(batch, 128, bcap), obj._warned)
-            obj.prepare_replay(batch, make_batch(local_lengths, prefix=20), 128)
+            static = stage_requests(obj, make_batch(local_lengths, prefix=20))
+            obj.prepare_replay(batch, static, 128, raw_num_tokens=128)
+            run_captured_prologue(obj, static)
 
 
 if __name__ == "__main__":

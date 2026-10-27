@@ -238,6 +238,7 @@ class TestInputContracts(unittest.TestCase):
 class TestFlashAndStateContracts(unittest.TestCase):
     def setUp(self):
         self.adapter = Adapter.__new__(Adapter)
+        self.adapter.read_done_by_key = {}
         self.adapter.prune = True
         self.adapter.full_write_locs = Rows(128)
         self.adapter.swa_write_locs = Rows(128)
@@ -316,6 +317,8 @@ class TestFlashAndStateContracts(unittest.TestCase):
         self.adapter._capture_templates = {id(batch): (125, 128, [128])}
         metadata = types.SimpleNamespace(welm_flash_schedules={})
         self.adapter.flash_metadata = {self.adapter.key(128): metadata}
+        producers = []
+        self.adapter._prepare_prompt_metadata_device = lambda fb: producers.append(fb)
         with patch.dict(sys.modules, {module.__name__: module}):
             for _ in range(3):
                 metadata.welm_flash_schedules["stale"] = object()
@@ -335,6 +338,7 @@ class TestFlashAndStateContracts(unittest.TestCase):
                 self.assertEqual(module.KVMirrorManager.activations_dict_kv, {})
                 self.assertIs(self.adapter.current_flash_metadata, metadata)
                 self.assertEqual(metadata.welm_flash_schedules, {})
+        self.assertEqual(producers, [batch, batch, batch])
 
 
 class TestSplitGraphContracts(unittest.TestCase):
@@ -393,6 +397,7 @@ class TestSplitGraphContracts(unittest.TestCase):
         )
         batch = types.SimpleNamespace(
             welm_prefill_graph=graph, welm_prefill_graph_phase="prompt",
+            welm_graph_read_done=None,
             batch_size=2, can_run_tbo=False,
             capture_hidden_mode=types.SimpleNamespace(need_capture=lambda: False),
         )
@@ -442,7 +447,8 @@ class TestSplitGraphContracts(unittest.TestCase):
         calls = []
         adapter.runner = types.SimpleNamespace(backend=types.SimpleNamespace(
             replay=lambda key, batch, **kw: calls.append(key) or key
-        ))
+        ), model_runner=types.SimpleNamespace(welm_graph_read_done_enabled=False))
+        adapter.read_done_by_key = {}
         adapter.captured_states = {}
         batch = types.SimpleNamespace(batch_size=2)
         prompt, mirror = adapter.key(128), adapter.mirror_key(2)
@@ -515,6 +521,7 @@ class TestOverlapPreparation(unittest.TestCase):
         )
         with patch.dict(ADAPTER, torch=fake_torch):
             adapter._prepare_tiles(batch, 128)
+            adapter._prepare_capture_tail_indices(batch)
             slot = batch.welmv4_rope_segment_tile_starts
             batch.extend_seq_lens_cpu = [1, 7]
             adapter._prepare_tiles(batch, 128)
@@ -523,7 +530,9 @@ class TestOverlapPreparation(unittest.TestCase):
         self.assertEqual(pending[0], ADAPTER["padded_rope_tiles"]([63, 62], 128, 8))
         self.assertEqual(pending[2], ADAPTER["padded_rope_tiles"]([1, 7], 128, 8))
         self.assertEqual(pending[1], [62, 124, 0, 0, 0, 0, 0, 0])
-        self.assertEqual(pending[3], [0, 7, 0, 0, 0, 0, 0, 0])
+        # Replay stages only RoPE tiles; new tails are device-produced inside
+        # Prompt, so there is no second host tail copy on this preparation path.
+        self.assertEqual(len(pending), 3)
 
     def test_welm_prefill_metadata_never_reads_device_lengths_to_host(self):
         class CpuLengths(list):

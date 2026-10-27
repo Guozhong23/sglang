@@ -52,6 +52,9 @@ def validate_dp_graph_rows(token_rows, request_rows, token_capacity, request_cap
 
 class WelmDpPrefillGraphAdapter(WelmPrefillGraphAdapter):
     is_dp = True
+    # Active/idle DP graphs have their own replay lifecycle. Keep the scheduler's
+    # whole-forward WAR fence until early-read tickets cover both DP roles.
+    supports_graph_read_done = False
     kernel_variant = "bf16-normal-ordinary-oproj"
 
     def __init__(self, runner):
@@ -409,9 +412,14 @@ class WelmDpPrefillGraphAdapter(WelmPrefillGraphAdapter):
         if batch.num_token_non_padded is not None:
             batch.num_token_non_padded.copy_(source)
         batch.num_token_non_padded_cpu = layout.current.local_real_rows
+        if phase == "prompt" and not self.is_idle_role(batch):
+            # The base adapter now stages only raw inputs before replay. Run
+            # the device producer in active Prompt graphs, preserving the
+            # independent DP T/B vectors and the metadata consumed by Mirror.
+            self._prepare_prompt_metadata_device(batch)
         self.current_batch = batch
 
-    def prepare_replay(self, live, static, capacity):
+    def prepare_replay(self, live, static, capacity, *, raw_num_tokens: int):
         ticket = getattr(live, "welm_prefill_graph_ticket", None)
         if not self.can_run(live, capacity):
             raise RuntimeError("WeLM DP replay requires the unanimous admission ticket")
@@ -435,7 +443,9 @@ class WelmDpPrefillGraphAdapter(WelmPrefillGraphAdapter):
             self._bind(static, capacity)
             self.prepare_idle_graph_inputs(static, capacity)
         else:
-            super().prepare_replay(live, static, capacity)
+            super().prepare_replay(
+                live, static, capacity, raw_num_tokens=raw_num_tokens
+            )
         static.welm_prefill_graph_ticket = ticket
         self._install_layout(static, "prompt", capacity)
         # The base adapter's scalar is shared with pure-TP metadata. DP graph

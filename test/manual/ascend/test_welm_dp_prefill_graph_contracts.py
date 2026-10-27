@@ -11,7 +11,7 @@ import logging
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -185,6 +185,9 @@ class TestDpGraphContracts(unittest.TestCase):
 
     def test_capture_head_never_fills_real_vectors_with_slot_or_first_dp_count(self):
         obj = adapter()
+        # Device metadata math is covered by the CPU-torch adapter tests;
+        # this fixture isolates the independent DP row-vector/scalar contract.
+        obj._prepare_prompt_metadata_device = Mock()
         obj._copy_live_rows((123, 61), (3, 1))
         obj._layout("prompt", 128, create=True)
         obj._layout("mirror", 4, create=True)
@@ -208,7 +211,12 @@ class TestDpGraphContracts(unittest.TestCase):
                 model_specific_states=None,
             )
             with patch.dict(sys.modules, {"sglang.srt.models.welmv4": module}):
+                obj._prepare_prompt_metadata_device.reset_mock()
                 obj.before_capture_forward(batch)
+            if phase == "prompt":
+                obj._prepare_prompt_metadata_device.assert_called_once_with(batch)
+            else:
+                obj._prepare_prompt_metadata_device.assert_not_called()
             np.testing.assert_array_equal(obj.prompt_real_rows_gpu.data, [123, 61])
             np.testing.assert_array_equal(obj.request_real_rows_gpu.data, [3, 1])
             np.testing.assert_array_equal(

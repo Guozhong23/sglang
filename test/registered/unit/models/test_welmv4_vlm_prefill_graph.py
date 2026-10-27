@@ -96,6 +96,15 @@ def test_adapter_replay_preserves_text_hashing_and_skips_vl_placeholders(vl):
     adapter.local_valid_rows = torch.ones(1, dtype=torch.int32)
     adapter.full_write_locs = torch.full((8,), 900, dtype=torch.int64)
     adapter.swa_write_locs = torch.full((8,), 800, dtype=torch.int64)
+    adapter.max_requests = 3
+    adapter.request_inputs = {
+        name: torch.zeros(3, dtype=torch.int32)
+        for name in ("req_pool_indices", "seq_lens", "extend_seq_lens")
+    }
+    adapter.token_indices = torch.arange(8)
+    adapter.tail_indices = torch.zeros(3, dtype=torch.int64)
+    adapter.page_starts = torch.tensor([0, 4])
+    adapter.page_in_bounds = torch.ones(2, dtype=torch.bool)
     adapter.rope_tiles = {}
     hasher = Mock(side_effect=lambda ids, batch: ids.unsqueeze(0).expand(4, -1))
     adapter.model = SimpleNamespace(
@@ -106,10 +115,14 @@ def test_adapter_replay_preserves_text_hashing_and_skips_vl_placeholders(vl):
         token_to_kv_pool=SimpleNamespace(
             translate_loc_from_full_to_swa=lambda ids: ids + 100
         ),
-        prepare_welm_prefill_graph_metadata=Mock(),
+        prepare_welm_prefill_graph_metadata_device=Mock(),
     )
     adapter.flash_inputs = object()
-    adapter.flash_metadata = {adapter.key(8): object()}
+    adapter.flash_metadata = {
+        adapter.key(8): SimpleNamespace(
+            welm_flash_cu_seqlens_q=torch.tensor([0, 0, 0, 8], dtype=torch.int32)
+        )
+    }
     # Pinned staging and Flash hardware planning are separate upstream tests.
     adapter._prepare_flash_offsets = Mock()
     adapter._prepare_tiles = Mock()
@@ -127,10 +140,33 @@ def test_adapter_replay_preserves_text_hashing_and_skips_vl_placeholders(vl):
             global_num_tokens_cpu=None,
             out_cache_loc=torch.arange(real_rows) + 20,
         )
+        # Emulate registry staging: its tail is cleared after the copied input
+        # head, which can itself contain one MLP-sync padding row.
+        raw_rows = real_rows + 1
+        positions = torch.zeros(8, dtype=torch.int64)
+        positions[:raw_rows] = 55
         static = SimpleNamespace(
-            num_token_non_padded=None, positions=torch.full((8,), 55)
+            num_token_non_padded=None,
+            positions=positions,
+            out_cache_loc=torch.full((8,), 999, dtype=torch.int64),
         )
-        adapter.prepare_replay(live, static, 8)
+        static.out_cache_loc[:real_rows] = live.out_cache_loc
+        adapter.request_inputs["extend_seq_lens"].fill_(77)
+        adapter.request_inputs["extend_seq_lens"][0] = real_rows
+        adapter.request_inputs["seq_lens"][0] = real_rows
+        previous_mask = adapter.valid_rows.clone()
+        adapter.prepare_replay(live, static, 8, raw_num_tokens=raw_rows)
+        # Derived metadata is produced by the graph, not by host replay staging.
+        torch.testing.assert_close(adapter.valid_rows, previous_mask)
+        adapter._prepare_prompt_metadata_device(static)
+        assert adapter.request_inputs["extend_seq_lens"].tolist() == [real_rows, 0, 0]
+        assert adapter.tail_indices.tolist() == [real_rows - 1, 0, 0]
+        assert adapter.current_flash_metadata.welm_flash_cu_seqlens_q.tolist() == [
+            0,
+            real_rows,
+            real_rows,
+            8,
+        ]
         assert static.ngram_embedding_info is live.ngram_embedding_info
         if vl:
             assert static.welm_prefill_oe_ids is None
@@ -251,6 +287,7 @@ def _batch(tokens, lengths, *, items=None, prefixes=None, capacity=8, table=None
             is_decode=lambda: False, is_target_verify=lambda: False
         ),
         welm_prefill_graph=None,
+        welm_graph_read_done=None,
         welm_prefill_oe_ids=None,
         welm_prefill_graph_phase="prompt",
         can_run_tbo=False,

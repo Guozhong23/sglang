@@ -409,7 +409,7 @@ class TestIdleGraph(unittest.TestCase):
                 adapter.full_write_locs.fill_(777)
                 adapter.mirror_q_used.fill_(1)
                 static = copy.copy(live)
-                adapter.prepare_replay(live, static, 128)
+                adapter.prepare_replay(live, static, 128, raw_num_tokens=0)
                 self.assertEqual(live.batch_size, 0)
                 self.assertTrue((adapter.full_write_locs == -1).all())
                 self.assertFalse(adapter.valid_rows.any())
