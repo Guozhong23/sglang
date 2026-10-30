@@ -467,6 +467,35 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.ps.attn_cp_size
+        # Experimental eager prefill only. Keep Flash metadata/decode enabled
+        # so an A/B run changes neither decode nor the KV write/sync contract.
+        self.use_welm_fia_prefill = self.is_welm_v4 and get_bool_env_var(
+            "WELM_NPU_PREFILL_USE_FIA", "False"
+        )
+        if self.use_welm_fia_prefill:
+            from sglang.srt.hardware_backend.npu.attention.welm_fia_prefill import (
+                validate_fia_prefill_config,
+            )
+
+            if not self.use_welm_flash_attn:
+                raise ValueError(
+                    "WELM_NPU_PREFILL_USE_FIA=1 requires WELM_NPU_USE_FLASH_ATTN=1 "
+                    "to preserve the existing metadata and decode paths"
+                )
+            validate_fia_prefill_config(
+                use_fia=self.use_fia,
+                prefill_backend=model_runner.server_args.cuda_graph_config.prefill.backend,
+                attn_cp_size=self.attn_cp_size,
+            )
+            if not callable(
+                getattr(torch_npu, "npu_fused_infer_attention_score_v2", None)
+            ):
+                raise RuntimeError("WeLM FIA prefill requires torch_npu FIA v2")
+            logger.info(
+                "WeLM experimental FIA v2 prefill enabled (eager EXTEND/MIXED, "
+                "including KV mirror; FP32 sink correction via LSE; "
+                "pure decode and speculative attention retain existing paths)"
+            )
         # Set before DecodeCudaGraphRunner starts capturing in its constructor.
         # Speculative/draft and other attention paths retain eager preparation.
         self.capture_welm_decode_metadata = (
@@ -824,6 +853,43 @@ class AscendAttnBackend(AttentionBackend):
                 dim=0,
             )
         return output.reshape(padded_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_welm_fia_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        sinks: Optional[torch.Tensor],
+        *,
+        mirror_prefill: bool = False,
+    ) -> torch.Tensor:
+        from sglang.srt.hardware_backend.npu.attention.welm_fia_prefill import (
+            forward_fia_prefill,
+        )
+
+        if self.graph_mode:
+            raise RuntimeError("WeLM FIA prefill only supports eager execution")
+        metadata = self.forward_metadata
+        return forward_fia_prefill(
+            q,
+            k_cache,
+            v_cache,
+            layer=layer,
+            page_size=self.page_size,
+            block_table=(
+                metadata.block_tables_swa
+                if self._is_swa_layer(layer)
+                else metadata.block_tables
+            ),
+            q_lens=metadata.extend_seq_lens_cpu_int,
+            kv_lens=metadata.seq_lens_cpu_int,
+            atten_mask=self.fia_mask,
+            fia=torch_npu.npu_fused_infer_attention_score_v2,
+            use_tnd=self._can_use_tnd(layer),
+            sinks=sinks,
+            mirror_prefill=mirror_prefill,
+        )
 
     def _get_sink_triton_window_size(self, layer: RadixAttention) -> int:
         """Convert WeLMv4's left-window value to the Triton kernel's span."""
@@ -2407,6 +2473,13 @@ class AscendAttnBackend(AttentionBackend):
                 f"{num_queries} query rows for batch size {forward_batch.batch_size}."
             )
 
+        if getattr(self, "use_welm_fia_prefill", False) and (
+            forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        ):
+            return self._forward_welm_fia_prefill(
+                q, k_cache, v_cache, layer, sinks, mirror_prefill=True
+            )
+
         if self.use_welm_flash_attn:
             return self._forward_welm_flash_attention(
                 q, k_cache, v_cache, layer, sinks, mirror_prefill=True
@@ -2653,6 +2726,13 @@ class AscendAttnBackend(AttentionBackend):
                     layer=layer,
                     forward_batch=forward_batch,
                     sinks=sinks,
+                )
+
+            if getattr(self, "use_welm_fia_prefill", False) and (
+                forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            ):
+                return self._forward_welm_fia_prefill(
+                    q, k_cache, v_cache, layer, sinks
                 )
 
             if self.use_welm_flash_attn:
