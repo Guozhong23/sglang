@@ -95,7 +95,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
             # while other backends remain unchanged.
-            self.k_buffer = torch.zeros(
+            # Keep the contiguous [layer, page, token, head, dim] allocation
+            # for HiCache IO even when FIA exposes per-layer attention views.
+            self._hicache_k_buffer = torch.zeros(
                 (
                     self.layer_num,
                     self.size // self.page_size + 1,
@@ -106,7 +108,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self.v_buffer = torch.zeros(
+            self._hicache_v_buffer = torch.zeros(
                 (
                     self.layer_num,
                     self.size // self.page_size + 1,
@@ -118,19 +120,32 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 device=self.device,
             )
 
+            self.k_buffer = self._hicache_k_buffer
+            self.v_buffer = self._hicache_v_buffer
+
             if self.use_fia:
                 # Use per-layer Python lists to avoid torch.compile capturing
                 # the entire multi-layer tensor (OOM during graph capture).
                 # Each layer view: [P*ps, 1, H, D], sharing the contiguous
                 # storage allocated above.
                 self.k_buffer = [
-                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    self._hicache_k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
                     for i in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    self.v_buffer[i].view(-1, 1, self.head_num, self.v_head_dim)
+                    self._hicache_v_buffer[i].view(-1, 1, self.head_num, self.v_head_dim)
                     for i in range(self.layer_num)
                 ]
+
+    def get_hicache_transfer_buffers(self):
+        """Return contiguous all-layer KV tensors sharing the attention storage."""
+        return self._hicache_k_buffer, self._hicache_v_buffer
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        # Releasing the public FIA views alone would retain the whole KV pool.
+        del self._hicache_k_buffer
+        del self._hicache_v_buffer
 
     def _init_kv_copy_and_warmup(self):
         # implementation relies on self.data_strides / self.data_ptrs, which the
