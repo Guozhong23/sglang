@@ -904,8 +904,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
 
     def _track_write_through_node(
@@ -1822,7 +1823,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if write_back:
-            # Blocking: wait for all pending write-backs
+            # Blocking: submit what is still queued, then wait for every ack.
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -1935,6 +1937,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        # Backups queued outside process_batch_result: the chunked-prefill stash
+        # in get_next_batch_to_run, abort_request, and the PD prefill release.
+        self.flush_pending_backups()
 
         if self.pp_size != 1:
             self.writing_check()
@@ -1972,6 +1977,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def flush_pending_backups(self) -> None:
+        """Submit pending D2H backups as a merged operation."""
+        if self.cache_controller is not None:
+            self.cache_controller.start_writing()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

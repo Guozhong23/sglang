@@ -605,6 +605,9 @@ class StreamingSession(BasePrefixCache):
     def check_hicache_events(self):
         return self.inner.check_hicache_events()
 
+    def flush_pending_backups(self) -> None:
+        self.inner.flush_pending_backups()
+
     def take_events(self):
         return self.inner.take_events()
 

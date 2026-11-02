@@ -371,6 +371,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def flush_pending_backups(self) -> None:
+        """Submit queued host backups; caches without deferred backups do nothing."""
+        pass
+
     def take_events(self):
         return []
 
