@@ -23,6 +23,8 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_PROTOCOL = "sdma"
+
 
 class AscendTransferEngine(MooncakeTransferEngine):
 
@@ -65,18 +67,14 @@ class AscendTransferEngine(MooncakeTransferEngine):
         )
 
         transfer_protocol = self._get_transfer_protocol()
+        trans_op_type = self._resolve_trans_op_type(transfer_protocol)
         hcom_url = os.getenv("ASCEND_MF_HCOM_URL", "")
 
         if transfer_protocol == "host_rdma":
-            trans_op_type = TransferEngine.TransDataOpType.HOST_RDMA
             hcom_url = self._get_worker_hcom_url(
                 hcom_url, get_world_group().rank_in_group
             )
-        elif transfer_protocol is None or transfer_protocol == "sdma":
-            trans_op_type = TransferEngine.TransDataOpType.SDMA
-        else:
-            trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
-            """with device RDMA for PD transfer"""
+        elif transfer_protocol == "device_rdma":
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
                 torch.empty_like(tmp_tensor) for _ in range(get_world_size())
@@ -85,7 +83,26 @@ class AscendTransferEngine(MooncakeTransferEngine):
             torch.distributed.all_gather(
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
-        """Initialize the ascend transfer instance."""
+        elif transfer_protocol in ("device_urma", "device_uboe"):
+            # URMA selects the device fabric through the SDK. Do not pass a
+            # stale Host RDMA NIC/port mapping from an older deployment.
+            if hcom_url:
+                logger.warning(
+                    "Ignoring ASCEND_MF_HCOM_URL for %s; it configures the "
+                    "Host RDMA endpoint, not the device fabric.",
+                    transfer_protocol,
+                )
+            hcom_url = ""
+
+        logger.info(
+            "Initializing Ascend Transfer Engine: protocol=%s, op_type=%s, "
+            "role=%s, npu_id=%d, session=%s",
+            transfer_protocol,
+            trans_op_type,
+            self.role,
+            self.npu_id,
+            self.session_id,
+        )
         # Decode owns the store. Prefill must remain a client so that its first
         # transfer lazily creates a connection to the Decode session.
         pd_affinity = (
@@ -106,29 +123,47 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 hcom_url,
             )
             if ret_value != 0:
-                logger.error("Ascend Transfer Engine initialization failed.")
-                raise RuntimeError("Ascend Transfer Engine initialization failed.")
+                raise RuntimeError(
+                    "Ascend Transfer Engine initialization failed: "
+                    f"protocol={transfer_protocol}, role={self.role}, "
+                    f"npu_id={self.npu_id}, return_code={ret_value}"
+                )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark register as failed
-            ret_value = -1
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ascend memory registration failed for {len(ptrs)} buffers."
+            ) from exc
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            raise RuntimeError(
+                f"Ascend memory registration failed for {len(ptrs)} buffers: "
+                f"return_code={ret_value}"
+            )
 
     @staticmethod
-    def _get_transfer_protocol():
-        protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma", "host_rdma"}
-        if protocol and protocol.lower() in allowed_protocols:
-            return protocol.lower()
-        else:
-            logger.warning(
-                "Invalid or no transfer protocol specified, using default protocol."
+    def _get_transfer_protocol() -> str:
+        protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL", "").strip().lower()
+        return protocol or _DEFAULT_PROTOCOL
+
+    @staticmethod
+    def _resolve_trans_op_type(protocol: str):
+        # Resolve only the requested protocol so older SDKs can still use
+        # SDMA/RDMA without exposing the 950-series URMA enum members.
+        op_type = getattr(TransferEngine.TransDataOpType, protocol.upper(), None)
+        if op_type is None:
+            supported = ", ".join(
+                name.lower()
+                for name in dir(TransferEngine.TransDataOpType)
+                if name.isupper()
             )
-            return None
+            raise ValueError(
+                f"ASCEND_MF_TRANSFER_PROTOCOL={protocol!r} is not supported by "
+                "the installed memfabric_hybrid. Available protocols: "
+                f"{supported}. Refusing to fall back to {_DEFAULT_PROTOCOL}."
+            )
+        return op_type
 
     def _get_worker_hcom_url(self, hcom_url: str, world_rank: int) -> str:
         """Select a URL by runtime NPU ID, then offset its port by world rank."""
