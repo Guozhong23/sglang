@@ -1,7 +1,10 @@
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -12,17 +15,37 @@ if _is_npu:
 
 class NpuCommunicator:
 
-    def __init__(self, group: ProcessGroup):
+    def __init__(self, group: ProcessGroup, device: Optional[torch.device] = None):
+        self.use_outplace_all_reduce = False
+        self._pyhccl = None
         if not _is_npu:
             self.disabled = True
             return
         self.disabled = False
         self.group = group
         self.world_size = dist.get_world_size(self.group)
+        self.use_outplace_all_reduce = envs.SGLANG_NPU_ALLREDUCE_OUTPLACE.get()
+        if self.use_outplace_all_reduce and self.world_size > 1:
+            from sglang.srt.distributed.device_communicators.pyhccl import (
+                PyHcclCommunicator,
+            )
+
+            if device is None:
+                device = torch.device("npu", torch.npu.current_device())
+            self._pyhccl = PyHcclCommunicator(group, device)
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(x, group=self.group)
         return x
+
+    def outplace_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self._pyhccl is None:
+            raise RuntimeError("Out-of-place NPU all-reduce is not enabled")
+        return self._pyhccl.all_reduce(x)
+
+    def close(self) -> None:
+        if self._pyhccl is not None:
+            self._pyhccl.close()
 
     def quant_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """

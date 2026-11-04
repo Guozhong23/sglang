@@ -646,6 +646,9 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Use separate HCCL send/receive buffers for ordinary NPU all-reduce.
+    # Process-wide opt-in; supports contiguous FP16/BF16/FP32 base formats.
+    SGLANG_NPU_ALLREDUCE_OUTPLACE = EnvBool(False)
     # BF16/MXFP8 WeLM target prefill, non-consumer EP.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
     # Fuse shared experts on selected MegaMoE calls, including prefill BCG.
