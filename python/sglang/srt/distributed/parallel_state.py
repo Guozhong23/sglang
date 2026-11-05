@@ -502,7 +502,9 @@ class GroupCoordinator:
 
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
-            self.npu_communicator = NpuCommunicator(group=self.device_group)
+            self.npu_communicator = NpuCommunicator(
+                group=self.device_group, device=self.device
+            )
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -664,6 +666,12 @@ class GroupCoordinator:
             return input_
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            if self.npu_communicator.use_outplace_all_reduce:
+                return outplace_all_reduce(
+                    input_,
+                    group_name=self.unique_name,
+                    outplace_all_reduce_method="npu_hccl",
+                )
             return self.npu_communicator.all_reduce(input_)
 
         if torch.compiler.is_compiling():
@@ -905,6 +913,10 @@ class GroupCoordinator:
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
+        if outplace_all_reduce_method == "npu_hccl":
+            if self.npu_communicator is None:
+                raise RuntimeError("NPU communicator is not initialized")
+            return self.npu_communicator.outplace_all_reduce(input_)
         if outplace_all_reduce_method == "auto":
             outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
                 input_
@@ -1770,6 +1782,9 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.npu_communicator is not None:
+            self.npu_communicator.close()
+            self.npu_communicator = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None

@@ -64,19 +64,33 @@ class AscendTransferEngine(MooncakeTransferEngine):
             get_world_size,
         )
 
-        transfer_protocol = self._get_transfer_protocol()
-        hcom_url = os.getenv("ASCEND_MF_HCOM_URL", "")
+        transfer_protocol = self._get_transfer_protocol() or "sdma"
+        trans_op_type = getattr(
+            TransferEngine.TransDataOpType, transfer_protocol.upper(), None
+        )
+        if trans_op_type is None:
+            raise RuntimeError(
+                f"Transfer protocol {transfer_protocol!r} is not supported by the "
+                "installed memfabric_hybrid. Install a version that provides "
+                f"TransDataOpType.{transfer_protocol.upper()}."
+            )
+
+        initialize_args = (
+            self.store_url,
+            self.session_id,
+            self.role,
+            self.npu_id,
+            trans_op_type,
+        )
 
         if transfer_protocol == "host_rdma":
-            trans_op_type = TransferEngine.TransDataOpType.HOST_RDMA
             hcom_url = self._get_worker_hcom_url(
-                hcom_url, get_world_group().rank_in_group
+                os.getenv("ASCEND_MF_HCOM_URL", ""), get_world_group().rank_in_group
             )
-        elif transfer_protocol is None or transfer_protocol == "sdma":
-            trans_op_type = TransferEngine.TransDataOpType.SDMA
-        else:
-            trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
-            """with device RDMA for PD transfer"""
+            # Preserve HOST_RDMA's Decode store role and per-worker HCOM URL.
+            # Other protocols use MemFabric's default optional arguments.
+            initialize_args += ("Decode", hcom_url)
+        elif transfer_protocol == "device_rdma":
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
                 torch.empty_like(tmp_tensor) for _ in range(get_world_size())
@@ -86,8 +100,6 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
-        # Decode owns the store. Prefill must remain a client so that its first
-        # transfer lazily creates a connection to the Decode session.
         pd_affinity = (
             get_pd_thread_affinity() if transfer_protocol == "host_rdma" else None
         )
@@ -96,15 +108,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             if pd_affinity is not None
             else nullcontext()
         ):
-            ret_value = self.engine.initialize(
-                self.store_url,
-                self.session_id,
-                self.role,
-                self.npu_id,
-                trans_op_type,
-                "Decode",
-                hcom_url,
-            )
+            ret_value = self.engine.initialize(*initialize_args)
             if ret_value != 0:
                 logger.error("Ascend Transfer Engine initialization failed.")
                 raise RuntimeError("Ascend Transfer Engine initialization failed.")
@@ -121,7 +125,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma", "host_rdma"}
+        allowed_protocols = {"device_rdma", "device_urma", "sdma", "host_rdma"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:
