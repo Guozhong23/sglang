@@ -8,7 +8,7 @@
 
 """FusedQkvProjNormRopeCache -- WeLMv4 QKV 投影全融合算子(P2,Cube+Vector 复合核).
 
-使用与 MXFP8 算子相同的 cannbotdsl 0.7 API。
+使用与 MXFP8 算子相同的 cannbotdsl 0.8 API。
 
 将 sglang WeLMv4 prefill 路径 kv-mirror 层的完整 9 步序列(matmul_fusion.md 步骤 1-8)
 融合为 1 个 MIX_AIC_1_2 复合核:
@@ -35,8 +35,8 @@ UB RingBuffer,epilogue 就地消费.
     Cube:  baseM=256 * baseN=256(= 1 个 head-unit)/ tile,baseK=64
            L1(256 * 256, depth2) → L0A/L0B(depth2) → L0C(256*256 f32, depth1)
            K=2048 沿 kL1=256 分 8 轮,每轮 4 次 MMAD 累加
-    交接:  mem_copy(cv_ub, l0c, copy_options(split_axis=0,
-                     actual=(cur_tokens, BASE_N)))
+    Handoff: mem_copy(cv_ub, l0c_actual.partition(dim=0))
+             explicit (cur_tokens, BASE_N) view, dual-destination FIXPIPE.
            cv_ub (128+1,256) f32 depth1 RingBuffer -- 每 AIV 消费本核有效行
     Vec:   按 10 个 unit 分派(Q*6 / K / V / mirror_k / mirror_v),行内处理与
            P1 (welmv4_qkv_post_fusion) 同构;M 尾块由 tile_slice 裁剪 +
@@ -98,7 +98,7 @@ from cannbotdsl.ops.reg import (
 from cannbotdsl.ops.reg.cast import RoundingMode
 from cannbotdsl.ops.sync import vec_sync_all
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import tile_slice
+from cannbotdsl.tensor import make_layout, tile_slice
 from cannbotdsl.types.dtypes import bfloat16 as BF16
 from cannbotdsl.types.dtypes import float32 as F32
 
@@ -227,9 +227,7 @@ class FusedQkvProjNormRopeCacheKernel:
                 )
 
     @jit
-    def _norm_rope_k(
-        self, in_ch, out_ch, cs_ch, gamma_ch, cur_rows, avg, epsilon
-    ):
+    def _norm_rope_k(self, in_ch, out_ch, cs_ch, gamma_ch, cur_rows, avg, epsilon):
         """K head unit: per-head fp32 RMSNorm (Newton rsqrt) + tail-64 RoPE.
 
         RoPE uses the same dual-load low-lane scheme as _rope_q: the norm is
@@ -367,12 +365,8 @@ class FusedQkvProjNormRopeCacheKernel:
                 )
                 c = vload(cs_ch, r * ROPE_DIM)
                 s = vload(cs_ch, r * ROPE_DIM + HALF_ROPE_DIM)
-                o_lo = vsub(
-                    vmul(y1r, c, mask=m_lo), vmul(y2r, s, mask=m_lo), mask=m_lo
-                )
-                o_hi = vadd(
-                    vmul(y1r, s, mask=m_lo), vmul(y2r, c, mask=m_lo), mask=m_lo
-                )
+                o_lo = vsub(vmul(y1r, c, mask=m_lo), vmul(y2r, s, mask=m_lo), mask=m_lo)
+                o_hi = vadd(vmul(y1r, s, mask=m_lo), vmul(y2r, c, mask=m_lo), mask=m_lo)
                 vstore_pack(
                     out_ch,
                     base + NOPE_DIM,
@@ -525,14 +519,14 @@ class FusedQkvProjNormRopeCacheKernel:
 
         # ---- cube-side channels (L1 = 256+256 = 512KB exact; the arena
         # matmul sample runs the identical baseM=256 configuration) ----
-        l1_a = RingBuffer(MemLoc.L1, shape=(PAIR_M, K_L1), dtype=BF16, depth=2)
-        l1_b = RingBuffer(MemLoc.L1, shape=(BASE_N, K_L1), dtype=BF16, depth=2)
-        l0a = RingBuffer(MemLoc.L0A, shape=(PAIR_M, BASE_K), dtype=BF16, depth=2)
-        l0b = RingBuffer(MemLoc.L0B, shape=(BASE_N, BASE_K), dtype=BF16, depth=2)
+        l1_a = RingBuffer(MemLoc.L1, BF16, make_layout((PAIR_M, K_L1)), depth=2)
+        l1_b = RingBuffer(MemLoc.L1, BF16, make_layout((BASE_N, K_L1)), depth=2)
+        l0a = RingBuffer(MemLoc.L0A, BF16, make_layout((PAIR_M, BASE_K)), depth=2)
+        l0b = RingBuffer(MemLoc.L0B, BF16, make_layout((BASE_N, BASE_K)), depth=2)
         # 256x256 f32 == 256KB L0C: depth1 (the pair tile trades fixpipe
         # double-buffering for the doubled M; the next item's first MMAD
         # still overlaps this item's fixpipe drain).
-        l0c = RingBuffer(MemLoc.L0C, shape=(PAIR_M, BASE_N), dtype=F32, depth=1)
+        l0c = RingBuffer(MemLoc.L0C, F32, make_layout((PAIR_M, BASE_N)), depth=1)
         # ---- cross-core handoff (fp32: dual_dst_ctl forbids narrowing cast) ----
         # One extra pad row: the rope fast path re-loads x2 at +32, whose
         # 64-lane load on the last row spans into the next row. The pad row
@@ -540,22 +534,21 @@ class FusedQkvProjNormRopeCacheKernel:
         # rope math. Keeping the pad as a whole row preserves the (128, 256)
         # contiguous fixpipe destination layout.
         cv_ub = RingBuffer(
-            MemLoc.UB,
-            shape=(TILE_VEC_M + 1, BASE_N),
-            dtype=F32,
-            depth=1,
+            MemLoc.UB, F32, make_layout((TILE_VEC_M + 1, BASE_N)), depth=1
         )
         # ---- vec-side channels ----
-        out_ch = RingBuffer(MemLoc.UB, shape=(TILE_VEC_M, HEAD_DIM), dtype=BF16, depth=1)
+        out_ch = RingBuffer(
+            MemLoc.UB, BF16, make_layout((TILE_VEC_M, HEAD_DIM)), depth=1
+        )
         # Pad row for the rope fast path's +32 cos/sin load on the last row.
         cs_ch = RingBuffer(
-            MemLoc.UB, shape=(TILE_VEC_M + 1, ROPE_DIM), dtype=F32, depth=1
+            MemLoc.UB, F32, make_layout((TILE_VEC_M + 1, ROPE_DIM)), depth=1
         )
         # 32-element tail slack: _norm_rope_k re-unpacks gamma[224:256] at
         # offset 224 (64 bf16 lanes) so g2 lands in the low lanes; the slack
         # lanes are written never and read only as masked-out garbage.
         gamma_ch = RingBuffer(
-            MemLoc.UB, shape=(1, HEAD_DIM + HALF_ROPE_DIM), dtype=BF16, depth=1
+            MemLoc.UB, BF16, make_layout((1, HEAD_DIM + HALF_ROPE_DIM)), depth=1
         )
 
         # Work-item scheduling: granularity is (pair, unit). Whole-tile
@@ -618,7 +611,7 @@ class FusedQkvProjNormRopeCacheKernel:
                 meta_row0 = row0
 
             # Preserve the existing per-item gamma preload.
-            gamma_w = gamma_ch.head_next()
+            gamma_w = gamma_ch.next_write()
             mem_copy(
                 tile_slice(gamma_w, (1, HEAD_DIM), (0, 0)),
                 tile_slice(gm_gamma, (1, HEAD_DIM), (0, 0)),
@@ -626,7 +619,7 @@ class FusedQkvProjNormRopeCacheKernel:
 
             # Vec-side preload for this item (this AIV's cos/sin rows);
             # item granularity re-issues it per unit (~16 KB DMA, noise).
-            cs_w = cs_ch.head_next()
+            cs_w = cs_ch.next_write()
             # Table extent is a compile-time constant under every spec form
             # (JIT trace or AOT TensorSpec): only M is dynamic.
             table_rows = gm_cos_sin.shape[0]
@@ -666,7 +659,11 @@ class FusedQkvProjNormRopeCacheKernel:
 
             # ---- cube: K-loop MMAD accumulation for unit u ----
             vec_sync_all()
-            l0c_acc = l0c.head_next()
+            # Bind compact actual pitches explicitly; allocation still reserves
+            # the maximum tile, including rank-local and odd M tails.
+            l0c_acc = l0c.next_write(bare=True).view(
+                make_layout((cur_tokens, BASE_N)), data_format="nz"
+            )
             for k_l1 in range(K_L1_TILES):
                 a_tile = tile_slice(hidden_span, (PAIR_M, K_L1), (pair, k_l1))
                 b_tile = tile_slice(gm_weight, (BASE_N, K_L1), (u, k_l1))
@@ -674,66 +671,75 @@ class FusedQkvProjNormRopeCacheKernel:
                 # across m-tiles; the disabled default re-fetches the
                 # 10.5 MB weight from HBM for every m-tile.
                 mem_copy(
-                    l1_a.head_next(),
+                    l1_a.next_write(bare=True).view(
+                        make_layout((cur_tokens, K_L1)), data_format="nz"
+                    ),
                     a_tile,
                     options=copy_options(l2_cache_ctl=1),
                 )
                 mem_copy(
-                    l1_b.head_next(),
+                    l1_b.next_write(),
                     b_tile,
                     options=copy_options(l2_cache_ctl=1),
                 )
-                l1_a_slot = l1_a.tail_next()
-                l1_b_slot = l1_b.tail_next()
+                l1_a_slot = l1_a.next_read(bare=True).view(
+                    make_layout((cur_tokens, K_L1)), data_format="nz"
+                )
+                l1_b_slot = l1_b.next_read()
                 for k_l0 in range(K_L0_PER_L1):
                     mem_copy(
-                        l0a.head_next(),
+                        l0a.next_write(bare=True).view(
+                            make_layout((cur_tokens, BASE_K)), data_format="nz"
+                        ),
                         tile_slice(l1_a_slot, (PAIR_M, BASE_K), (0, k_l0)),
                     )
                     mem_copy(
-                        l0b.head_next(),
+                        l0b.next_write(),
                         tile_slice(l1_b_slot, (BASE_N, BASE_K), (0, k_l0)),
                     )
-                    l0a_slot = l0a.tail_next()
-                    l0b_slot = l0b.tail_next()
+                    l0a_slot = l0a.next_read(bare=True).view(
+                        make_layout((cur_tokens, BASE_K)), data_format="nz"
+                    )
+                    l0b_slot = l0b.next_read()
                     gk = k_l1 * K_L0_PER_L1 + k_l0
-                    matmul(l0c_acc, l0a_slot, l0b_slot, init=(gk == 0))
+                    l0c_acc = matmul(l0c_acc, l0a_slot, l0b_slot, init=(gk == 0))
 
             # ---- handoff: L0C -> per-AIV UB halves ----
-            # split_axis=0 on an L0C->UB copy is the dual-destination
-            # FIXPIPE: each AIV receives its balanced half of the
+            # Partition the actual L0C view for dual-destination FIXPIPE:
+            # each AIV receives its balanced half of the
             # tail-clipped (cur_tokens, N) tile directly in its own UB.
-            cv_w = cv_ub.head_next()
+            cv_w = cv_ub.next_write()
             mem_copy(
                 tile_slice(cv_w, (TILE_VEC_M, BASE_N), (0, 0)),
-                l0c.tail_next(),
-                options=copy_options(split_axis=0, actual=(cur_tokens, BASE_N)),
+                l0c.next_read(bare=True)
+                .view(make_layout((cur_tokens, BASE_N)), data_format="nz")
+                .partition(dim=0),
             )
 
             # ---- vec epilogue, specialized per unit ----
             # Dense outputs use one partitioned block copy per item (op①
             # CopyoutProto's blockCount=rows pattern) instead of per-row
             # 512B DMAs; only the slot scatter keeps row granularity.
-            cv_r = cv_ub.tail_next()
-            cs_r = cs_ch.tail_next()
-            out_w = out_ch.head_next()
+            cv_r = cv_ub.next_read()
+            cs_r = cs_ch.next_read()
+            out_w = out_ch.next_write()
             if u < NUM_Q_HEADS:
                 self._rope_q(cv_r, out_w, cs_r, rows_here)
-                q_half = tile_slice(
-                    q_span, (PAIR_M, HEAD_DIM), (pair, u)
-                ).partition(dim=0, part_id=sub)
-                mem_copy(q_half, out_ch.tail_next())
-            elif u == UNIT_K:
-                self._norm_rope_k(
-                    cv_r, out_w, cs_r, gamma_w, rows_here, AVG, epsilon
+                q_half = tile_slice(q_span, (PAIR_M, HEAD_DIM), (pair, u)).partition(
+                    dim=0, part_id=sub
                 )
-                out_r = out_ch.tail_next()
-                k_half = tile_slice(
-                    k_span, (PAIR_M, HEAD_DIM), (pair, 0)
-                ).partition(dim=0, part_id=sub)
+                # mem_copy retains the source domain in 0.8; clip valid
+                # AIV rows explicitly before writing a partitioned GM tile.
+                mem_copy(q_half, out_ch.next_read()[0:rows_here, 0:HEAD_DIM])
+            elif u == UNIT_K:
+                self._norm_rope_k(cv_r, out_w, cs_r, gamma_w, rows_here, AVG, epsilon)
+                out_r = out_ch.next_read()
+                k_half = tile_slice(k_span, (PAIR_M, HEAD_DIM), (pair, 0)).partition(
+                    dim=0, part_id=sub
+                )
                 # The tile drain and the slot scatter are two readers of one
                 # out_ch slot; both consume the same VF-written epoch.
-                mem_copy(k_half, out_r)
+                mem_copy(k_half, out_r[0:rows_here, 0:HEAD_DIM])
                 for r in range(rows_here):
                     slot = gm_slot[meta_row0 + r]
                     if slot != -1:
@@ -743,14 +749,14 @@ class FusedQkvProjNormRopeCacheKernel:
                         )
             elif u == UNIT_V:
                 self._cast_rows(cv_r, out_w, rows_here)
-                out_r = out_ch.tail_next()
+                out_r = out_ch.next_read()
                 if const_expr(self.return_v):
                     # Transitional interface: materialize v like the
                     # production scatter's transient contiguous copy.
                     v_half = tile_slice(
                         v_span, (PAIR_M, HEAD_DIM), (pair, 0)
                     ).partition(dim=0, part_id=sub)
-                    mem_copy(v_half, out_r)
+                    mem_copy(v_half, out_r[0:rows_here, 0:HEAD_DIM])
                 for r in range(rows_here):
                     slot = gm_slot[meta_row0 + r]
                     if slot != -1:
@@ -760,13 +766,13 @@ class FusedQkvProjNormRopeCacheKernel:
                         )
             else:
                 self._cast_rows(cv_r, out_w, rows_here)
-                out_r = out_ch.tail_next()
+                out_r = out_ch.next_read()
                 gm_m = mk_span if u == UNIT_MK else mv_span
                 if const_expr(self.has_mirror):
-                    m_half = tile_slice(
-                        gm_m, (PAIR_M, HEAD_DIM), (pair, 0)
-                    ).partition(dim=0, part_id=sub)
-                    mem_copy(m_half, out_r)
+                    m_half = tile_slice(gm_m, (PAIR_M, HEAD_DIM), (pair, 0)).partition(
+                        dim=0, part_id=sub
+                    )
+                    mem_copy(m_half, out_r[0:rows_here, 0:HEAD_DIM])
                 else:
                     # Plain-layer stand-ins are (1, 256); the mirror units
                     # never execute at runtime, so per-row runtime coords
@@ -810,9 +816,7 @@ def compile_aot(
     """
     n_units = qkv_width // HEAD_DIM
     if n_units * HEAD_DIM != qkv_width or n_units not in (8, 10):
-        raise ValueError(
-            f"qkv_width must be 2048 or 2560, got {qkv_width}"
-        )
+        raise ValueError(f"qkv_width must be 2048 or 2560, got {qkv_width}")
     op = FusedQkvProjNormRopeCache(
         return_v=return_v,
         has_mirror=(n_units == 10),
@@ -963,7 +967,6 @@ class FusedQkvProjNormRopeCache:
             gm_v_cache,
             eps,
         )
-
 
     @host
     def run_rank_chunk(

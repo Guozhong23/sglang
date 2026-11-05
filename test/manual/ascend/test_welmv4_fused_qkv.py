@@ -1,13 +1,14 @@
 """Single-NPU mode-consistency tests for the framework's WeLM fused QKV op.
 
-Run from the repository root, with its python/ directory on PYTHONPATH:
+Run from the repository root:
 
     NPU_DEVICE=npu:4 python test/manual/ascend/test_welmv4_fused_qkv.py -v -f
 
 Requires the CANNBotDSL SDK and its supported NPU/toolchain (ARCH 3510).
 No server, checkpoint, distributed initialization or small operator wheel is
-needed. The operator is imported from sglang.srt.layers. Missing NPU support
-is reported as SKIP; SDK import/compilation failures on NPU remain errors.
+needed. The operator is loaded directly from this checkout to avoid importing
+serving dependencies. Missing NPU support is reported as SKIP; SDK
+import/compilation failures on NPU remain errors.
 
 The tests compare contiguous loads with per-row positions, including ragged
 prefill and target verify, and check dense outputs, raw mirror outputs and KV
@@ -19,6 +20,7 @@ reused across M.
 import importlib.util
 import os
 import unittest
+from pathlib import Path
 
 
 class TestWeLMv4FusedQKV(unittest.TestCase):
@@ -46,9 +48,15 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         torch.npu.set_device(cls.device)
 
         # Deliberately do not hide missing/broken SDK or operator imports.
-        from sglang.srt.layers import fused_qkv_proj_norm_rope_cache
-
-        cls.operator = fused_qkv_proj_norm_rope_cache
+        path = (
+            Path(__file__).resolve().parents[3]
+            / "python/sglang/srt/layers/fused_qkv_proj_norm_rope_cache.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "fused_qkv_proj_norm_rope_cache", path
+        )
+        cls.operator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.operator)
         cls.programs = {}
         torch.manual_seed(1234)
         cls.weights = {
@@ -57,9 +65,9 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             )
             for width in (2048, 2560)
         }
-        cls.gamma = (
-            1 + 0.1 * torch.randn((1, 256), device=cls.device)
-        ).to(torch.bfloat16)
+        cls.gamma = (1 + 0.1 * torch.randn((1, 256), device=cls.device)).to(
+            torch.bfloat16
+        )
         angle = (
             torch.arange(cls.MAX_POSITION, dtype=torch.float32, device=cls.device)[
                 :, None

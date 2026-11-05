@@ -133,7 +133,7 @@ _is_npu = is_npu()
 
 # Cache only compiled programs, never per-forward Q/K/V or mirror activations.
 _WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
-_WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
+_WELMV4_FUSED_QUANT_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
 
 # Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
 # rank's packed segment prevents a bulk-RoPE AIV tile from crossing ranks.
@@ -200,7 +200,7 @@ def _get_welm_fused_qkv_program(
     return program
 
 
-def _get_welm_fused_qkv_mx_program(
+def _get_welm_fused_quant_qkv_program(
     device: Any,
     qkv_width: int,
     num_slots: int,
@@ -217,29 +217,29 @@ def _get_welm_fused_qkv_mx_program(
         positions_contiguous,
         rank_chunk_layout,
     )
-    program = _WELMV4_FUSED_QKV_MX_PROGRAMS.get(key)
+    program = _WELMV4_FUSED_QUANT_QKV_PROGRAMS.get(key)
     if program is None:
-        from sglang.srt.layers.fused_qkv_proj_norm_rope_cache_mx import (
-            compile_aot_mx,
-            compile_aot_mx_rank_chunk,
+        from sglang.srt.layers.fused_quant_qkv_proj_norm_rope_cache import (
+            compile_aot_quant,
+            compile_aot_quant_rank_chunk,
         )
 
         if rank_chunk_layout:
-            program = compile_aot_mx_rank_chunk(
+            program = compile_aot_quant_rank_chunk(
                 qkv_width,
                 num_slots,
                 max_pos,
                 positions_contiguous=positions_contiguous,
             )
         else:
-            program = compile_aot_mx(
+            program = compile_aot_quant(
                 qkv_width,
                 num_slots,
                 max_pos,
                 return_v=True,
                 positions_contiguous=positions_contiguous,
             )
-        _WELMV4_FUSED_QKV_MX_PROGRAMS[key] = program
+        _WELMV4_FUSED_QUANT_QKV_PROGRAMS[key] = program
     return program
 
 
@@ -2102,7 +2102,7 @@ class Qwen2MoeAttention(nn.Module):
             mirror_v if has_mirror else None,
         )
 
-    def _try_npu_fused_qkv_mxfp8(
+    def _try_npu_fused_quant_qkv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -2173,7 +2173,7 @@ class Qwen2MoeAttention(nn.Module):
                 else forward_batch.out_cache_loc
             )
         )
-        program = _get_welm_fused_qkv_mx_program(
+        program = _get_welm_fused_quant_qkv_program(
             hidden_states.device,
             weight.shape[0],
             k_cache.shape[0],
@@ -2230,7 +2230,7 @@ class Qwen2MoeAttention(nn.Module):
             gate_ag_on_alt_stream,
         )
 
-    def _npu_prefill_ag_fused_qkv_mxfp8(
+    def _npu_prefill_ag_fused_quant_qkv(
         self,
         positions: torch.Tensor,
         local_hidden: torch.Tensor,
@@ -2292,7 +2292,7 @@ class Qwen2MoeAttention(nn.Module):
             for start, end in slices
         ]
         programs = {
-            mode: _get_welm_fused_qkv_mx_program(
+            mode: _get_welm_fused_quant_qkv_program(
                 local_hidden.device,
                 weight.shape[0],
                 k_cache.shape[0],
@@ -2961,7 +2961,7 @@ class Qwen2MoeAttention(nn.Module):
                 fused_qkv,
                 prefill_gate_hidden_states,
                 prefill_gate_all_gather_on_alt_stream,
-            ) = self._npu_prefill_ag_fused_qkv_mxfp8(
+            ) = self._npu_prefill_ag_fused_quant_qkv(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -2970,7 +2970,7 @@ class Qwen2MoeAttention(nn.Module):
             )
         elif self.use_npu_fused_qkv:
             if self._is_npu_mxfp8_projection(self.qkv_proj):
-                result = self._try_npu_fused_qkv_mxfp8(
+                result = self._try_npu_fused_quant_qkv(
                     positions,
                     hidden_states,
                     forward_batch,
