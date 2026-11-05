@@ -141,12 +141,14 @@ def _golden(projection, gamma, positions, cs, width):
 def _assert_close(name, output, golden):
     actual = output.detach().float().cpu().numpy()
     expected = golden.float().cpu().numpy()
+    assert np.isfinite(actual).all(), f"{name}: output contains NaN or Inf"
+    assert np.isfinite(expected).all(), f"{name}: reference contains NaN or Inf"
     if actual.size == 0:
         return 0.0
     mismatch = float((~np.isclose(actual, expected, rtol=1e-3, atol=1e-3)).mean())
-    assert mismatch <= 1e-3, (
-        f"{name}: mismatch={mismatch:.6%}, max_error={np.abs(actual - expected).max()}"
-    )
+    assert (
+        mismatch <= 1e-3
+    ), f"{name}: mismatch={mismatch:.6%}, max_error={np.abs(actual - expected).max()}"
     return mismatch
 
 
@@ -356,10 +358,16 @@ def test_repeated_prefill_slot_reuse(operator):
             outputs[1].cpu()[:, 192:].float(),
         ]
         for name, actual, expected in zip(["q", "k"], actual_rope, expected_rope):
+            assert torch.isfinite(
+                actual
+            ).all(), f"{name}: launch {launch} output contains NaN or Inf"
+            assert torch.isfinite(
+                expected
+            ).all(), f"{name}: reference contains NaN or Inf"
             bad_rows = ((actual - expected).abs() > 0.05).any(-1).sum().item()
-            assert bad_rows == 0, (
-                f"{name}: launch {launch} has {bad_rows} stale RoPE rows"
-            )
+            assert (
+                bad_rows == 0
+            ), f"{name}: launch {launch} has {bad_rows} stale RoPE rows"
         for cache, output in zip(caches, outputs[1:3]):
             assert torch.equal(cache[slots[valid]].cpu(), output[valid].cpu())
     print(f"slot reuse quant={operator.quant}: 20 launches clean")
