@@ -966,10 +966,35 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         self, input_ids: torch.Tensor, image_items: List[MultimodalDataItem]
     ) -> torch.Tensor:
         image_token_id = self._image_token_id()
-        logical_input_ids = input_ids.clone()
-        for item in image_items:
-            if item.pad_value is not None:
-                logical_input_ids[logical_input_ids == item.pad_value] = image_token_id
+        pad_values = [
+            item.pad_value for item in image_items if item.pad_value is not None
+        ]
+        if pad_values:
+            placeholder = torch.as_tensor(
+                pad_values, device=input_ids.device, dtype=input_ids.dtype
+            ).reshape(-1)
+            if input_ids.dim() == 1 and placeholder.numel() <= 256:
+                # The per-image loop this replaces launched ~5 micro kernels per
+                # image (EqScalar / Fill / NonZero / BroadcastTo / IndexPut), i.e.
+                # 250 launches and ~14ms of launch-gap on a 50-image prefill
+                # chunk. Both torch.isin and a boolean-mask assignment are also
+                # bad here on Ascend: isin lowers to a sort/unique that syncs the
+                # stream, and the mask assignment lowers to NonZero + IndexPut.
+                # broadcast-compare + any() + where() is three async kernels.
+                if placeholder.numel() == 1:
+                    mask = input_ids == placeholder[0]
+                else:
+                    mask = (
+                        input_ids.unsqueeze(-1) == placeholder.view(1, -1)
+                    ).any(dim=-1)
+                logical_input_ids = torch.where(mask, image_token_id, input_ids)
+            else:
+                logical_input_ids = input_ids.clone()
+                logical_input_ids[
+                    torch.isin(logical_input_ids, placeholder)
+                ] = image_token_id
+        else:
+            logical_input_ids = input_ids
         vocab_size = self.model.embed_tokens.num_embeddings
         return logical_input_ids.clamp(min=0, max=vocab_size - 1)
 
