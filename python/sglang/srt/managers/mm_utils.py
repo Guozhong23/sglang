@@ -418,6 +418,48 @@ def get_embedding_chunk(
     return embedding_chunk, start_index, end_index
 
 
+_PRECOMPUTED_CONCAT_MEMO = None  # (sources: Tuple[Tensor, ...], value: Tensor)
+
+
+def _concat_precomputed_items(
+    items_per_req: List[MultimodalDataItem],
+) -> torch.Tensor:
+    """Concatenate one request's precomputed embeddings, reusing the result.
+
+    Chunked prefill calls this once per chunk of the same request, with exactly
+    the same items.  Concatenating ~50 image embeddings costs ~5.7ms of CPU
+    time, and the *only* reason it shows up as a device bubble is that it sits
+    on the critical path between two prefill chunks (chunk N+1 cannot start its
+    LM forward until this buffer has been assembled and uploaded).
+
+    The concatenated buffer already exists in chunk N — the previous
+    implementation simply dropped it on the floor after slicing.  Keeping a
+    single reference therefore adds no peak memory, only a longer lifetime, and
+    removes the concat from every subsequent chunk.
+
+    Keying is done by tensor identity, not by ``item.hash``: on the
+    PRECOMPUTED_EMBEDDING path the item carries ``pad_value`` but ``hash`` is
+    frequently still None, so a hash-keyed memo silently never hits.  Holding
+    ``sources`` keeps those tensors alive for as long as the memo exists, which
+    is what makes identity comparison sound.  Exactly one entry is retained so a
+    finished request cannot pin memory.
+    """
+    global _PRECOMPUTED_CONCAT_MEMO
+    sources = tuple(item.precomputed_embeddings for item in items_per_req)
+
+    memo = _PRECOMPUTED_CONCAT_MEMO
+    if (
+        memo is not None
+        and len(memo[0]) == len(sources)
+        and all(a is b for a, b in zip(memo[0], sources))
+    ):
+        return memo[1]
+
+    embedding = torch.concat(list(sources))
+    _PRECOMPUTED_CONCAT_MEMO = (sources, embedding)
+    return embedding
+
+
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
     items_size: List[int],
@@ -444,9 +486,7 @@ def _get_precomputed_embedding(
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
+            req_embeddings = _concat_precomputed_items(items_per_req)
             chunk, _, _ = get_embedding_chunk(
                 embedding=req_embeddings,
                 extend_prefix_len=prefix_length[i],
@@ -975,7 +1015,30 @@ def _get_chunked_prefill_embedding(
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
-    return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
+    """Boolean mask of the tokens that stand in for multimodal placeholders.
+
+    ``torch.isin`` is lowered to a sort/unique over *input_ids* (32k+ elements
+    in a full prefill chunk) on Ascend, and ``aclnnUnique`` performs an implicit
+    ``aclrtSynchronizeStream``.  That drains the launch queue in the middle of
+    the prefill forward, and the host then has to refill it, which surfaces as a
+    bubble right before the first LM layer.
+
+    ``placeholder_tensor`` only carries the handful of per-item pad values, so a
+    broadcast compare + ``any`` answers the same question with two fully async
+    kernels and no implicit sync.  Fall back to ``torch.isin`` when the
+    placeholder set is large or the dtypes differ.
+    """
+    pv = placeholder_tensor.reshape(-1)
+    if (
+        input_ids.dim() != 1
+        or pv.numel() == 0
+        or pv.numel() > 256
+        or pv.dtype != input_ids.dtype
+    ):
+        return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
+    if pv.numel() == 1:
+        return (input_ids == pv[0]).unsqueeze(-1)
+    return (input_ids.unsqueeze(-1) == pv.view(1, -1)).any(dim=-1).unsqueeze(-1)
 
 
 def _adjust_embedding_length(
@@ -1069,8 +1132,10 @@ def get_embedding_and_mask(
         if embedding is None:
             return None, None, input_ids
     # 2. Get mask
-    if _is_npu:
-        torch.npu.current_stream().synchronize()
+    # NOTE (opt-1): no full-stream synchronize here. input_ids and
+    # placeholder_tensor are produced on the same stream, so the mask kernel is
+    # already ordered after them; the sync only broke launch pipelining and
+    # exposed host-side embedding assembly as a device bubble.
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
